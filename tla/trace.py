@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""把 TLC 输出的反例压缩成"每一步做了什么、哪些变量变了"。
+"""Condense a TLC counterexample into "what each step did and which variables changed".
 
-用法：./run.sh hole1 | python3 trace.py
-只显示变化了的关键变量；加 -a 显示每一步的全部变量。
+Usage: ./run.sh hole1 | python3 trace.py
+Shows only the key variables that changed; pass -a to show all variables at every step.
 """
 import re
 import sys
 
-# 读反例时最值得看的变量（按这个顺序显示）
+# The variables most worth watching in a counterexample (shown in this order)
 KEY = ["up", "pc", "bpc", "fpc", "vpc", "mapE", "snap", "dirty", "queued", "dead", "opH",
        "queue", "fitem", "net", "wait", "resp", "db", "dedup", "abs", "absKnown",
        "deletedGens", "violation"]
@@ -43,7 +43,7 @@ def main():
             print(line)
     prev = {}
     for st in parse(lines):
-        print(f"\n--- 第 {st['n']} 步：{st['action']}")
+        print(f"\n--- step {st['n']}: {st['action']}")
         names = KEY if not show_all else KEY + sorted(set(st["vars"]) - set(KEY))
         for k in names:
             v = st["vars"].get(k)

@@ -1,72 +1,72 @@
 ----------------------------- MODULE RowService -----------------------------
-\* design.md 中"内存权威行数据服务"核心并发协议的 TLA+ 模型。
+\* TLA+ model of the core concurrency protocol of the "In-Memory Authoritative Row Service" in design.md.
 \*
-\* 只建模一个 key：设计中所有的正确性问题都是 per-key 的。建模了：
-\*   - shard map 中 entry 的分配和淘汰（dead 协议，7.7）
-\*   - entry 的 snap / dirty / queued / dead / op 锁（5.2、6）
-\*   - Get、Update、Create、Delete，以及 runSync 在客户端放弃之后继续执行（7.2～7.5）
-\*   - 刷盘器：op 一直持有到写完，失败时并回掩码、重新入队（7.6）
-\*   - 会"迟到执行"的 DB：Go 侧超时之后语句仍可能执行；响应可能丢失；
-\*     语句可能被确定拒绝（8.1、8.4）
-\*   - 客户端放弃等待；SDK 用同一个 gen 重试 create（7.10）
-\*   - 服务崩溃与重启（7.8）
+\* Models only one key: all correctness issues in the design are per-key. Modeled:
+\*   - allocation and eviction of the entry in the shard map (dead protocol, 7.7)
+\*   - the entry's snap / dirty / queued / dead / op lock (5.2, 6)
+\*   - Get, Update, Create, Delete, and runSync continuing after the client gives up (7.2-7.5)
+\*   - the flusher: op is held until the write completes; on failure the mask is merged back and re-enqueued (7.6)
+\*   - a DB with "late execution": a statement may still execute after the Go side times out; responses may be lost;
+\*     a statement may be definitely rejected (8.1, 8.4)
+\*   - clients giving up waiting; the SDK retries create with the same gen (7.10)
+\*   - service crash and restart (7.8)
 \*
-\* 建模粒度：mu、shard.mu、qmu 的临界区不做 IO、不阻塞，每个临界区建模成一个
-\* 原子步骤；"放锁之后、再次拿锁之前"的空档（第 10 节）拆成单独的步骤，
-\* 由 TLC 穷举其中所有可能的交错。
+\* Modeling granularity: the critical sections of mu, shard.mu and qmu do no IO and never block, so each is modeled
+\* as one atomic step; the gap "after releasing a lock and before acquiring it again" (Section 10) is split into
+\* separate steps, and TLC exhaustively explores all possible interleavings within it.
 \*
-\* 正确性的判断标准：维护一个抽象的顺序状态 abs。每个操作在第 9 节给出的
-\* 线性化点上修改 abs；内存、DB 都必须和 abs 对得上（见文件末尾的不变式）。
+\* Correctness criterion: maintain an abstract sequential state abs. Each operation modifies abs at the
+\* linearization point given in Section 9; memory and DB must both agree with abs (see the invariants at the end of the file).
 \*
-\* Update 只建模"给一列赋一个新值"。自增（INCR）在 mu 里基于旧值计算新值，
-\* 和赋值走的是同一条路径、同一个原子步骤，并发结构完全一样，所以没有单独建模。
+\* Update is modeled only as "assign a new value to one column". Increment (INCR) computes the new value from the old one
+\* inside mu, on the same path and in the same atomic step as assignment, with an identical concurrency structure, so it is not modeled separately.
 \*
-\* 为了控制状态数，局部变量在用完之后都恢复成固定的初始值（操作结束时清空
-\* cop/ce、后台结束时清空 be/bop、结果被取走后清空 resp 等）。这不改变行为。
+\* To bound the state count, local variables are reset to fixed initial values once they are no longer needed (clear
+\* cop/ce when an operation ends, be/bop when the background task ends, resp once the result is taken, etc.). This does not change behavior.
 
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS
-    Clients,            \* 客户端；每个客户端还有一个自己的 runSync 后台 goroutine
-    Cols,               \* 业务列
-    MaxEntry,           \* 最多分配几个 entry（淘汰、崩溃之后要分配新的）
-    MaxGen,             \* 最多几次新的 create（每次 create 一个新 gen）
-    MaxVal,             \* 最多几次 update（每次 update 写一个新值）
-    MaxOps,             \* 每个客户端最多发起几个操作
-    MaxStmtTimeouts,    \* DB 语句"结果不确定"的次数上限（Go 侧超时、响应丢失）
-    MaxDrops,           \* DB 语句被确定拒绝、或者永远不执行的次数上限
-    MaxClientTimeouts,  \* 客户端在 create/delete 结果确定之前放弃等待的次数上限
-    MaxCrashes,         \* 服务崩溃的次数上限
-    InsertCanBeLate,    \* INSERT 在 Go 侧超时之后，是否还可能迟到执行（漏洞 1 的前提）
-    RetryCreate,        \* 结果不确定的 create，SDK 是否用同一个 gen 重试（漏洞 2 的前提）
-    FixDedup,           \* 修复漏洞 1、2：gen 去重表 + create 先加载
-    FixFence,           \* 修复漏洞 3：重启时先清掉旧进程留在 PG 上的会话
-    FixUnsureRetry      \* 修复漏洞 4：出现过不确定的尝试之后，确定失败不能当作最终结果
+    Clients,            \* clients; each client also has its own runSync background goroutine
+    Cols,               \* business columns
+    MaxEntry,           \* max number of entries allocated (new ones are needed after eviction or crash)
+    MaxGen,             \* max number of new creates (each create uses a new gen)
+    MaxVal,             \* max number of updates (each update writes a new value)
+    MaxOps,             \* max number of operations each client issues
+    MaxStmtTimeouts,    \* max number of DB statements with an ambiguous outcome (Go-side timeout, lost response)
+    MaxDrops,           \* max number of DB statements that are definitely rejected or never executed
+    MaxClientTimeouts,  \* max number of times a client gives up waiting before a create/delete outcome is known
+    MaxCrashes,         \* max number of service crashes
+    InsertCanBeLate,    \* whether an INSERT can still execute late after a Go-side timeout (precondition of hole 1)
+    RetryCreate,        \* whether the SDK retries an ambiguous create with the same gen (precondition of hole 2)
+    FixDedup,           \* fix for holes 1, 2: gen dedup table + create loads first
+    FixFence,           \* fix for hole 3: on restart, first clear the sessions the previous process left on PG
+    FixUnsureRetry      \* fix for hole 4: after any ambiguous attempt, a definite failure cannot be taken as the final result
 
 ASSUME MaxEntry >= 1
 
 VARIABLES
-    \* 服务是否在运行；每次崩溃 epoch + 1
+    \* whether the service is running; epoch + 1 on each crash
     up, epoch,
-    \* shard map：mapE 是 map 中这个 key 对应的 entry（0 表示没有）
+    \* shard map: mapE is the entry for this key in the map (0 means none)
     mapE, nextEntry, eEp,
-    \* entry 的字段（下标是 entry 编号）
+    \* entry fields (indexed by entry number)
     snap, dirty, queued, dead, opH,
-    \* 客户端
+    \* clients
     pc, cop, ce, cret, ops, lastSeen, unkGen, cwait,
-    \* 每个客户端的 runSync 后台 goroutine
+    \* each client's runSync background goroutine
     bpc, be, bop, bres, bgr, bamb,
-    \* 刷盘器和刷盘队列
+    \* flusher and flush queue
     fpc, fbatch, fretry, fitem, queue,
-    \* 淘汰器
+    \* evictor
     vpc, ve,
-    \* DB：这一行在 DB 中的状态，以及（修复方案的）去重表
+    \* DB: the state of this row in the DB, and the dedup table (of the fix)
     db, dedup,
-    \* 已经发出、还没执行的语句；每个执行者是否在等结果、等到的结果
+    \* statements sent but not yet executed; whether each executor is waiting for a result, and the result it received
     net, wait, resp,
-    \* 各种次数上限的计数
+    \* counters for the various limits
     stmtTO, drops, cto, crashes, nextGen, nextVal,
-    \* 用于检查正确性的幽灵变量
+    \* ghost variables for checking correctness
     abs, absKnown, preCrash, deletedGens, insSent, delSent, violation, seen
 
 sysV == <<up, epoch>>
@@ -83,20 +83,20 @@ ghV  == <<abs, absKnown, preCrash, deletedGens, insSent, delSent, violation, see
 vars == <<sysV, mapV, entV, cliV, bgV, flV, evV, dbV, netV, budV, ghV>>
 
 -----------------------------------------------------------------------------
-\* 值和记录
+\* values and records
 
 Entries == 1..MaxEntry
 
-\* 列的值是 <<gen, n>>：带上写入它的那条生命的 gen，用来发现"旧对象的数据写进新对象"。
+\* A column value is <<gen, n>>: it carries the gen of the life that wrote it, to detect "data of an old object written into a new object".
 Val0       == [col \in Cols |-> <<0, 0>>]
 InitVal(g) == [col \in Cols |-> <<g, 0>>]
 
-\* entry.snap：nil = 未加载；absent = 确定不存在；row = 当前行
+\* entry.snap: nil = not loaded; absent = definitely does not exist; row = current row
 NIL    == [k |-> "nil",    gen |-> 0, ver |-> 0, val |-> Val0]
 ABSENT == [k |-> "absent", gen |-> 0, ver |-> 0, val |-> Val0]
 RowR(g, v, vl) == [k |-> "row", gen |-> g, ver |-> v, val |-> vl]
 
-\* 抽象状态只关心：存在与否、gen、各列的值（ver 是实现细节）
+\* the abstract state cares only about: existence, gen, and the column values (ver is an implementation detail)
 Proj(r)   == [ex |-> r.k = "row", gen |-> r.gen, val |-> r.val]
 AbsAbsent == Proj(ABSENT)
 
@@ -104,13 +104,13 @@ DbAbsent == [ex |-> FALSE, gen |-> 0, ver |-> 0, val |-> Val0]
 DbRow    == IF db.ex THEN RowR(db.gen, db.ver, db.val) ELSE ABSENT
 DbProj   == Proj(DbRow)
 
-\* op 锁的持有者
+\* holder of the op lock
 FREE  == <<"free">>
-CL(c) == <<"cl", c>>     \* 客户端自己（load）
-BG(c) == <<"bg", c>>     \* 客户端的 runSync 后台 goroutine（create/delete）
-FL    == <<"fl">>        \* 刷盘器
-EV    == <<"ev">>        \* 淘汰器
-DBProcs == {BG(c) : c \in Clients} \cup {FL}   \* 会向 DB 发写语句的执行者
+CL(c) == <<"cl", c>>     \* the client itself (load)
+BG(c) == <<"bg", c>>     \* the client's runSync background goroutine (create/delete)
+FL    == <<"fl">>        \* the flusher
+EV    == <<"ev">>        \* the evictor
+DBProcs == {BG(c) : c \in Clients} \cup {FL}   \* executors that send write statements to the DB
 
 AnyCol == CHOOSE col \in Cols : TRUE
 NoOp   == [t |-> "none", col |-> AnyCol, egen |-> 0, gen |-> 0, v |-> 0]
@@ -154,9 +154,9 @@ Init ==
     /\ seen = [c \in Clients |-> {}]
 
 -----------------------------------------------------------------------------
-\* 辅助定义
+\* helper definitions
 
-\* getOrCreate（7.1）：两次查 map 的写法等价于一个原子步骤。
+\* getOrCreate (7.1): the double map lookup is equivalent to one atomic step.
 GetOrCreate(c) ==
     IF mapE # 0
     THEN /\ ce' = [ce EXCEPT ![c] = mapE]
@@ -167,34 +167,34 @@ GetOrCreate(c) ==
          /\ eEp' = [eEp EXCEPT ![nextEntry] = epoch]
          /\ ce' = [ce EXCEPT ![c] = nextEntry]
 
-\* 客户端的操作结束：局部变量恢复初始值
+\* client operation ends: local variables are reset to initial values
 EndOp(c) ==
     /\ pc' = [pc EXCEPT ![c] = "idle"]
     /\ cop' = [cop EXCEPT ![c] = NoOp]
     /\ ce' = [ce EXCEPT ![c] = 0]
     /\ cret' = [cret EXCEPT ![c] = "none"]
 
-\* 正在进行 Get 的客户端，记录它开始以来抽象状态出现过的所有值；
-\* Get 读到的值必须是其中之一（读操作可以线性化在它区间内的任意时刻）。
+\* For a client running Get, record every value the abstract state has taken since the Get began;
+\* the value the Get reads must be one of them (a read can be linearized at any point within its interval).
 InGet(c) == cop[c].t = "get" /\ pc[c] # "idle"
 NewSeen(newAbs) == [c \in Clients |-> IF InGet(c) THEN seen[c] \cup {newAbs} ELSE seen[c]]
 
-\* 线性化点：抽象状态变为 newAbs
+\* linearization point: the abstract state becomes newAbs
 LP(newAbs) == abs' = newAbs /\ seen' = NewSeen(newAbs)
 
-\* 崩溃重启之后，第一次从 DB 观察到的状态是否说得通：
-\*   - 已经确认删除的生命不能出现
-\*   - 出现的生命一定有人发过它的 INSERT
-\*   - 各列的值都属于这条生命
-\*   - 崩溃前存在的生命如果不见了，一定有人发过它的 DELETE
-\* 刷盘窗口内的 update 可以丢（值可以是旧的），这是需求允许的。
+\* Whether the first state observed from the DB after a crash and restart makes sense:
+\*   - a life whose delete was confirmed must not appear
+\*   - a life that appears must have had its INSERT sent by someone
+\*   - all column values belong to this life
+\*   - if a life that existed before the crash is gone, someone must have sent its DELETE
+\* Updates within the flush window may be lost (values may be stale); the requirements allow this.
 Plausible(obs) ==
     /\ obs.ex => obs.gen \notin deletedGens
     /\ obs.ex => obs.gen \in insSent
     /\ obs.ex => \A col \in Cols : obs.val[col][1] = obs.gen
     /\ (preCrash.ex /\ ~(obs.ex /\ obs.gen = preCrash.gen)) => preCrash.gen \in delSent
 
-\* 从 DB 加载到内存时调用。崩溃之后的第一次加载，用加载到的状态重建 abs。
+\* Called when loading from the DB into memory. On the first load after a crash, rebuild abs from the loaded state.
 Observe(obs) ==
     IF absKnown
     THEN UNCHANGED <<abs, absKnown, seen, violation>>
@@ -203,14 +203,14 @@ Observe(obs) ==
          /\ seen' = NewSeen(obs)
          /\ violation' = IF Plausible(obs) THEN violation ELSE "PostCrashStateImplausible"
 
-\* 执行者 p 向 DB 发一条写语句，然后等结果。live = 发送者还在等这条语句的结果。
-\* （语句没有编号：同一时刻每个执行者最多只有一条 live 的语句。）
+\* Executor p sends a write statement to the DB, then waits for the result. live = the sender is still waiting for this statement's result.
+\* (Statements are unnumbered: at any moment each executor has at most one live statement.)
 SendStmt(p, kind, g, ver, vl, m) ==
     /\ net' = net \cup {[kind |-> kind, gen |-> g, ver |-> ver, val |-> vl, mask |-> m,
                          src |-> p, ep |-> epoch, live |-> TRUE]}
     /\ wait' = [wait EXCEPT ![p] = TRUE]
 
-\* runSync 的 fn 结束：释放 op；如果客户端还在等，就把结果交给它
+\* runSync's fn ends: release op; if the client is still waiting, hand it the result
 Finish(c, res) ==
     /\ opH' = [opH EXCEPT ![be[c]] = FREE]
     /\ bpc' = [bpc EXCEPT ![c] = IF cwait[c] THEN "B_done" ELSE "idle"]
@@ -220,7 +220,7 @@ Finish(c, res) ==
     /\ bgr' = [bgr EXCEPT ![c] = 0]
     /\ bamb' = [bamb EXCEPT ![c] = FALSE]
 
-\* Create 的线性化点（I7）：DB 确定成功之后，在 mu 里 snap.Store(row)
+\* Create's linearization point (I7): after the DB has definitely succeeded, snap.Store(row) inside mu
 CreateLP(c, row, obsBefore) ==
     /\ snap' = [snap EXCEPT ![be[c]] = row]
     /\ dirty' = [dirty EXCEPT ![be[c]] = {}]
@@ -230,7 +230,7 @@ CreateLP(c, row, obsBefore) ==
                     ELSE "PostCrashStateImplausible"
 
 -----------------------------------------------------------------------------
-\* 客户端：选择下一个操作
+\* client: choose the next operation
 
 ClientStart(c) ==
     /\ up /\ pc[c] = "idle" /\ ops[c] > 0
@@ -240,7 +240,7 @@ ClientStart(c) ==
           /\ pc' = [pc EXCEPT ![c] = "G_goc"]
           /\ seen' = [seen EXCEPT ![c] = IF absKnown THEN {abs} ELSE {}]
           /\ UNCHANGED <<unkGen, nextGen, nextVal>>
-       \/ \* Update：给某一列写一个新值；可以带上之前看到的 gen（7.3）
+       \/ \* Update: write a new value to some column; may carry a previously seen gen (7.3)
           \E col \in Cols, eg \in {0, lastSeen[c]} :
              /\ nextVal < MaxVal
              /\ nextVal' = nextVal + 1
@@ -248,19 +248,19 @@ ClientStart(c) ==
                                            gen |-> 0, v |-> nextVal + 1]]
              /\ pc' = [pc EXCEPT ![c] = "U_goc"]
              /\ UNCHANGED <<unkGen, nextGen, seen>>
-       \/ \* Create：SDK 生成一个新的 gen
+       \/ \* Create: the SDK generates a new gen
           /\ bpc[c] = "idle" /\ nextGen < MaxGen
           /\ nextGen' = nextGen + 1
           /\ cop' = [cop EXCEPT ![c] = [NoOp EXCEPT !.t = "create", !.gen = nextGen + 1]]
           /\ pc' = [pc EXCEPT ![c] = "X_goc"]
           /\ UNCHANGED <<unkGen, nextVal, seen>>
-       \/ \* SDK 重试一个结果不确定的 create（同一个 gen）
+       \/ \* the SDK retries an ambiguous create (same gen)
           /\ RetryCreate /\ bpc[c] = "idle" /\ unkGen[c] # 0
           /\ cop' = [cop EXCEPT ![c] = [NoOp EXCEPT !.t = "create", !.gen = unkGen[c]]]
           /\ unkGen' = [unkGen EXCEPT ![c] = 0]
           /\ pc' = [pc EXCEPT ![c] = "X_goc"]
           /\ UNCHANGED <<nextGen, nextVal, seen>>
-       \/ \* Delete：可以带上之前看到的 gen
+       \/ \* Delete: may carry a previously seen gen
           \E eg \in {0, lastSeen[c]} :
              /\ bpc[c] = "idle"
              /\ cop' = [cop EXCEPT ![c] = [NoOp EXCEPT !.t = "delete", !.egen = eg]]
@@ -270,7 +270,7 @@ ClientStart(c) ==
                    stmtTO, drops, cto, crashes,
                    abs, absKnown, preCrash, deletedGens, insSent, delSent, violation>>
 
-\* 各操作的第一步：getOrCreate
+\* first step of each operation: getOrCreate
 GocNext(x) == CASE x = "G_goc" -> "G_read"
                 [] x = "U_goc" -> "U_mu"
                 [] x = "X_goc" -> "X_lock"
@@ -283,7 +283,7 @@ Goc(c) ==
                    bgV, flV, evV, dbV, netV, budV, ghV>>
 
 -----------------------------------------------------------------------------
-\* Get（7.2）：无锁读 snap；未加载时去 load，然后从头再来
+\* Get (7.2): lock-free read of snap; if not loaded, load, then start over
 
 G_read(c) ==
     /\ up /\ pc[c] = "G_read"
@@ -292,7 +292,7 @@ G_read(c) ==
        THEN /\ pc' = [pc EXCEPT ![c] = "L_lock"]
             /\ cret' = [cret EXCEPT ![c] = "G_goc"]
             /\ UNCHANGED <<cop, ce, lastSeen, violation, seen>>
-       ELSE \* 线性化点：snap.Load()。不检查 dead（dead 协议规则 3）
+       ELSE \* linearization point: snap.Load(). dead is not checked (dead protocol rule 3)
             /\ EndOp(c)
             /\ lastSeen' = [lastSeen EXCEPT ![c] = IF r.k = "row" THEN r.gen ELSE @]
             /\ violation' = IF seen[c] # {} /\ Proj(r) \notin seen[c]
@@ -301,7 +301,7 @@ G_read(c) ==
     /\ UNCHANGED <<sysV, mapV, entV, ops, unkGen, cwait, bgV, flV, evV, dbV, netV, budV,
                    abs, absKnown, preCrash, deletedGens, insSent, delSent>>
 
-\* load：排队拿 op（相当于 singleflight）
+\* load: queue up to acquire op (equivalent to singleflight)
 L_lock(c) ==
     /\ up /\ pc[c] = "L_lock" /\ opH[ce[c]] = FREE
     /\ opH' = [opH EXCEPT ![ce[c]] = CL(c)]
@@ -310,7 +310,7 @@ L_lock(c) ==
                    cop, ce, cret, ops, lastSeen, unkGen, cwait,
                    bgV, flV, evV, dbV, netV, budV, ghV>>
 
-\* load：检查 dead、二次检查 snap，然后 SELECT 并写入 snap
+\* load: check dead, re-check snap, then SELECT and write into snap
 L_load(c) ==
     /\ up /\ pc[c] = "L_load"
     /\ LET e == ce[c] IN
@@ -325,7 +325,7 @@ L_load(c) ==
                    bgV, flV, evV, dbV, netV, budV, preCrash, deletedGens, insSent, delSent>>
 
 -----------------------------------------------------------------------------
-\* Update（7.3）：只拿 mu，读-改-写完整地在一个临界区里
+\* Update (7.3): takes only mu; the read-modify-write happens entirely within one critical section
 
 U_mu(c) ==
     /\ up /\ pc[c] = "U_mu"
@@ -336,11 +336,11 @@ U_mu(c) ==
            nr  == [old EXCEPT !.ver = old.ver + 1, !.val = [old.val EXCEPT ![op.col] = nv]]
        IN
        IF dead[e] THEN
-            \* 淘汰正在摘除它：重新查 map
+            \* eviction is removing it: look up the map again
             /\ pc' = [pc EXCEPT ![c] = "U_goc"]
             /\ UNCHANGED <<snap, dirty, queued, cop, ce, cret, lastSeen, abs, seen>>
        ELSE IF old.k = "nil" THEN
-            \* 先放掉 mu，再去 load
+            \* release mu first, then load
             /\ pc' = [pc EXCEPT ![c] = "L_lock"]
             /\ cret' = [cret EXCEPT ![c] = "U_goc"]
             /\ UNCHANGED <<snap, dirty, queued, cop, ce, lastSeen, abs, seen>>
@@ -349,7 +349,7 @@ U_mu(c) ==
             /\ EndOp(c)
             /\ UNCHANGED <<snap, dirty, queued, lastSeen, abs, seen>>
        ELSE
-            \* 线性化点：mu 里的 snap.Store(&nr)
+            \* linearization point: snap.Store(&nr) inside mu
             /\ snap' = [snap EXCEPT ![e] = nr]
             /\ dirty' = [dirty EXCEPT ![e] = @ \cup {op.col}]
             /\ queued' = [queued EXCEPT ![e] = TRUE]
@@ -357,7 +357,7 @@ U_mu(c) ==
             /\ LP([abs EXCEPT !.val = [abs.val EXCEPT ![op.col] = nv]])
             /\ IF queued[e]
                THEN EndOp(c)
-               ELSE /\ pc' = [pc EXCEPT ![c] = "U_enq"]   \* 放掉 mu 之后再入队
+               ELSE /\ pc' = [pc EXCEPT ![c] = "U_enq"]   \* enqueue after releasing mu
                     /\ UNCHANGED <<cop, ce, cret>>
     /\ UNCHANGED <<sysV, mapV, dead, opH, ops, unkGen, cwait,
                    bgV, flV, evV, dbV, netV, budV,
@@ -371,13 +371,13 @@ U_enq(c) ==
                    bgV, fpc, fbatch, fretry, fitem, evV, dbV, netV, budV, ghV>>
 
 -----------------------------------------------------------------------------
-\* Create / Delete 的客户端部分（7.4、7.5）：lockOpLive，然后交给 runSync
+\* client part of Create / Delete (7.4, 7.5): lockOpLive, then hand off to runSync
 
 X_lock(c) ==
     /\ up /\ pc[c] = "X_lock" /\ opH[ce[c]] = FREE
     /\ LET e == ce[c] IN
        IF dead[e]
-       THEN \* 拿到 op 之后发现 dead：放掉，重新查 map
+       THEN \* found dead after acquiring op: release it, look up the map again
             /\ pc' = [pc EXCEPT ![c] = "X_goc"]
             /\ UNCHANGED <<opH, bgV, cwait>>
        ELSE /\ opH' = [opH EXCEPT ![e] = BG(c)]
@@ -391,7 +391,7 @@ X_lock(c) ==
                    cop, ce, cret, ops, lastSeen, unkGen,
                    flV, evV, dbV, netV, budV, ghV>>
 
-\* 等后台的结果；或者客户端的 ctx 先到期（ErrOutcomeUnknown），后台继续执行
+\* wait for the background result; or the client's ctx expires first (ErrOutcomeUnknown) and the background continues
 X_wait(c) ==
     /\ up /\ pc[c] = "X_wait"
     /\ EndOp(c)
@@ -412,7 +412,7 @@ X_wait(c) ==
                    flV, evV, dbV, netV, stmtTO, drops, crashes, nextGen, nextVal, ghV>>
 
 -----------------------------------------------------------------------------
-\* runSync 后台：createLocked + insertUntilSure（7.4）
+\* runSync background: createLocked + insertUntilSure (7.4)
 
 B_c1(c) ==
     /\ up /\ bpc[c] = "B_c1"
@@ -421,12 +421,12 @@ B_c1(c) ==
            g   == bop[c].gen
        IN
        IF FixDedup /\ cur.k = "nil" THEN
-            \* 修复方案：先加载，用内存判断是否已经存在
+            \* the fix: load first, and use memory to decide whether it already exists
             /\ snap' = [snap EXCEPT ![e] = DbRow]
             /\ Observe(DbProj)
             /\ UNCHANGED <<opH, bgV, net, wait, insSent>>
        ELSE IF cur.k = "row" THEN
-            \* 已经存在：同一个 gen 说明是客户端重试、之前那次已经成功（幂等）
+            \* already exists: the same gen means a client retry whose earlier attempt already succeeded (idempotent)
             /\ Finish(c, IF cur.gen = g THEN "ok" ELSE "exists")
             /\ UNCHANGED <<snap, net, wait, insSent, abs, absKnown, seen, violation>>
        ELSE
@@ -440,7 +440,7 @@ B_c1(c) ==
 
 B_c2(c) ==
     /\ up /\ bpc[c] = "B_c2" /\ ~wait[BG(c)]
-    /\ resp' = [resp EXCEPT ![BG(c)] = "none"]     \* 取走结果
+    /\ resp' = [resp EXCEPT ![BG(c)] = "none"]     \* take the result
     /\ LET e    == be[c]
            g    == bop[c].gen
            r    == resp[BG(c)]
@@ -448,37 +448,37 @@ B_c2(c) ==
            mine == db.ex /\ db.gen = g
        IN
        IF r = "ok" THEN
-            \* INSERT ... RETURNING 成功
+            \* INSERT ... RETURNING succeeded
             /\ CreateLP(c, RowR(g, 0, InitVal(g)), AbsAbsent)
             /\ Finish(c, "ok")
             /\ UNCHANGED <<net, wait>>
        ELSE IF (r = "dup" \/ r = "claimed") /\ mine THEN
-            \* 冲突，SELECT 看到的是自己的 gen：之前某次"不确定"的 INSERT 其实成功了
+            \* conflict, and SELECT sees its own gen: an earlier "ambiguous" INSERT actually succeeded
             /\ CreateLP(c, DbRow, DbProj)
             /\ Finish(c, "ok")
             /\ UNCHANGED <<net, wait>>
        ELSE IF r = "claimed" THEN
-            \* 修复方案：这个 gen 早就插入过、之后又被删了，create 当时已经生效
+            \* the fix: this gen was inserted long ago and later deleted; the create already took effect back then
             /\ Finish(c, "ok")
             /\ UNCHANGED <<snap, dirty, net, wait, abs, absKnown, seen, violation>>
        ELSE IF r = "dup" /\ db.ex THEN
-            \* DB 里是别的生命：顺便加载进内存
+            \* DB holds a different life: load it into memory along the way
             /\ snap' = [snap EXCEPT ![e] = DbRow]
             /\ Observe(DbProj)
             /\ Finish(c, "exists")
             /\ UNCHANGED <<dirty, net, wait>>
        ELSE IF r = "conflict" THEN
-            \* 修复方案下不应该出现：去重记录写入了，但业务行没插进去
+            \* should not happen under the fix: the dedup record was written but the business row was not inserted
             /\ violation' = "DedupConflict"
             /\ Finish(c, "exists")
             /\ UNCHANGED <<snap, dirty, net, wait, abs, absKnown, seen>>
        ELSE IF r = "fail" /\ ~(FixUnsureRetry /\ bamb[c]) THEN
-            \* 确定失败：内存不变（当前设计：不管之前有没有过不确定的尝试）
+            \* definite failure: memory unchanged (the current design: regardless of whether there were earlier ambiguous attempts)
             /\ Finish(c, "fail")
             /\ UNCHANGED <<snap, dirty, net, wait, abs, absKnown, seen, violation>>
        ELSE
-            \* 结果不确定；或者冲突之后 SELECT 看到不存在；
-            \* 或者（修复方案）之前有过不确定的尝试、这次确定失败：用同一个 gen 重试
+            \* ambiguous outcome; or after a conflict SELECT sees that it does not exist;
+            \* or (the fix) there was an earlier ambiguous attempt and this one definitely failed: retry with the same gen
             /\ SendStmt(BG(c), kind, g, 0, InitVal(g), {})
             /\ bamb' = [bamb EXCEPT ![c] = @ \/ r = "amb"]
             /\ UNCHANGED <<snap, dirty, opH, bpc, be, bop, bres, bgr,
@@ -487,7 +487,7 @@ B_c2(c) ==
                    preCrash, deletedGens, insSent, delSent>>
 
 -----------------------------------------------------------------------------
-\* runSync 后台：deleteLocked + deleteUntilSure（7.5）
+\* runSync background: deleteLocked + deleteUntilSure (7.5)
 
 B_d1(c) ==
     /\ up /\ bpc[c] = "B_d1"
@@ -504,7 +504,7 @@ B_d1(c) ==
             /\ Finish(c, "notfound")
             /\ UNCHANGED <<snap, net, wait, delSent, abs, absKnown, seen, violation>>
        ELSE
-            \* ① 先删 DB：DELETE ... WHERE id AND gen。这期间不持有 mu，update 可以继续
+            \* (1) delete from the DB first: DELETE ... WHERE id AND gen. mu is not held meanwhile, so updates can proceed
             /\ bgr' = [bgr EXCEPT ![c] = r.gen]
             /\ SendStmt(BG(c), "del", r.gen, 0, Val0, {})
             /\ delSent' = delSent \cup {r.gen}
@@ -515,12 +515,12 @@ B_d1(c) ==
 
 B_d2(c) ==
     /\ up /\ bpc[c] = "B_d2" /\ ~wait[BG(c)]
-    /\ resp' = [resp EXCEPT ![BG(c)] = "none"]     \* 取走结果
+    /\ resp' = [resp EXCEPT ![BG(c)] = "none"]     \* take the result
     /\ LET e == be[c]
            r == resp[BG(c)]
        IN
        IF r = "ok" THEN
-            \* ② 线性化点：同一个 mu 临界区里换成墓碑，并丢弃脏数据
+            \* (2) linearization point: replace with a tombstone in the same mu critical section, and discard dirty data
             /\ snap' = [snap EXCEPT ![e] = ABSENT]
             /\ dirty' = [dirty EXCEPT ![e] = {}]
             /\ LP(AbsAbsent)
@@ -528,11 +528,11 @@ B_d2(c) ==
             /\ Finish(c, "ok")
             /\ UNCHANGED <<net, wait>>
        ELSE IF r = "fail" /\ ~(FixUnsureRetry /\ bamb[c]) THEN
-            \* 确定失败：行还在，dirty 保留（当前设计：不管之前有没有过不确定的尝试）
+            \* definite failure: the row is still there, dirty is kept (the current design: regardless of whether there were earlier ambiguous attempts)
             /\ Finish(c, "fail")
             /\ UNCHANGED <<snap, dirty, abs, seen, deletedGens, net, wait>>
        ELSE
-            \* 结果不确定；或者（修复方案）之前有过不确定的尝试、这次确定失败：用同一个 gen 重试
+            \* ambiguous outcome; or (the fix) there was an earlier ambiguous attempt and this one definitely failed: retry with the same gen
             /\ SendStmt(BG(c), "del", bgr[c], 0, Val0, {})
             /\ bamb' = [bamb EXCEPT ![c] = @ \/ r = "amb"]
             /\ UNCHANGED <<snap, dirty, opH, bpc, be, bop, bres, bgr, abs, seen, deletedGens>>
@@ -540,9 +540,9 @@ B_d2(c) ==
                    absKnown, preCrash, insSent, delSent, violation>>
 
 -----------------------------------------------------------------------------
-\* 刷盘器（7.6）
+\* flusher (7.6)
 
-\* 取走整个队列
+\* take the whole queue
 F_take ==
     /\ up /\ fpc = "F_take" /\ queue # {}
     /\ fbatch' = queue
@@ -550,20 +550,20 @@ F_take ==
     /\ fpc' = "F_scan"
     /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, fretry, fitem, evV, dbV, netV, budV, ghV>>
 
-\* 逐个 entry：tryLockOp，然后在 mu 里取快照、清 dirty
+\* per entry: tryLockOp, then take a snapshot and clear dirty inside mu
 F_scan ==
     /\ up /\ fpc = "F_scan" /\ fbatch # {}
     /\ LET e == CHOOSE x \in fbatch : TRUE IN
        /\ fbatch' = fbatch \ {e}
        /\ IF opH[e] # FREE THEN
-               \* 正在 create/delete/load：下一轮再处理，queued 仍为 TRUE
+               \* create/delete/load in progress: handle it in the next round; queued stays TRUE
                /\ fretry' = fretry \cup {e}
                /\ UNCHANGED <<opH, dirty, queued, fitem>>
           ELSE IF dead[e] \/ snap[e].k # "row" \/ dirty[e] = {} THEN
                /\ queued' = [queued EXCEPT ![e] = FALSE]
                /\ UNCHANGED <<opH, dirty, fretry, fitem>>
           ELSE
-               \* op 一直持有到这一批写完
+               \* op is held until this batch has been written
                /\ opH' = [opH EXCEPT ![e] = FL]
                /\ fitem' = [e |-> e, r |-> snap[e], m |-> dirty[e]]
                /\ dirty' = [dirty EXCEPT ![e] = {}]
@@ -571,7 +571,7 @@ F_scan ==
                /\ UNCHANGED fretry
     /\ UNCHANGED <<sysV, mapV, snap, dead, cliV, bgV, fpc, queue, evV, dbV, netV, budV, ghV>>
 
-\* requeueAll(retry)，然后发 UPDATE ... SET <mask 中的列>, ver WHERE id AND gen AND ver < ?
+\* requeueAll(retry), then send UPDATE ... SET <columns in mask>, ver WHERE id AND gen AND ver < ?
 F_send ==
     /\ up /\ fpc = "F_scan" /\ fbatch = {}
     /\ queue' = queue \cup fretry
@@ -583,10 +583,10 @@ F_send ==
             /\ SendStmt(FL, "upd", fitem.r.gen, fitem.r.ver, fitem.r.val, fitem.m)
     /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, fbatch, fitem, evV, dbV, resp, budV, ghV>>
 
-\* 写完：成功就放掉 op；失败或不确定，把掩码并回去、重新入队
+\* write done: on success release op; on failure or ambiguous outcome, merge the mask back and re-enqueue
 F_done ==
     /\ up /\ fpc = "F_wait" /\ ~wait[FL]
-    /\ resp' = [resp EXCEPT ![FL] = "none"]     \* 取走结果
+    /\ resp' = [resp EXCEPT ![FL] = "none"]     \* take the result
     /\ LET e == fitem.e IN
        /\ opH' = [opH EXCEPT ![e] = FREE]
        /\ IF resp[FL] = "ok"
@@ -600,10 +600,10 @@ F_done ==
                    net, wait, budV, ghV>>
 
 -----------------------------------------------------------------------------
-\* 淘汰器（7.7，dead 协议）。空闲 TTL、容量是否超限都是时间和策略问题，
-\* 这里让它在任何时刻都可以尝试淘汰，覆盖所有可能的时机。
+\* evictor (7.7, dead protocol). Idle TTL and whether capacity is exceeded are matters of time and policy;
+\* here it may attempt eviction at any moment, covering all possible timings.
 
-\* tryEvict：tryLockOp，在 mu 里确认 dirty == 0，设置 dead
+\* tryEvict: tryLockOp, confirm dirty == 0 inside mu, set dead
 V_evict ==
     /\ up /\ vpc = "V_pick" /\ mapE # 0 /\ nextEntry <= MaxEntry
     /\ LET e == mapE IN
@@ -614,8 +614,8 @@ V_evict ==
        /\ vpc' = "V_rm"
     /\ UNCHANGED <<sysV, mapV, snap, dirty, queued, cliV, bgV, flV, dbV, netV, budV, ghV>>
 
-\* 放掉 mu 之后（空档），在 shard.mu 里从 map 中摘除，然后放掉 op。
-\* 已经没有人拿着它的指针时，把它的 snap 清掉（只是为了减少状态数，没有人能再看到它）。
+\* after releasing mu (the gap), remove it from the map inside shard.mu, then release op.
+\* Once nobody holds a pointer to it, clear its snap (only to reduce the state count; nobody can see it again).
 V_remove ==
     /\ up /\ vpc = "V_rm"
     /\ mapE' = IF mapE = ve THEN 0 ELSE mapE
@@ -627,11 +627,11 @@ V_remove ==
                    cliV, bgV, flV, dbV, netV, budV, ghV>>
 
 -----------------------------------------------------------------------------
-\* DB（PostgreSQL）。所有写入都是条件写（I6）。
+\* DB (PostgreSQL). All writes are conditional writes (I6).
 
 NewRow(s) == [ex |-> TRUE, gen |-> s.gen, ver |-> 0, val |-> s.val]
 
-\* 语句执行之后 DB 的新状态
+\* new DB state after a statement executes
 ExecDb(s) ==
     CASE s.kind = "ins"  -> IF db.ex THEN db ELSE NewRow(s)          \* ON CONFLICT DO NOTHING
       [] s.kind = "insd" -> IF s.gen \notin dedup /\ ~db.ex THEN NewRow(s) ELSE db
@@ -643,14 +643,14 @@ ExecDb(s) ==
                             ELSE db
       [] s.kind = "del"  -> IF db.ex /\ db.gen = s.gen THEN DbAbsent ELSE db
 
-\* 语句执行的结果（UPDATE/DELETE 影响 0 行也算成功）
+\* result of executing a statement (an UPDATE/DELETE affecting 0 rows also counts as success)
 ExecResult(s) ==
     CASE s.kind = "ins"  -> IF db.ex THEN "dup" ELSE "ok"
       [] s.kind = "insd" -> IF s.gen \in dedup THEN "claimed"
                             ELSE IF db.ex THEN "conflict" ELSE "ok"
       [] OTHER           -> "ok"
 
-\* 执行一条语句（可能是迟到执行的）。如果发送者还在等，把结果交给它；响应也可能丢失。
+\* execute one statement (possibly a late execution). If the sender is still waiting, hand it the result; the response may also be lost.
 DbExec ==
     /\ \E s \in net :
          /\ db' = ExecDb(s)
@@ -660,14 +660,14 @@ DbExec ==
             THEN /\ wait' = [wait EXCEPT ![s.src] = FALSE]
                  /\ \/ /\ resp' = [resp EXCEPT ![s.src] = ExecResult(s)]
                        /\ UNCHANGED stmtTO
-                    \/ /\ stmtTO < MaxStmtTimeouts       \* 执行了，但响应丢了
+                    \/ /\ stmtTO < MaxStmtTimeouts       \* executed, but the response was lost
                        /\ stmtTO' = stmtTO + 1
                        /\ resp' = [resp EXCEPT ![s.src] = "amb"]
             ELSE UNCHANGED <<resp, wait, stmtTO>>
     /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, flV, evV,
                    drops, cto, crashes, nextGen, nextVal, ghV>>
 
-\* Go 侧 ctx 超时：发送者不再等了，按"结果不确定"处理；语句还在路上，之后可能执行
+\* Go-side ctx timeout: the sender stops waiting and treats it as an ambiguous outcome; the statement is still in flight and may execute later
 DbTimeout ==
     /\ stmtTO < MaxStmtTimeouts
     /\ \E s \in net :
@@ -680,7 +680,7 @@ DbTimeout ==
     /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, flV, evV, dbV,
                    drops, cto, crashes, nextGen, nextVal, ghV>>
 
-\* 语句被确定拒绝（statement_timeout、连接失败等，没有执行），或者永远到不了 DB
+\* statement definitely rejected (statement_timeout, connection failure, etc.; not executed), or never reaches the DB
 DbDrop ==
     /\ drops < MaxDrops
     /\ \E s \in net :
@@ -694,10 +694,10 @@ DbDrop ==
                    stmtTO, cto, crashes, nextGen, nextVal, ghV>>
 
 -----------------------------------------------------------------------------
-\* 崩溃与重启（7.8）
+\* crash and restart (7.8)
 
-\* 进程崩溃：内存全部丢失，所有 goroutine 消失；已经发出的语句还在路上，但没有人在等了。
-\* 正在进行 create 的客户端看到连接断开，结果不确定。
+\* process crash: all memory is lost and all goroutines vanish; statements already sent are still in flight, but nobody is waiting for them anymore.
+\* a client with a create in progress sees the connection drop; the outcome is ambiguous.
 Crash ==
     /\ up /\ crashes < MaxCrashes /\ nextEntry <= MaxEntry
     /\ up' = FALSE
@@ -736,8 +736,8 @@ Crash ==
                    stmtTO, drops, cto, nextGen, nextVal,
                    abs, deletedGens, insSent, delSent, violation>>
 
-\* 修复方案：重启时 pg_terminate_backend 旧进程的会话。会话没了，
-\* 旧进程发出、还没执行的语句就永远不会执行。
+\* the fix: on restart, pg_terminate_backend the previous process's sessions. With the sessions gone,
+\* statements sent by the previous process and not yet executed will never execute.
 FenceDrop ==
     /\ FixFence /\ ~up
     /\ \E s \in net : s.ep < epoch /\ net' = net \ {s}
@@ -750,7 +750,7 @@ Restart ==
     /\ UNCHANGED <<epoch, mapV, entV, cliV, bgV, flV, evV, dbV, netV, budV, ghV>>
 
 -----------------------------------------------------------------------------
-\* 所有客户端的操作都做完了，后台也空闲：允许停在这里（不算死锁）
+\* all client operations are done and background tasks are idle: allowed to stop here (not a deadlock)
 Done ==
     /\ up
     /\ \A c \in Clients : pc[c] = "idle" /\ ops[c] = 0 /\ bpc[c] = "idle"
@@ -771,28 +771,28 @@ Next ==
 Spec == Init /\ [][Next]_vars
 
 -----------------------------------------------------------------------------
-\* 不变式
+\* invariants
 
-\* 各个动作中的断言：Get 的线性一致性、崩溃之后的状态、去重表冲突
+\* assertions inside actions: Get linearizability, post-crash state, dedup table conflict
 NoViolation == violation = "none"
 
-\* 不可容忍①：已经删除（delete 的线性化点已经发生）的生命，不能重新出现在 DB 或内存里
+\* intolerable (1): a life that has been deleted (the delete's linearization point has occurred) must not reappear in the DB or in memory
 NoResurrection ==
     /\ db.ex => db.gen \notin deletedGens
     /\ (up /\ mapE # 0 /\ snap[mapE].k = "row") => snap[mapE].gen \notin deletedGens
 
-\* map 中已加载的 entry
+\* loaded entry in the map
 LiveLoaded == up /\ mapE # 0 /\ ~dead[mapE] /\ snap[mapE].k # "nil"
 
-\* 内存（map 中已加载的 entry）和抽象状态一致：所有线性化点都对得上
+\* memory (the loaded entry in the map) agrees with the abstract state: all linearization points line up
 MemMatchesAbs == (LiveLoaded /\ absKnown) => Proj(snap[mapE]) = abs
 
-\* I4 的推论：entry 是干净的、没有人持有 op、也没有还在路上的语句时，DB 和内存完全一致。
-\* 违反它说明旧值覆盖了新值，或者内存和 DB 永久地分叉了（不可容忍②③）。
+\* corollary of I4: when the entry is clean, nobody holds op, and no statement is in flight, the DB and memory are identical.
+\* A violation means an old value overwrote a new one, or memory and the DB diverged permanently (intolerable (2)(3)).
 QuiescentConsistent ==
     (LiveLoaded /\ dirty[mapE] = {} /\ opH[mapE] = FREE /\ net = {}) => DbRow = snap[mapE]
 
-\* 内存中没有这一行（或者还没加载）、而且一切都停下来时，DB 必须等于抽象状态
+\* when memory does not have this row (or it is not loaded yet) and everything has stopped, the DB must equal the abstract state
 AllIdle ==
     /\ net = {}
     /\ \A c \in Clients : bpc[c] \in {"idle", "B_done"}
@@ -801,28 +801,28 @@ DbMatchesAbsWhenIdle ==
     (up /\ absKnown /\ AllIdle /\ (mapE = 0 \/ snap[mapE].k = "nil" \/ dirty[mapE] = {}))
         => DbProj = abs
 
-\* 不可容忍④：已经确认的 create 不会消失（除非有人发过它的 DELETE）
+\* intolerable (4): a confirmed create does not disappear (unless someone sent its DELETE)
 CreateDurable ==
     (absKnown /\ abs.ex) => ((db.ex /\ db.gen = abs.gen) \/ abs.gen \in delSent)
 
-\* I5：同一个 key 同一时刻最多只有一条在等结果的写 SQL
+\* I5: for the same key, at most one write SQL is awaiting its result at any moment
 OneWriterPerKey == Cardinality({p \in DBProcs : wait[p]}) <= 1
 
-\* 脏的 entry 一定在刷盘的流水线上，不会被遗忘
+\* a dirty entry is always in the flush pipeline and is never forgotten
 DirtyImpliesQueued == (up /\ mapE # 0 /\ dirty[mapE] # {}) => queued[mapE]
 QueuedIsTracked ==
     (up /\ mapE # 0 /\ queued[mapE]) =>
         \/ mapE \in queue \cup fbatch \cup fretry
         \/ \E c \in Clients : pc[c] = "U_enq" /\ ce[c] = mapE
 
-\* I1：当前进程中没有 dead 的 entry 一定在 map 中
+\* I1: in the current process, an entry that is not dead must be in the map
 LiveEntryInMap ==
     \A e \in 1..(nextEntry - 1) : (up /\ eEp[e] = epoch /\ ~dead[e]) => mapE = e
 
 -----------------------------------------------------------------------------
-\* 只用于 hole3.cfg 的状态约束：崩溃时还在路上的旧语句只能是 UPDATE，
-\* 让 TLC 给出 design.md 13.2 中描述的那个 UPDATE 版本的反例
-\*（不加约束时，TLC 会先找到更短的 INSERT 版本，见 hole3_insert.cfg）。
+\* state constraint used only by hole3.cfg: old statements still in flight at crash time may only be UPDATEs,
+\* so that TLC produces the UPDATE version of the counterexample described in design.md 13.2
+\* (without the constraint, TLC first finds the shorter INSERT version; see hole3_insert.cfg).
 OldStmtsAreUpdates == \A s \in net : s.ep < epoch => s.kind = "upd"
 
 =============================================================================
