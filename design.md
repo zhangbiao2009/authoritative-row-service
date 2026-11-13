@@ -1007,6 +1007,8 @@ Capacity eviction (`capacityEvictShard`) follows the same flow: take K samples u
 
 **Prerequisite**: the DB account used by this service is used only by this service (section 2); otherwise other programs' sessions would be terminated too. Also, this step does not protect against accidentally starting a second instance: the second instance terminates the first instance's sessions, but after the first instance reconnects both would write at the same time. So "only one instance runs at any moment" must still be guaranteed by deployment (11.3).
 
+**Why "the new process can only bind the port after the old one exits" does not replace step 2**: it proves that the old *process* is gone, not that its SQL is gone. A PG backend notices that its client died only when it next talks to it, so a statement that is executing (or waiting on a lock) runs to completion and commits, and bytes already in the kernel send buffer or on the network are still delivered and executed. Verified on PG 16: after `kill -9` of a client whose UPDATE was running, its backend stayed `active` and the UPDATE committed 3 seconds later, after a new client had already read the old value; with step 2 run first, it never committed. (`client_connection_check_interval`, PG 14+, only narrows the window: a statement that finishes before the next check still commits.) Binding the same port is still useful: on a single host it makes "the old process is dead" (the prerequisite above) checkable.
+
 **Graceful shutdown**
 
 1. The TCP server stops accepting new connections; new requests arriving on existing connections all return `UNAVAILABLE` (see 7.10).
@@ -1229,7 +1231,7 @@ err = items.Delete(ctx, client.Key(int64(42)))
 - **Timeouts**: the SDK takes the time remaining on the caller's ctx, subtracts a small margin, and puts it in `timeout_ms`, so that the server times out first and returns an explicit Status (the same idea as "server-side timeout shorter than the Go-side timeout" in 8.4).
 - **Principle: the SDK automatically retries only idempotent requests** (Get, Create, Delete with gen). For other requests with an ambiguous outcome, `ErrOutcomeUnknown` is handed to the caller.
 - **Get**: read-only; retried directly when the connection drops.
-- **Create**: automatically generates a non-zero random gen. On `OUTCOME_UNKNOWN`, or if the connection drops after the request was sent, it retries with the same gen until the outcome is determined or the caller's ctx expires (returning `ErrOutcomeUnknown` on expiry). The dedup table makes such retries idempotent: even if someone else deletes the row in the meantime, it will not be re-inserted (7.4).
+- **Create**: automatically generates a non-zero random gen. On `OUTCOME_UNKNOWN`, or if the connection drops after the request was sent, it retries with the same gen until the outcome is determined or the caller's ctx expires (returning `ErrOutcomeUnknown` on expiry). The dedup table makes such retries idempotent: even if someone else deletes the row in the meantime, it will not be re-inserted (7.4). The gen must come from `crypto/rand` (or the OS-seeded `math/rand/v2` of Go 1.22+), never from a generator seeded with the time: SDKs started at the same moment, or cloned from one VM image, would produce identical sequences, a far likelier source of collisions than chance (correctness-properties.md A5).
 - **Delete**: when the caller supplies a gen (`client.WithExpectedGen`), retries are exactly idempotent: on `OUTCOME_UNKNOWN` or a dropped connection, retry with the same gen; if the retry returns `NOT_FOUND`, the earlier attempt already deleted it (or someone else did), and it is treated as success. **Without a gen there is no automatic retry**; like Update, it returns `ErrOutcomeUnknown`: a retry in that case could delete the same primary key that someone else re-created during the retry (the client-level counterpart of example 3 in 8.2). Which life to delete is business semantics, left for the business side to decide (for example, Get first to obtain the gen, then delete).
 - **Update**: if the connection drops after the request was sent, it is **not retried automatically**; `ErrOutcomeUnknown` is returned to the caller. Reason: an INCR retry could add twice; a SET retry could overwrite a newer value someone else wrote in the meantime. The business side has confirmed: increments are only used on less important data and do not need "exactly once".
 - `BUSY`, `UNAVAILABLE`: retry after backoff.
@@ -1554,11 +1556,13 @@ The whole service is deployed as a single instance, and the deployment process g
 | `RowService.tla` | The model itself; comments indicate which section of this document each part corresponds to |
 | `*.cfg` | The individual check scenarios (scale, which faults are enabled, whether the fixes are included) |
 | `run.sh` | Run: `./run.sh <scenario name>`; requires Java 11+ and `tla2tools.jar` (TLC 2.19, by default placed in `~/.local/share/tla/`) |
+| `live.cfg` | Liveness check under weak fairness (`FairSpec`) |
+| `suite.py` | The acceptance suites: `python3 suite.py holes|mutants|witnesses|liveness|all` (planted bugs must be caught, reachability witnesses must be violated) |
 | `trace.py` | Compresses a TLC counterexample into "what each step did and which variables changed": `./run.sh hole1 > out/hole1.out; python3 trace.py < out/hole1.out` |
 
 **Modeling scope**: one key; allocation and eviction of the entry in the shard map (dead protocol); the entry's snap / dirty / queued / dead / op; Get, Update, Create, Delete, plus runSync continuing in the background after the client gives up; the flusher; a DB that can execute late (statements may still execute after a timeout, responses may be lost, statements may be definitely rejected); the SDK retrying create with the same gen; process crash and restart. The critical sections of `mu`, `shard.mu` and `qmu` are each modeled as one atomic step, and every gap of section 10 is a separate step.
 
-**Properties checked**: an abstract sequential state is maintained, and each operation modifies it at its linearization point from section 9.
+**Properties checked**: the full list, with the reasons, the environment model, the mutation catalogue and the reachability witnesses, is in [correctness-properties.md](correctness-properties.md). In short: an abstract sequential state is maintained, and each operation modifies it at its linearization point from section 9.
 
 | Invariant | Meaning |
 |---|---|
@@ -1571,6 +1575,13 @@ The whole service is deployed as a single instance, and the deployment process g
 | `OneWriterPerKey` | For a given key, at most one write SQL is awaiting its result at any moment (I5) |
 | `DirtyImpliesQueued`, `QueuedIsTracked` | Dirty data is always in the flush pipeline and is never forgotten |
 | `LiveEntryInMap` | An entry that is not dead is always in the map (I1) |
+| `CleanIsDurable` | When the entry is clean and nobody holds op, the DB equals memory, even with late statements in flight (I4) |
+| `DbNotAhead` | The DB ver is never greater than the memory ver for the life memory holds |
+| `DbValsBelongToGen` | Every column value in the DB belongs to the life that owns the row |
+| `NoDirtyEviction` | An entry being evicted holds no dirty data (I10) |
+| `FencedRestart` | Once up, no statement of a previous process is in flight (I15) |
+| `DbVerMonotonic` (action property) | Within one life the DB ver never decreases, and values never change without a larger ver |
+| `EventuallyResponds`, `BackgroundSettles`, `EventuallyFlushed`, `NoLockLeak` (liveness, `FairSpec`) | Every request is answered; every background create/delete settles; dirty data is eventually flushed; op is never held forever |
 
 TLC also checks for deadlock: apart from "all operations are done", every state must still be able to make progress.
 
@@ -1580,16 +1591,20 @@ TLC also checks for deadlock: apart from "all operations are done", every state 
 |---|---|---|
 | `hole1` | The current design; INSERT may execute late | Violates `NoResurrection`; the counterexample matches hole 1 of 13.2 |
 | `hole2` | The current design; client gives up waiting, SDK retries create | Violates `NoResurrection`; the counterexample matches hole 2 |
-| `hole3` | The current design; a flush UPDATE is still in flight at crash time | Violates `QuiescentConsistent`; the counterexample matches hole 3 |
+| `hole3` | The current design; a flush UPDATE is still in flight at crash time | Violates `DbNotAhead` the moment the old UPDATE lands (before the properties of correctness-properties.md were added: `QuiescentConsistent`); the counterexample matches hole 3 |
 | `hole3_insert` | The current design; an INSERT is still in flight at crash time | Violates `QuiescentConsistent` (INSERT version of hole 3) |
 | `hole4` | The current design; statement responses can be lost, and statements can be definitely rejected | Violates `DbMatchesAbsWhenIdle`; a new hole found by TLC (hole 4 of 13.2) |
 | `hole1-4_fixed` | Same as above, with the corresponding fixes added | All pass |
 | `base` | Hole 4 fixed, preconditions of holes 1-3 removed; 2 clients, 3 operations each, at most 2 creates, 2 updates, 3 entries (reallocated after eviction), one each of: ambiguous statement, rejected statement, client giving up waiting | **Pass**: 275 million distinct states, longest interleaving 71 steps, 19 minutes |
-| `fixed` | Same scale as `base`, all faults enabled (late INSERT execution, SDK retrying create, 1 crash), plus all fixes | **Pass**: 1.67 billion distinct states, longest interleaving 74 steps, 2 hours |
+| `fixed` | Same scale as `base`, all faults enabled (late INSERT execution, SDK retrying create, 1 crash), plus all fixes | **Pass**: 1.67 billion distinct states, longest interleaving 74 steps, 2 hours (re-run with every property of `correctness-properties.md`: same 1,667,861,866 states, no error) |
 | `base_2col` | Same design and faults as `base`, table has two columns, each update changes one of them: checks that only dirty columns are written and that the mask is merged back on failure. Scale: 2 clients, 3 operations each, 1 create, 3 updates, 2 entries | **Pass**: 39.66 million distinct states, longest interleaving 62 steps, 3 minutes |
 
 | `base_big` | Random simulation (not exhaustive): same design as `base`, scale enlarged to 3 clients, two columns, 4 operations each, 2 of each kind of fault; randomly generated executions, each up to 300 steps | **No violation found**: 25 minutes, about 1.6 billion states checked |
-| `fixed_big` | Random simulation: same as `fixed` (all faults + fixes), scale same as `base_big`, 2 crashes | **No violation found**: 25 minutes, about 1.5 billion states checked |
+| `fixed_big` | Random simulation: same as `fixed` (all faults + fixes), scale same as `base_big`, 2 crashes | **No violation found**: 25 minutes, about 1.5 billion states checked (re-run with the new properties: about 1.38 billion, no violation) |
+| `live` | Liveness under weak fairness: all faults + fixes, 2 clients, 2 operations each, 1 crash | **Pass**: 9.63 million distinct states, all four liveness properties, 27 minutes |
+| mutants | 15 planted bugs, one at a time, in the `fixed` environment (correctness-properties.md 7) | **All 15 caught** |
+| witnesses | 17 "this situation never happens" claims in the `fixed` environment (correctness-properties.md 8) | **All 17 violated**: every fault scenario, including each hole's precondition, is reachable |
+| liveness mutants | 2 planted bugs checked by liveness alone | **Both caught** |
 
 **Conclusion**: apart from the four holes of 13.2, within the above scales no other interleaving that violates an invariant or deadlocks was found. The fixes for the four holes have been written into the main body of the design (`FixDedup` corresponds to the dedup table and "create loads first" of 7.4 and 8.3, `FixFence` corresponds to the startup cleanup of 7.8, `FixUnsureRetry` corresponds to the two kinds of definite failure of 7.4, 7.5 and 8.4). When changing the design in the future, first change it in the model and run these scenarios, then change the code.
 
@@ -1599,7 +1614,7 @@ TLC also checks for deadlock: apart from "all operations are done", every state 
 - Only one key is modeled. Different keys share only the shard's map and queue; those two locks are leaf locks and do not affect the correctness of a single key.
 - Increment is not modeled separately: it is done inside the same `mu` critical section as assignment, and the concurrency structure is exactly the same.
 - Not modeled: load failures and error caching, backpressure, the poison row quarantine, interactions between multiple rows in one batch, the external protocol (7.10), schema.
-- Only safety and deadlock are checked, not liveness (e.g. "after the DB recovers, dirty data is eventually written").
+- Liveness is checked only at the smaller scale of `live.cfg`, and under the assumption that every fault is finite (correctness-properties.md A7).
 
 ---
 

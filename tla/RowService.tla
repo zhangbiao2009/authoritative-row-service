@@ -23,6 +23,12 @@
 \*
 \* To bound the state count, local variables are reset to fixed initial values once they are no longer needed (clear
 \* cop/ce when an operation ends, be/bop when the background task ends, resp once the result is taken, etc.). This does not change behavior.
+\*
+\* The properties checked here, and how each one is exercised, are specified in ../correctness-properties.md:
+\*   - safety invariants and one action property (Spec)
+\*   - liveness properties under weak fairness (FairSpec, live.cfg)
+\*   - mutations: the constant Mut plants exactly one known bug; each must be caught (suite.py mutants)
+\*   - reachability witnesses W_*: each must be violated, proving the model reaches that situation (suite.py witnesses)
 
 EXTENDS Naturals, FiniteSets, TLC
 
@@ -41,9 +47,31 @@ CONSTANTS
     RetryCreate,        \* whether the SDK retries an ambiguous create with the same gen (precondition of hole 2)
     FixDedup,           \* fix for holes 1, 2: gen dedup table + create loads first
     FixFence,           \* fix for hole 3: on restart, first clear the sessions the previous process left on PG
-    FixUnsureRetry      \* fix for hole 4: after any ambiguous attempt, a definite failure cannot be taken as the final result
+    FixUnsureRetry,     \* fix for hole 4: after any ambiguous attempt, a definite failure cannot be taken as the final result
+    Mut                 \* "none", or the name of one planted bug (see MutNames and correctness-properties.md section 6)
+
+\* Each mutation breaks exactly one rule of the design; with Mut = "none" the model is the design itself.
+MutNames == {
+    "none",
+    "NoVerCheck",          \* flush UPDATE without "AND ver < ?"
+    "NoGenCheck",          \* flush UPDATE / DELETE without "AND gen = ?"
+    "FlushUpsert",         \* flush is an upsert: inserts the row when it does not exist
+    "DedupDeletedWithRow", \* deleting the business row also deletes its dedup record
+    "NoMaskMerge",         \* a failed flush does not merge its column mask back
+    "EvictDirty",          \* eviction does not check dirty
+    "EvictNoDead",         \* eviction removes the entry from the map without setting dead
+    "UpdateIgnoresDead",   \* Update does not check dead
+    "LoadNoRecheck",       \* load does not re-check snap after acquiring op
+    "FlushNoOp",           \* the flusher writes without holding op
+    "ReleaseOnAmbiguous",  \* create/delete: on an ambiguous outcome, give up and release op
+    "SelectConfirms",      \* create/delete: on an ambiguous outcome, decide by one SELECT
+    "CreateNoLoad",        \* create inserts without loading first
+    "DeleteKeepsDirty",    \* a successful delete keeps the dirty mask
+    "LeakOpOnNotFound"     \* delete of a missing row returns without releasing op
+}
 
 ASSUME MaxEntry >= 1
+ASSUME Mut \in MutNames
 
 VARIABLES
     \* whether the service is running; epoch + 1 on each crash
@@ -211,14 +239,17 @@ SendStmt(p, kind, g, ver, vl, m) ==
     /\ wait' = [wait EXCEPT ![p] = TRUE]
 
 \* runSync's fn ends: release op; if the client is still waiting, hand it the result
-Finish(c, res) ==
-    /\ opH' = [opH EXCEPT ![be[c]] = FREE]
+\* (rel = FALSE only under the mutation LeakOpOnNotFound)
+FinishOp(c, res, rel) ==
+    /\ opH' = IF rel THEN [opH EXCEPT ![be[c]] = FREE] ELSE opH
     /\ bpc' = [bpc EXCEPT ![c] = IF cwait[c] THEN "B_done" ELSE "idle"]
     /\ bres' = [bres EXCEPT ![c] = IF cwait[c] THEN res ELSE "none"]
     /\ bop' = [bop EXCEPT ![c] = IF cwait[c] THEN @ ELSE NoOp]
     /\ be' = [be EXCEPT ![c] = 0]
     /\ bgr' = [bgr EXCEPT ![c] = 0]
     /\ bamb' = [bamb EXCEPT ![c] = FALSE]
+
+Finish(c, res) == FinishOp(c, res, TRUE)
 
 \* Create's linearization point (I7): after the DB has definitely succeeded, snap.Store(row) inside mu
 CreateLP(c, row, obsBefore) ==
@@ -315,7 +346,7 @@ L_load(c) ==
     /\ up /\ pc[c] = "L_load"
     /\ LET e == ce[c] IN
        /\ opH' = [opH EXCEPT ![e] = FREE]
-       /\ IF dead[e] \/ snap[e].k # "nil"
+       /\ IF dead[e] \/ (snap[e].k # "nil" /\ Mut # "LoadNoRecheck")
           THEN UNCHANGED <<snap, abs, absKnown, seen, violation>>
           ELSE /\ snap' = [snap EXCEPT ![e] = DbRow]
                /\ Observe(DbProj)
@@ -335,7 +366,7 @@ U_mu(c) ==
            nv  == <<old.gen, op.v>>
            nr  == [old EXCEPT !.ver = old.ver + 1, !.val = [old.val EXCEPT ![op.col] = nv]]
        IN
-       IF dead[e] THEN
+       IF dead[e] /\ Mut # "UpdateIgnoresDead" THEN
             \* eviction is removing it: look up the map again
             /\ pc' = [pc EXCEPT ![c] = "U_goc"]
             /\ UNCHANGED <<snap, dirty, queued, cop, ce, cret, lastSeen, abs, seen>>
@@ -420,7 +451,7 @@ B_c1(c) ==
            cur == snap[e]
            g   == bop[c].gen
        IN
-       IF FixDedup /\ cur.k = "nil" THEN
+       IF FixDedup /\ cur.k = "nil" /\ Mut # "CreateNoLoad" THEN
             \* the fix: load first, and use memory to decide whether it already exists
             /\ snap' = [snap EXCEPT ![e] = DbRow]
             /\ Observe(DbProj)
@@ -452,6 +483,19 @@ B_c2(c) ==
             /\ CreateLP(c, RowR(g, 0, InitVal(g)), AbsAbsent)
             /\ Finish(c, "ok")
             /\ UNCHANGED <<net, wait>>
+       ELSE IF r = "amb" /\ Mut = "ReleaseOnAmbiguous" THEN
+            \* mutation: return "unknown" and release op; memory keeps saying "absent"
+            /\ Finish(c, "unknown")
+            /\ UNCHANGED <<snap, dirty, net, wait, abs, absKnown, seen, violation>>
+       ELSE IF r = "amb" /\ Mut = "SelectConfirms" /\ mine THEN
+            \* mutation: one SELECT sees the row, so it is taken as created
+            /\ CreateLP(c, DbRow, DbProj)
+            /\ Finish(c, "ok")
+            /\ UNCHANGED <<net, wait>>
+       ELSE IF r = "amb" /\ Mut = "SelectConfirms" THEN
+            \* mutation: one SELECT does not see the row, so it is taken as not created
+            /\ Finish(c, "fail")
+            /\ UNCHANGED <<snap, dirty, net, wait, abs, absKnown, seen, violation>>
        ELSE IF (r = "dup" \/ r = "claimed") /\ mine THEN
             \* conflict, and SELECT sees its own gen: an earlier "ambiguous" INSERT actually succeeded
             /\ CreateLP(c, DbRow, DbProj)
@@ -501,7 +545,7 @@ B_d1(c) ==
             /\ Observe(DbProj)
             /\ UNCHANGED <<opH, bgV, net, wait, delSent>>
        ELSE IF r.k = "absent" \/ (eg # 0 /\ r.gen # eg) THEN
-            /\ Finish(c, "notfound")
+            /\ FinishOp(c, "notfound", Mut # "LeakOpOnNotFound")
             /\ UNCHANGED <<snap, net, wait, delSent, abs, absKnown, seen, violation>>
        ELSE
             \* (1) delete from the DB first: DELETE ... WHERE id AND gen. mu is not held meanwhile, so updates can proceed
@@ -519,14 +563,19 @@ B_d2(c) ==
     /\ LET e == be[c]
            r == resp[BG(c)]
        IN
-       IF r = "ok" THEN
+       IF r = "ok" \/ (r = "amb" /\ Mut = "SelectConfirms" /\ ~(db.ex /\ db.gen = bgr[c])) THEN
             \* (2) linearization point: replace with a tombstone in the same mu critical section, and discard dirty data
+            \* (under the mutation SelectConfirms, also when one SELECT after an ambiguous attempt no longer sees the row)
             /\ snap' = [snap EXCEPT ![e] = ABSENT]
-            /\ dirty' = [dirty EXCEPT ![e] = {}]
+            /\ dirty' = IF Mut = "DeleteKeepsDirty" THEN dirty ELSE [dirty EXCEPT ![e] = {}]
             /\ LP(AbsAbsent)
             /\ deletedGens' = deletedGens \cup {bgr[c]}
             /\ Finish(c, "ok")
             /\ UNCHANGED <<net, wait>>
+       ELSE IF r = "amb" /\ Mut \in {"ReleaseOnAmbiguous", "SelectConfirms"} THEN
+            \* mutation: give up (ReleaseOnAmbiguous), or one SELECT still sees the row so it is taken as failed (SelectConfirms)
+            /\ Finish(c, IF Mut = "ReleaseOnAmbiguous" THEN "unknown" ELSE "fail")
+            /\ UNCHANGED <<snap, dirty, abs, seen, deletedGens, net, wait>>
        ELSE IF r = "fail" /\ ~(FixUnsureRetry /\ bamb[c]) THEN
             \* definite failure: the row is still there, dirty is kept (the current design: regardless of whether there were earlier ambiguous attempts)
             /\ Finish(c, "fail")
@@ -555,7 +604,7 @@ F_scan ==
     /\ up /\ fpc = "F_scan" /\ fbatch # {}
     /\ LET e == CHOOSE x \in fbatch : TRUE IN
        /\ fbatch' = fbatch \ {e}
-       /\ IF opH[e] # FREE THEN
+       /\ IF opH[e] # FREE /\ Mut # "FlushNoOp" THEN
                \* create/delete/load in progress: handle it in the next round; queued stays TRUE
                /\ fretry' = fretry \cup {e}
                /\ UNCHANGED <<opH, dirty, queued, fitem>>
@@ -564,7 +613,7 @@ F_scan ==
                /\ UNCHANGED <<opH, dirty, fretry, fitem>>
           ELSE
                \* op is held until this batch has been written
-               /\ opH' = [opH EXCEPT ![e] = FL]
+               /\ opH' = IF Mut = "FlushNoOp" THEN opH ELSE [opH EXCEPT ![e] = FL]
                /\ fitem' = [e |-> e, r |-> snap[e], m |-> dirty[e]]
                /\ dirty' = [dirty EXCEPT ![e] = {}]
                /\ queued' = [queued EXCEPT ![e] = FALSE]
@@ -588,10 +637,10 @@ F_done ==
     /\ up /\ fpc = "F_wait" /\ ~wait[FL]
     /\ resp' = [resp EXCEPT ![FL] = "none"]     \* take the result
     /\ LET e == fitem.e IN
-       /\ opH' = [opH EXCEPT ![e] = FREE]
+       /\ opH' = IF Mut = "FlushNoOp" THEN opH ELSE [opH EXCEPT ![e] = FREE]
        /\ IF resp[FL] = "ok"
           THEN UNCHANGED <<dirty, queued, queue>>
-          ELSE /\ dirty' = [dirty EXCEPT ![e] = @ \cup fitem.m]
+          ELSE /\ dirty' = IF Mut = "NoMaskMerge" THEN dirty ELSE [dirty EXCEPT ![e] = @ \cup fitem.m]
                /\ queued' = [queued EXCEPT ![e] = TRUE]
                /\ queue' = IF queued[e] THEN queue ELSE queue \cup {e}
     /\ fitem' = NoItem
@@ -607,8 +656,8 @@ F_done ==
 V_evict ==
     /\ up /\ vpc = "V_pick" /\ mapE # 0 /\ nextEntry <= MaxEntry
     /\ LET e == mapE IN
-       /\ opH[e] = FREE /\ ~dead[e] /\ dirty[e] = {}
-       /\ dead' = [dead EXCEPT ![e] = TRUE]
+       /\ opH[e] = FREE /\ ~dead[e] /\ (dirty[e] = {} \/ Mut = "EvictDirty")
+       /\ dead' = IF Mut = "EvictNoDead" THEN dead ELSE [dead EXCEPT ![e] = TRUE]
        /\ opH' = [opH EXCEPT ![e] = EV]
        /\ ve' = e
        /\ vpc' = "V_rm"
@@ -635,13 +684,16 @@ NewRow(s) == [ex |-> TRUE, gen |-> s.gen, ver |-> 0, val |-> s.val]
 ExecDb(s) ==
     CASE s.kind = "ins"  -> IF db.ex THEN db ELSE NewRow(s)          \* ON CONFLICT DO NOTHING
       [] s.kind = "insd" -> IF s.gen \notin dedup /\ ~db.ex THEN NewRow(s) ELSE db
-      [] s.kind = "upd"  -> IF db.ex /\ db.gen = s.gen /\ db.ver < s.ver
+      [] s.kind = "upd"  -> IF db.ex /\ (db.gen = s.gen \/ Mut = "NoGenCheck")
+                                  /\ (db.ver < s.ver \/ Mut = "NoVerCheck")
                             THEN [db EXCEPT !.ver = s.ver,
                                             !.val = [col \in Cols |->
                                                        IF col \in s.mask THEN s.val[col]
                                                        ELSE db.val[col]]]
+                            ELSE IF ~db.ex /\ Mut = "FlushUpsert"
+                            THEN [ex |-> TRUE, gen |-> s.gen, ver |-> s.ver, val |-> s.val]
                             ELSE db
-      [] s.kind = "del"  -> IF db.ex /\ db.gen = s.gen THEN DbAbsent ELSE db
+      [] s.kind = "del"  -> IF db.ex /\ (db.gen = s.gen \/ Mut = "NoGenCheck") THEN DbAbsent ELSE db
 
 \* result of executing a statement (an UPDATE/DELETE affecting 0 rows also counts as success)
 ExecResult(s) ==
@@ -654,7 +706,10 @@ ExecResult(s) ==
 DbExec ==
     /\ \E s \in net :
          /\ db' = ExecDb(s)
-         /\ dedup' = IF s.kind = "insd" THEN dedup \cup {s.gen} ELSE dedup
+         /\ dedup' = CASE s.kind = "insd" -> dedup \cup {s.gen}
+                       [] s.kind = "del" /\ Mut = "DedupDeletedWithRow" /\ db.ex /\ db.gen = s.gen
+                                         -> dedup \ {s.gen}
+                       [] OTHER -> dedup
          /\ net' = net \ {s}
          /\ IF s.live
             THEN /\ wait' = [wait EXCEPT ![s.src] = FALSE]
@@ -818,6 +873,88 @@ QueuedIsTracked ==
 \* I1: in the current process, an entry that is not dead must be in the map
 LiveEntryInMap ==
     \A e \in 1..(nextEntry - 1) : (up /\ eEp[e] = epoch /\ ~dead[e]) => mapE = e
+
+\* I10: an entry being evicted (dead) never holds dirty data, and nothing can make it dirty afterwards
+NoDirtyEviction == \A e \in Entries : dead[e] => dirty[e] = {}
+
+\* every column value in the DB was written by the life that currently owns the row
+\* (a violation means "data of an old object written into a new object", 8.2 example 2)
+DbValsBelongToGen == db.ex => \A col \in Cols : db.val[col][1] = db.gen
+
+\* the DB is never newer than memory for the life memory holds (a violation means a write memory never made reached the DB)
+DbNotAhead ==
+    (LiveLoaded /\ snap[mapE].k = "row" /\ db.ex /\ db.gen = snap[mapE].gen) => db.ver <= snap[mapE].ver
+
+\* I4 in its strongest form: whenever nobody holds op and the entry is clean, memory and the DB are identical,
+\* even while late statements are still in flight (they must all be harmless by then).
+\* While a flush is in progress the entry is already clean but op is held, which is why op appears here.
+CleanIsDurable ==
+    (LiveLoaded /\ dirty[mapE] = {} /\ opH[mapE] = FREE) => DbRow = snap[mapE]
+
+\* I15: once the service is up, no statement from a previous process is still in flight
+FencedRestart == (FixFence /\ up) => \A s \in net : s.ep = epoch
+
+\* action property: within one life, the DB ver never goes back, and a value never changes without a larger ver
+\* (a violation means a stale UPDATE overwrote a newer one, 8.2 example 1)
+DbVerMonotonic ==
+    [][(db.ex /\ db'.ex /\ db'.gen = db.gen) =>
+         /\ db'.ver >= db.ver
+         /\ (db'.val # db.val => db'.ver > db.ver)]_db
+
+-----------------------------------------------------------------------------
+\* liveness (correctness-properties.md section 5)
+\*
+\* Fairness: every step of an operation that has started, of the flusher, of an eviction already under way, of DB execution,
+\* and of a restart eventually happens if it stays enabled. Faults (DbTimeout, DbDrop, Crash, a client giving up) and the
+\* choice of new operations and of starting an eviction get no fairness: they may or may not happen. All faults are bounded
+\* by the budgets above, which models "the DB is not unavailable forever".
+
+Fairness ==
+    /\ \A c \in Clients :
+         /\ WF_vars(Goc(c)) /\ WF_vars(G_read(c)) /\ WF_vars(L_lock(c)) /\ WF_vars(L_load(c))
+         /\ WF_vars(U_mu(c)) /\ WF_vars(U_enq(c)) /\ WF_vars(X_lock(c)) /\ WF_vars(X_wait(c))
+         /\ WF_vars(B_c1(c)) /\ WF_vars(B_c2(c)) /\ WF_vars(B_d1(c)) /\ WF_vars(B_d2(c))
+    /\ WF_vars(F_take) /\ WF_vars(F_scan) /\ WF_vars(F_send) /\ WF_vars(F_done)
+    /\ WF_vars(V_remove)
+    /\ WF_vars(DbExec) /\ WF_vars(FenceDrop) /\ WF_vars(Restart)
+
+FairSpec == Spec /\ Fairness
+
+\* L1: every request a client has issued eventually gets an answer (success, failure, or "unknown")
+EventuallyResponds == \A c \in Clients : pc[c] # "idle" ~> pc[c] = "idle"
+
+\* L2: every create/delete running in the background eventually reaches a definite outcome
+BackgroundSettles ==
+    \A c \in Clients : bpc[c] \in {"B_c1", "B_c2", "B_d1", "B_d2"} ~> bpc[c] \in {"idle", "B_done"}
+
+\* L3: dirty data is eventually flushed (or lost in a crash, which the requirements allow)
+EventuallyFlushed == \A e \in Entries : dirty[e] # {} ~> dirty[e] = {}
+
+\* L4: op is never held forever (no lock leak; an entry can always become evictable again)
+NoLockLeak == \A e \in Entries : opH[e] # FREE ~> opH[e] = FREE
+
+-----------------------------------------------------------------------------
+\* reachability witnesses (correctness-properties.md section 7). Each W_x claims that a situation never occurs;
+\* TLC MUST report each one as violated. If one holds, the model never reaches that situation, and every property
+\* that relies on it passes vacuously.
+
+W_Delete               == deletedGens = {}
+W_Recreate             == ~(abs.ex /\ deletedGens # {})
+W_Evict                == \A e \in Entries : ~dead[e]
+W_Reload               == nextEntry <= 2
+W_Crash                == crashes = 0
+W_CrashWithStmtInFlight == ~(~up /\ net # {})
+W_LateStmt             == \A s \in net : s.live
+W_EffectiveLateStmt    == ~(\E s \in net : ~s.live /\ ExecDb(s) # db)
+W_LateInsertOfDeletedGen == ~(\E s \in net : s.kind \in {"ins", "insd"} /\ s.gen \in deletedGens)
+W_OldUpdateAtRestart   == ~(~up /\ \E s \in net : s.ep < epoch /\ s.kind = "upd")
+W_RetryOfDeletedGen    == ~(\E c \in Clients : cop[c].t = "create" /\ cop[c].gen \in deletedGens)
+W_DedupClaimed         == ~(\E c \in Clients : resp[BG(c)] = "claimed")
+W_AmbThenNotExecuted   == ~(\E c \in Clients : bamb[c] /\ ~wait[BG(c)] /\ resp[BG(c)] = "fail")
+W_FlushFailed          == ~(fpc = "F_wait" /\ ~wait[FL] /\ resp[FL] \in {"amb", "fail"})
+W_UpdateDuringFlush    == ~(fitem # NoItem /\ dirty[fitem.e] # {})
+W_UpdateDuringDelete   == ~(\E c \in Clients : bpc[c] = "B_d2" /\ dirty[be[c]] # {})
+W_ClientGaveUp         == cto = 0
 
 -----------------------------------------------------------------------------
 \* state constraint used only by hole3.cfg: old statements still in flight at crash time may only be UPDATEs,

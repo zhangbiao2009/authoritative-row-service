@@ -3,6 +3,8 @@
 #   config: hole1 / hole2 / hole3 (current design, expected to fail with a counterexample)
 #           base (current design without the preconditions of the three holes, expected to pass)
 #           fixed (all faults enabled + the fixes, expected to pass)
+#           base_2col, live (liveness under FairSpec), base_big / fixed_big (random simulation: add -simulate -depth 300)
+#   The mutant, witness and liveness suites (../correctness-properties.md sections 7-9): python3 suite.py {holes|mutants|witnesses|liveness|all}
 # Requires Java 11+ and tla2tools.jar (default location ~/.local/share/tla/, override with TLA2TOOLS).
 # Environment: TLC_HEAP (JVM heap, default 8g), TLC_WORKERS (checker threads, default auto).
 set -euo pipefail
