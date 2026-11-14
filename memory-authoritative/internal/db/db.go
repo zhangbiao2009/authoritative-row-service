@@ -68,4 +68,22 @@ type DB interface {
 	// Zero rows affected is not an error (7.6): an earlier write that timed out may have landed, or the row
 	// is gone. The values are absolute, never col = col + delta (I12).
 	Update(ctx context.Context, r *schema.Row, mask uint64) error
+
+	// InsertDedup inserts r (r.Ver == 0) and its dedup record (table, r.Key, r.Gen) in one statement: both
+	// take effect or neither (I14; design.md 5.1, 8.3). It returns the stored row, with any defaults the DB
+	// filled in. ErrGenClaimed: the dedup record exists, nothing was written. ErrDuplicate: the dedup record
+	// was new and is now written, but a row with r.Key exists.
+	InsertDedup(ctx context.Context, r *schema.Row) (*schema.Row, error)
+
+	// GenClaimed reports whether (key, gen) is in the dedup table: whether a create of that gen ever took
+	// effect (7.4, hole 6).
+	GenClaimed(ctx context.Context, key schema.Key, gen int64) (bool, error)
+
+	// Delete deletes the row with key and gen (I6). Zero rows affected is not an error. The dedup record
+	// stays (I14).
+	Delete(ctx context.Context, key schema.Key, gen int64) error
+
+	// FenceSessions terminates the sessions and returns nil once none of them can execute anything any
+	// more (7.4, 8.3). An error means "not confirmed": some of them may still execute.
+	FenceSessions(ctx context.Context, ids []SessionID) error
 }
