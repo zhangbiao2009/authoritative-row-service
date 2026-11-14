@@ -61,7 +61,7 @@ created: 2026-11-11
   - An old value overwriting a new value and staying in the DB long-term
   - Data of an old object being written into a new object re-created with the same id
 - External protocol: **a custom TCP protocol with protobuf message bodies** (see 7.10).
-- Language: Go 1.25 (this machine currently has 1.24, to be upgraded when work starts; `testing/synctest` requires 1.25). Other languages are not considered for now.
+- Language: Go 1.25 (`testing/synctest` requires 1.25; this machine has 1.25.14). Other languages are not considered for now.
 
 ---
 
@@ -1816,7 +1816,7 @@ Answers to the first round of questions (2026-11-11):
 | 8 | Does Update need to carry gen? | The user was unsure, worried it would be unfriendly to the business side. The recommended option was adopted: **optional, not checked by default**. Business clients that do not use it are completely unaware of it; the gen used by create is generated automatically by the Go SDK, so business clients never touch it either | 7.3, 7.10 |
 | 9 | Does Update have read-modify-write semantics such as increment? | Yes. Update supports SET and INCR | 7.3, 7.10 |
 | 10 | Must an update that arrives while a delete is in progress fail? | No; it is allowed to succeed | 7.3, 15 |
-| 11 | Which Go version? | Go 1.25 (this machine currently has 1.24; upgrade when work starts) | 1, 12.1 |
+| 11 | Which Go version? | Go 1.25 (installed: 1.25.14) | 1, 12.1 |
 
 Answers to the second round of questions (2026-11-11):
 
