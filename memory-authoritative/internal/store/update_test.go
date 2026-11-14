@@ -205,3 +205,20 @@ func TestUpdateRejectsMalformedChange(t *testing.T) {
 		t.Fatalf("%s, want %s", got, clean)
 	}
 }
+
+// Change.Gen (7.3): an update meant for one life must not change another.
+func TestUpdateWithGen(t *testing.T) {
+	d := fakedb.New()
+	s := newTestStore(t, d)
+	k := key(t, s, 1)
+	d.Put(testRow(k, 1)) // gen 101
+	if _, err := s.Update(context.Background(), k, Change{Gen: 999, Cols: []ColChange{set(1, "x")}}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Update with another gen: %v, want ErrNotFound", err)
+	}
+	if got := bookkeeping(s, k); got != clean {
+		t.Fatalf("after the rejected update: %s, want %s", got, clean)
+	}
+	if r, err := s.Update(context.Background(), k, Change{Gen: 101, Cols: []ColChange{set(1, "x")}}); err != nil || r.Vals[1] != "x" {
+		t.Fatalf("Update with the row's gen = %+v, %v", r, err)
+	}
+}
