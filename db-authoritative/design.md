@@ -205,19 +205,12 @@ The examples use a sample table `items(id, gen, ver, name, score)`.
 
 ### 5.2 Go structures
 
-```go
-package store
+`Key`, `Row` and `ErrInvalid` live in package `schema`, which both `db` and `store` import: `db.DB` returns rows, and `store` imports `db`, so defining them in `store` would be an import cycle (decided 2026-11-14, 13.1). The skeletons in this document write `Key` and `Row` for `schema.Key` and `schema.Row`.
 
-var (
-	ErrNotFound       = errors.New("not found")
-	ErrAlreadyExists  = errors.New("already exists")
-	ErrOutcomeUnknown = errors.New("outcome unknown") // the client's deadline expired before the outcome was settled
-	ErrInvalid        = errors.New("invalid argument") // increment of NULL, result out of range, etc. (7.4)
-	ErrInternal       = errors.New("internal")         // an invariant was violated: log it and alert
-)
-// Errors from package db are passed through, wrapped with %w: db.ErrNotExecuted ("did not take effect"),
-// db.ErrRejected (a constraint rejected it), db.ErrNotOwner (this instance has been superseded). The server
-// maps them to Status (7.9).
+```go
+package schema
+
+var ErrInvalid = errors.New("invalid argument") // increment of NULL, result out of range, a bad key value, etc. (5.3, 7.4)
 
 // Key is the canonical encoding of the primary key (5.3), usable directly as a map key.
 type Key string
@@ -229,16 +222,31 @@ type Row struct {
 	Ver  int64 // version within one life, incremented by the DB
 	Vals []any // business column values by schema ordinal; neither the slice nor its values may be modified
 }
+```
+
+```go
+package store
+
+var (
+	ErrNotFound       = errors.New("not found")
+	ErrAlreadyExists  = errors.New("already exists")
+	ErrOutcomeUnknown = errors.New("outcome unknown") // the client's deadline expired before the outcome was settled
+	ErrInvalid        = schema.ErrInvalid              // the same value, so errors.Is works whichever package wrapped it
+	ErrInternal       = errors.New("internal")         // an invariant was violated: log it and alert
+)
+// Errors from package db are passed through, wrapped with %w: db.ErrNotExecuted ("did not take effect"),
+// db.ErrRejected (a constraint rejected it), db.ErrNotOwner (this instance has been superseded). The server
+// maps them to Status (7.9).
 
 // absent is the sentinel for "definitely does not exist" (tombstone or negative cache).
-var absent = &Row{}
+var absent = &schema.Row{}
 
 type entry struct {
-	id Key
+	id schema.Key
 
 	// Read lock-free; written only while holding op (I3).
 	// nil = not loaded; absent = does not exist; other = the row, equal to the DB row while op is free (I4).
-	snap atomic.Pointer[Row]
+	snap atomic.Pointer[schema.Row]
 
 	// op: the per-key lock, held across DB IO. A channel of capacity 1 so that waiting can be cancelled by ctx.
 	// Serializes load, create, update, delete and eviction of this key. While it is held, the only other lock
@@ -256,7 +264,7 @@ type entry struct {
 
 type shard struct {
 	mu sync.RWMutex // leaf lock: protects only the map structure
-	m  map[Key]*entry
+	m  map[schema.Key]*entry
 }
 
 type Store struct {
@@ -303,24 +311,24 @@ func SessionOf(err error) SessionID   // the Session of the *AmbiguousError in e
 
 type DB interface {
 	// Select returns the row, or ErrNoRows.
-	Select(ctx context.Context, key Key) (*Row, error)
+	Select(ctx context.Context, key schema.Key) (*schema.Row, error)
 
 	// InsertDedup inserts r (gen r.Gen, ver 0) together with its dedup record, in one statement (I12).
 	// Returns the stored row, with defaults the DB filled in. ErrGenClaimed: the dedup record exists and
 	// nothing was written. ErrDuplicate: the dedup record was new but the business row conflicted on the
 	// primary key. ErrNotOwner: nothing was written.
-	InsertDedup(ctx context.Context, r *Row) (*Row, error)
+	InsertDedup(ctx context.Context, r *schema.Row) (*schema.Row, error)
 
 	// GenClaimed reports whether (key, gen) is in the dedup table.
-	GenClaimed(ctx context.Context, key Key, gen int64) (bool, error)
+	GenClaimed(ctx context.Context, key schema.Key, gen int64) (bool, error)
 
 	// Update sets the columns cols of the row with key r.Key and gen r.Gen to r.Vals[c], and ver = ver + 1.
 	// Returns the row as stored (RETURNING). ErrNoRows: no row matched, which includes "not the owner".
-	Update(ctx context.Context, r *Row, cols []int) (*Row, error)
+	Update(ctx context.Context, r *schema.Row, cols []int) (*schema.Row, error)
 
 	// Delete deletes the row with key and gen. ErrNoRows: no row matched, which includes "not the owner".
 	// The dedup record stays (I12).
-	Delete(ctx context.Context, key Key, gen int64) error
+	Delete(ctx context.Context, key schema.Key, gen int64) error
 
 	// FenceSession terminates the session and returns nil once it can execute nothing any more (8.3).
 	// An error means "not confirmed".
@@ -1381,6 +1389,7 @@ Two checks are **not needed** by the model and are kept on purpose (0.4): `AND g
 | 4 | Share code with memory-authoritative? | **No.** An independent module; M1 copies what it needs | 3, 12.2 |
 | 5 | External protocol | The same as memory-authoritative for now; reconsidered before M8 (13.4) | 7.9 |
 | 6 | Tables with constraints on other rows | **Accepted** without an option: a rejection is synchronous and nothing of it can land later. Cascading foreign keys are still refused | 5.3 |
+| 7 | Package of `Key`, `Row`, `ErrInvalid` | **`schema`**: `db` and `store` both use them, and `store` imports `db` (M1 plan, decision 1) | 5.2 |
 
 ### 13.2 The holes of the memory-authoritative design, here
 
