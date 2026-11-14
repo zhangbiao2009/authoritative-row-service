@@ -116,8 +116,10 @@ func (d *DB) Claimed(key schema.Key, gen int64) bool {
 	return d.dedup[dedupKey{key, gen}]
 }
 
-// SetCrossRow turns the cross-row-constraint switch of key on or off. While it is on, an Insert or Delete
-// of key, when it executes (on time or late), is rejected with db.ErrCrossRow and changes nothing.
+// SetCrossRow turns the cross-row-constraint switch of key on or off. While it is on, an Insert that would
+// write the row, or a Delete that would delete it, when it executes (on time or late), is rejected with
+// db.ErrCrossRow and changes nothing. An Insert whose gen is claimed, or a Delete that finds no row, never
+// reaches the constraint (8.3).
 func (d *DB) SetCrossRow(key schema.Key, on bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -233,22 +235,25 @@ func (d *DB) InsertDedup(ctx context.Context, r *schema.Row) (*schema.Row, error
 	var got *schema.Row
 	var res error
 	err := d.run(ctx, &Stmt{Kind: Insert, Key: r.Key, Gen: r.Gen}, func() bool {
+		// In the order of the statement (8.3): the dedup claim first; the business row only if it was
+		// claimed; a cross-row constraint is checked only by an INSERT that would write the row.
 		dk := dedupKey{r.Key, r.Gen}
-		switch {
-		case d.crossRow[r.Key]:
-			d.stats.CrossRow++
-			res = db.ErrCrossRow // the whole statement is rolled back, dedup record included
-			return false
-		case d.dedup[dk]:
+		if d.dedup[dk] {
 			d.stats.GenClaimed++
 			res = db.ErrGenClaimed
 			return false
 		}
-		d.dedup[dk] = true
 		if _, ok := d.rows[r.Key]; ok {
+			d.dedup[dk] = true
 			res = db.ErrDuplicate // ON CONFLICT (id) DO NOTHING: the dedup record stays
 			return true
 		}
+		if d.crossRow[r.Key] {
+			d.stats.CrossRow++
+			res = db.ErrCrossRow // the whole statement is rolled back, dedup record included
+			return false
+		}
+		d.dedup[dk] = true
 		if d.deleted[dk] {
 			d.violateLocked("NoResurrection: key %q gen %d inserted again after its delete", r.Key, r.Gen)
 		}
@@ -278,12 +283,12 @@ func (d *DB) Delete(ctx context.Context, key schema.Key, gen int64) error {
 	defer d.write(key)()
 	var res error
 	err := d.run(ctx, &Stmt{Kind: Delete, Key: key, Gen: gen}, func() bool {
-		if d.crossRow[key] {
-			d.stats.CrossRow++
-			res = db.ErrCrossRow
-			return false
-		}
 		if cur, ok := d.rows[key]; ok && cur.Gen == gen {
+			if d.crossRow[key] { // a referencing row: checked only when a row is deleted
+				d.stats.CrossRow++
+				res = db.ErrCrossRow
+				return false
+			}
 			delete(d.rows, key)
 			d.deleted[dedupKey{key, gen}] = true
 			return true

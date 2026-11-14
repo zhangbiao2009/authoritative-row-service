@@ -332,3 +332,24 @@ func TestRowCheck(t *testing.T) {
 		t.Fatal("RowCheck failure not reported")
 	}
 }
+
+// A cross-row constraint is checked only by a statement that would change the row (design.md 8.3): an
+// Insert whose gen is claimed stops at the dedup table, and a Delete of a row that is gone affects 0 rows.
+// The until-sure loops rely on this (7.4): had an earlier attempt succeeded, the retry would not reach it.
+func TestCrossRowOnlyWhenTheRowWouldChange(t *testing.T) {
+	ctx := context.Background()
+	d := New()
+	if _, err := d.InsertDedup(ctx, row(100, "a")); err != nil {
+		t.Fatal(err)
+	}
+	d.SetCrossRow("k", true)
+	if _, err := d.InsertDedup(ctx, row(100, "a")); !errors.Is(err, db.ErrGenClaimed) {
+		t.Fatalf("insert of a claimed gen while blocked: %v, want ErrGenClaimed", err)
+	}
+	if err := d.Delete(ctx, "k", 999); err != nil {
+		t.Fatalf("delete of another gen while blocked: %v, want nil (0 rows)", err)
+	}
+	if err := d.Delete(ctx, "k", 100); !db.IsCrossRow(err) || d.Row("k") == nil {
+		t.Fatalf("delete of the row while blocked: %v, row %+v; want a cross-row rejection, the row kept", err, d.Row("k"))
+	}
+}
