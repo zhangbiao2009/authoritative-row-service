@@ -52,8 +52,8 @@ func TestConcurrentIncrementsMatchDB(t *testing.T) {
 	stop()
 	drain(t, s)
 	got, err := s.Get(context.Background(), k)
-	if err != nil || got.Vals[2] != int64(N*K) {
-		t.Fatalf("Get = %+v, %v; want score %d", got, err, N*K)
+	if err != nil || got.Vals[2] != int64(N*K) || got.Ver != 3+N*K {
+		t.Fatalf("Get = %+v, %v; want score %d, Ver %d", got, err, N*K, 3+N*K)
 	}
 	dbMatches(t, d, got)
 	checkInvariants(t, s, d)

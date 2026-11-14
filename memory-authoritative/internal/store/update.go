@@ -11,8 +11,8 @@ import (
 type ColOp uint8
 
 const (
-	OpSet  ColOp = iota // assignment
-	OpIncr              // increment: new value = old value + delta
+	OpSet  ColOp = iota
+	OpIncr       // new value = old value + delta
 )
 
 type ColChange struct {

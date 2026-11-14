@@ -33,7 +33,7 @@ type Config struct {
 	NumShards     int           // power of 2
 	LoadErrTTL    time.Duration // after a load failure, how long the same error is returned directly
 	FlushInterval time.Duration // how often RunFlusher writes dirty rows back
-	DBTimeout     time.Duration // bound on each DB write of the flusher
+	DBTimeout     time.Duration // timeout for DB calls on the Go side (design.md 11.4); in M2, each flush write
 }
 
 // DefaultConfig returns the reference values of design.md 11.4.
@@ -148,7 +148,7 @@ func (e *entry) tryLockOp() bool {
 
 func (e *entry) unlockOp() { <-e.op }
 
-// markDirtyLocked adds mask (non-zero) to e's dirty columns. The caller holds e.mu.
+// markDirtyLocked adds mask (non-zero) to e's dirty columns.
 func (s *Store) markDirtyLocked(e *entry, mask uint64) {
 	if e.dirty == 0 {
 		s.dirtyCount.Add(1)
@@ -156,7 +156,6 @@ func (s *Store) markDirtyLocked(e *entry, mask uint64) {
 	e.dirty |= mask
 }
 
-// clearDirtyLocked marks e clean. The caller holds e.mu.
 func (s *Store) clearDirtyLocked(e *entry) {
 	if e.dirty != 0 {
 		s.dirtyCount.Add(-1)

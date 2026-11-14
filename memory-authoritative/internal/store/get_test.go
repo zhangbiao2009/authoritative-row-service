@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"rowsvc/internal/db/fakedb"
 	"rowsvc/internal/schema"
@@ -101,16 +102,26 @@ func TestGetOrCreateOneEntryPerKey(t *testing.T) { // I1
 	}
 }
 
-func TestNewRejectsBadNumShards(t *testing.T) {
+// A zero FlushInterval would panic in RunFlusher; a zero DBTimeout would fail every write, so no row would
+// ever be flushed and nothing would say why.
+func TestNewRejectsBadConfig(t *testing.T) {
 	sch, err := schema.New("t", []schema.Column{{Name: "id", Type: schema.Int8}}, []int{0})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, n := range []int{0, -4, 3, 6} {
+	for name, change := range map[string]func(*Config){
+		"NumShards 0":     func(c *Config) { c.NumShards = 0 },
+		"NumShards -4":    func(c *Config) { c.NumShards = -4 },
+		"NumShards 3":     func(c *Config) { c.NumShards = 3 },
+		"NumShards 6":     func(c *Config) { c.NumShards = 6 },
+		"FlushInterval 0": func(c *Config) { c.FlushInterval = 0 },
+		"DBTimeout 0":     func(c *Config) { c.DBTimeout = 0 },
+		"DBTimeout < 0":   func(c *Config) { c.DBTimeout = -time.Second },
+	} {
 		cfg := DefaultConfig()
-		cfg.NumShards = n
+		change(&cfg)
 		if _, err := New(sch, fakedb.New(), cfg); err == nil {
-			t.Errorf("New accepted NumShards = %d", n)
+			t.Errorf("New accepted %s", name)
 		}
 	}
 }

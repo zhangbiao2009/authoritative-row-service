@@ -115,7 +115,7 @@ Each row is one atomic step of the model. In Go a step is a stretch of one funct
 | `B_d2` | `deleteUntilSure` loop body, then the end of `deleteLocked` (7.5) | success → under `mu`: `snap.Store(absent)`, `clearDirtyLocked` (linearization point) |
 | `F_take` | `flushShard` (7.6) | take `sh.queue` under `qmu` |
 | `F_scan` | `flushShard` loop over `batch` | `tryLockOp` (fails → `retry`); under `mu`: dead / nil / absent / clean → `queued = false`, `unlockOp`; else snapshot row + mask, `clearDirtyLocked`, `queued = false`, keep `op` |
-| `F_send` | `flushShard` | `requeueAll(retry)`; `db.Update` per item (M2), `db.UpdateBatch` from M6 |
+| `F_send` | `flushShard` | M2: `db.Update` per item, each right after its `F_scan`; `requeueAll(retry)` after the shard's items. From M6: `requeueAll(retry)`, then `db.UpdateBatch` |
 | `F_done` | `flushShard` after `UpdateBatch` | on error: merge the mask back, re-enqueue if not queued; `unlockOp` |
 | `V_evict` | `tryEvict` (7.7) | `tryLockOp`; under `mu`: `!dead && dirty == 0 && eligible` → `dead = true` |
 | `V_remove` | `tryEvict` | under `shard.mu`: delete from the map; `unlockOp` |

@@ -3,7 +3,7 @@ package store
 import (
 	"context"
 	"errors"
-	"reflect"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -11,22 +11,6 @@ import (
 	"rowsvc/internal/db/fakedb"
 	"rowsvc/internal/schema"
 )
-
-func update(t *testing.T, s *Store, k schema.Key, cols ...ColChange) *schema.Row {
-	t.Helper()
-	r, err := s.Update(context.Background(), k, Change{Cols: cols})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return r
-}
-
-func dbMatches(t *testing.T, d *fakedb.DB, want *schema.Row) {
-	t.Helper()
-	if got := d.Row(want.Key); !reflect.DeepEqual(got, want) {
-		t.Fatalf("DB row %+v, want %+v", got, want)
-	}
-}
 
 func TestFlushWritesDirtyColumns(t *testing.T) {
 	d := fakedb.New()
@@ -39,8 +23,8 @@ func TestFlushWritesDirtyColumns(t *testing.T) {
 	if n := d.Updates(); n != 1 {
 		t.Fatalf("Updates = %d, want 1", n)
 	}
-	if dirty, queued := state(entryOf(s, k)); dirty != 0 || queued || queueLen(s) != 0 || s.dirtyCount.Load() != 0 {
-		t.Fatalf("after flush: dirty %#x queued %v queue %d dirtyCount %d", dirty, queued, queueLen(s), s.dirtyCount.Load())
+	if got := bookkeeping(s, k); got != clean {
+		t.Fatalf("after flush: %s, want %s", got, clean)
 	}
 	checkInvariants(t, s, d)
 }
@@ -71,9 +55,8 @@ func TestFlushFailureKeepsColumnsDirty(t *testing.T) {
 	boom := errors.New("boom")
 	d.UpdateHook = func(context.Context, schema.Key, func()) error { return boom }
 	flushAll(s)
-	dirty, queued := state(entryOf(s, k))
-	if dirty != schema.ColBit(2) || !queued || queueLen(s) != 1 || s.dirtyCount.Load() != 1 {
-		t.Fatalf("after a failed flush: dirty %#x queued %v queue %d dirtyCount %d", dirty, queued, queueLen(s), s.dirtyCount.Load())
+	if got, want := bookkeeping(s, k), "dirty 0x4 queued true queue 1 dirtyCount 1"; got != want {
+		t.Fatalf("after a failed flush: %s, want %s", got, want)
 	}
 	dbMatches(t, d, testRow(k, 1))
 	d.UpdateHook = nil
@@ -94,8 +77,8 @@ func TestFlushRequeuesWhenOpBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 	flushAll(s)
-	if dirty, queued := state(e); d.Updates() != 0 || dirty == 0 || !queued || queueLen(s) != 1 {
-		t.Fatalf("flush while op is held: Updates %d dirty %#x queued %v queue %d", d.Updates(), dirty, queued, queueLen(s))
+	if got, want := bookkeeping(s, k), "dirty 0x4 queued true queue 1 dirtyCount 1"; d.Updates() != 0 || got != want {
+		t.Fatalf("flush while op is held: Updates %d, %s; want 0, %s", d.Updates(), got, want)
 	}
 	e.unlockOp()
 	flushAll(s)
@@ -126,8 +109,7 @@ func TestLateFlushDoesNotOverwriteNewer(t *testing.T) {
 	checkInvariants(t, s, d)
 }
 
-// A DB that never answers: Updates of the same key do not wait for the flush, the flush gives up after
-// DBTimeout, and the row stays dirty.
+// Updates of a key do not wait for its flush, the flush gives up after DBTimeout, and the row stays dirty.
 func TestUpdateNotBlockedByHangingFlush(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
@@ -135,27 +117,21 @@ func TestUpdateNotBlockedByHangingFlush(t *testing.T) {
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
 		update(t, s, k, incr(2, 1))
-		d.UpdateHook = func(ctx context.Context, _ schema.Key, _ func()) error {
-			<-ctx.Done()
-			return ctx.Err()
-		}
-		done := make(chan struct{})
-		go func() {
-			flushAll(s)
-			close(done)
-		}()
+		d.UpdateHook = hang
+		var wg sync.WaitGroup
+		wg.Go(func() { flushAll(s) })
 		synctest.Wait() // the flush holds op and waits for the DB
 		start := time.Now()
 		r := update(t, s, k, incr(2, 1))
 		if waited := time.Since(start); waited != 0 {
 			t.Fatalf("Update waited %v for the flush", waited)
 		}
-		<-done
+		wg.Wait()
 		if waited := time.Since(start); waited != s.cfg.DBTimeout {
 			t.Fatalf("flush gave up after %v, want DBTimeout %v", waited, s.cfg.DBTimeout)
 		}
-		if dirty, queued := state(entryOf(s, k)); dirty == 0 || !queued {
-			t.Fatalf("after a timed-out flush: dirty %#x queued %v", dirty, queued)
+		if got, want := bookkeeping(s, k), "dirty 0x4 queued true queue 1 dirtyCount 1"; got != want {
+			t.Fatalf("after a timed-out flush: %s, want %s", got, want)
 		}
 		d.UpdateHook = nil
 		flushAll(s)
@@ -173,29 +149,19 @@ func TestSecondFlushWaitsForFirstWrite(t *testing.T) {
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
 		update(t, s, k, incr(2, 1))
-		d.UpdateHook = func(ctx context.Context, _ schema.Key, _ func()) error {
-			<-ctx.Done() // a DB that never answers
-			return ctx.Err()
-		}
-		first, second := make(chan struct{}), make(chan struct{})
-		go func() {
-			flushAll(s)
-			close(first)
-		}()
+		d.UpdateHook = hang
+		var wg sync.WaitGroup
+		wg.Go(func() { flushAll(s) })
 		synctest.Wait()                  // the first write is in progress
 		r := update(t, s, k, incr(2, 1)) // queues the entry again
-		go func() {
-			flushAll(s)
-			close(second)
-		}()
+		wg.Go(func() { flushAll(s) })
 		synctest.Wait()
 		if n := d.Updates(); n != 1 {
 			t.Fatalf("Updates = %d while the first write is in progress, want 1", n)
 		}
-		<-first
-		<-second
-		if n := queueLen(s); n != 1 {
-			t.Fatalf("queue %d after both rounds, want 1", n)
+		wg.Wait()
+		if got, want := bookkeeping(s, k), "dirty 0x4 queued true queue 1 dirtyCount 1"; got != want {
+			t.Fatalf("after both rounds: %s, want %s", got, want)
 		}
 		d.UpdateHook = nil
 		flushAll(s)
@@ -218,43 +184,20 @@ func TestUpdateDuringFlushIsWrittenNext(t *testing.T) {
 			exec()
 			return nil
 		}
-		done := make(chan struct{})
-		go func() {
-			flushAll(s)
-			close(done)
-		}()
+		var wg sync.WaitGroup
+		wg.Go(func() { flushAll(s) })
 		synctest.Wait() // the flush has taken its snapshot and waits for the DB
 		r := update(t, s, k, set(1, "y"))
 		if n := queueLen(s); n != 1 {
 			t.Fatalf("queue %d during the flush, want 1", n)
 		}
 		close(release)
-		<-done
+		wg.Wait()
 		d.UpdateHook = nil
 		flushAll(s)
 		dbMatches(t, d, r)
 		checkInvariants(t, s, d)
 	})
-}
-
-// A zero FlushInterval would panic in RunFlusher; a zero DBTimeout would fail every write, so no row would
-// ever be flushed and nothing would say why.
-func TestNewRejectsNonPositiveDurations(t *testing.T) {
-	sch, err := schema.New("t", []schema.Column{{Name: "id", Type: schema.Int8}}, []int{0})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, change := range map[string]func(*Config){
-		"FlushInterval 0": func(c *Config) { c.FlushInterval = 0 },
-		"DBTimeout 0":     func(c *Config) { c.DBTimeout = 0 },
-		"DBTimeout < 0":   func(c *Config) { c.DBTimeout = -time.Second },
-	} {
-		cfg := DefaultConfig()
-		change(&cfg)
-		if _, err := New(sch, fakedb.New(), cfg); err == nil {
-			t.Errorf("New accepted %s", name)
-		}
-	}
 }
 
 func TestRunFlusher(t *testing.T) {
@@ -263,18 +206,12 @@ func TestRunFlusher(t *testing.T) {
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan struct{})
-		go func() {
-			s.RunFlusher(ctx)
-			close(done)
-		}()
+		stop := startFlusher(s)
 		r := update(t, s, k, set(1, "b"))
 		time.Sleep(s.cfg.FlushInterval)
 		synctest.Wait()
 		dbMatches(t, d, r)
-		cancel()
-		<-done
+		stop()
 		checkInvariants(t, s, d)
 	})
 }

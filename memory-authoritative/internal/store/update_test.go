@@ -3,9 +3,9 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
-	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -18,6 +18,15 @@ import (
 
 func set(col int, v any) ColChange    { return ColChange{Col: col, Op: OpSet, Val: v} }
 func incr(col int, d int64) ColChange { return ColChange{Col: col, Op: OpIncr, Val: d} }
+
+func update(t *testing.T, s *Store, k schema.Key, cols ...ColChange) *schema.Row {
+	t.Helper()
+	r, err := s.Update(context.Background(), k, Change{Cols: cols})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
 
 func queueLen(s *Store) int {
 	n := 0
@@ -36,10 +45,29 @@ func entryOf(s *Store, k schema.Key) *entry {
 	return sh.m[k]
 }
 
-func state(e *entry) (dirty uint64, queued bool) {
+// clean is the bookkeeping of a store whose only entries are clean.
+const clean = "dirty 0x0 queued false queue 0 dirtyCount 0"
+
+// bookkeeping describes k's dirty columns and queued flag, and the store's queue length and dirtyCount.
+func bookkeeping(s *Store, k schema.Key) string {
+	e := entryOf(s, k)
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.dirty, e.queued
+	dirty, queued := e.dirty, e.queued
+	e.mu.Unlock()
+	return fmt.Sprintf("dirty %#x queued %v queue %d dirtyCount %d", dirty, queued, queueLen(s), s.dirtyCount.Load())
+}
+
+func dbMatches(t *testing.T, d *fakedb.DB, want *schema.Row) {
+	t.Helper()
+	if got := d.Row(want.Key); !reflect.DeepEqual(got, want) {
+		t.Fatalf("DB row %+v, want %+v", got, want)
+	}
+}
+
+// hang is an UpdateHook for a DB that never answers.
+func hang(ctx context.Context, _ schema.Key, _ func()) error {
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func TestUpdateSetAndIncr(t *testing.T) {
@@ -48,10 +76,10 @@ func TestUpdateSetAndIncr(t *testing.T) {
 	k := key(t, s, 1)
 	d.Put(testRow(k, 1)) // Gen 101, Ver 3, Vals {1, "a", 10}
 	old, _ := s.Get(context.Background(), k)
-	r, err := s.Update(context.Background(), k, Change{Cols: []ColChange{set(1, "b"), incr(2, 5)}})
+	r := update(t, s, k, set(1, "b"), incr(2, 5))
 	want := &schema.Row{Key: k, Gen: 101, Ver: 4, Vals: []any{int64(1), "b", int64(15)}}
-	if err != nil || !reflect.DeepEqual(r, want) {
-		t.Fatalf("Update = %+v, %v; want %+v", r, err, want)
+	if !reflect.DeepEqual(r, want) {
+		t.Fatalf("Update = %+v, want %+v", r, want)
 	}
 	if !reflect.DeepEqual(old, testRow(k, 1)) {
 		t.Fatalf("the earlier snapshot changed (I2): %+v", old)
@@ -59,16 +87,13 @@ func TestUpdateSetAndIncr(t *testing.T) {
 	if g, _ := s.Get(context.Background(), k); g != r {
 		t.Fatalf("Get after Update = %+v, want the same row", g)
 	}
-	dirty, queued := state(entryOf(s, k))
-	if dirty != schema.ColBit(1)|schema.ColBit(2) || !queued || queueLen(s) != 1 || s.dirtyCount.Load() != 1 {
-		t.Fatalf("dirty %#x queued %v queue %d dirtyCount %d", dirty, queued, queueLen(s), s.dirtyCount.Load())
+	const dirtyQueued = "dirty 0x6 queued true queue 1 dirtyCount 1"
+	if got := bookkeeping(s, k); got != dirtyQueued {
+		t.Fatalf("after Update: %s, want %s", got, dirtyQueued)
 	}
-	// a second update: dirty grows, the queue does not
-	if _, err := s.Update(context.Background(), k, Change{Cols: []ColChange{incr(2, 1)}}); err != nil {
-		t.Fatal(err)
-	}
-	if queueLen(s) != 1 || s.dirtyCount.Load() != 1 {
-		t.Fatalf("after a second update: queue %d dirtyCount %d; want 1, 1", queueLen(s), s.dirtyCount.Load())
+	update(t, s, k, incr(2, 1)) // dirty grows; the queue does not
+	if got := bookkeeping(s, k); got != dirtyQueued {
+		t.Fatalf("after a second Update: %s, want %s", got, dirtyQueued)
 	}
 	if d.Updates() != 0 {
 		t.Fatal("Update wrote to the DB; it must only change memory")
@@ -80,9 +105,8 @@ func TestUpdateLoadsFirst(t *testing.T) {
 	s := newTestStore(t, d)
 	k := key(t, s, 1)
 	d.Put(testRow(k, 1))
-	r, err := s.Update(context.Background(), k, Change{Cols: []ColChange{incr(2, 1)}})
-	if err != nil || r.Ver != 4 || r.Vals[2] != int64(11) {
-		t.Fatalf("Update = %+v, %v; want Ver 4, score 11", r, err)
+	if r := update(t, s, k, incr(2, 1)); r.Ver != 4 || r.Vals[2] != int64(11) {
+		t.Fatalf("Update = %+v; want Ver 4, score 11", r)
 	}
 	if n := d.Selects(); n != 1 {
 		t.Fatalf("Selects = %d, want 1", n)
@@ -96,8 +120,8 @@ func TestUpdateMissingRow(t *testing.T) {
 	if _, err := s.Update(context.Background(), k, Change{Cols: []ColChange{incr(2, 1)}}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
-	if queueLen(s) != 0 || s.dirtyCount.Load() != 0 {
-		t.Fatalf("queue %d dirtyCount %d; want 0, 0", queueLen(s), s.dirtyCount.Load())
+	if got := bookkeeping(s, k); got != clean {
+		t.Fatalf("%s, want %s", got, clean)
 	}
 }
 
@@ -113,9 +137,8 @@ func TestUpdateLoadErrorHasNoEffect(t *testing.T) {
 		if _, err := s.Update(context.Background(), k, ch); !errors.Is(err, boom) {
 			t.Fatalf("err = %v, want boom", err)
 		}
-		if entryOf(s, k).snap.Load() != nil || queueLen(s) != 0 || s.dirtyCount.Load() != 0 {
-			t.Fatalf("after a failed load: snap %v, queue %d, dirtyCount %d; want nil, 0, 0",
-				entryOf(s, k).snap.Load(), queueLen(s), s.dirtyCount.Load())
+		if snap, got := entryOf(s, k).snap.Load(), bookkeeping(s, k); snap != nil || got != clean {
+			t.Fatalf("after a failed load: snap %v, %s; want nil, %s", snap, got, clean)
 		}
 		d.SelectHook = nil
 		time.Sleep(s.cfg.LoadErrTTL)
@@ -145,12 +168,9 @@ func TestFailedIncrementHasNoEffect(t *testing.T) {
 		if after, _ := s.Get(context.Background(), k); after != before {
 			t.Fatalf("score %v: row changed to %+v", score, after)
 		}
-		if dirty, _ := state(entryOf(s, k)); dirty != 0 {
-			t.Fatalf("score %v: dirty %#x, want 0", score, dirty)
+		if got := bookkeeping(s, k); got != clean {
+			t.Fatalf("score %v: %s, want %s", score, got, clean)
 		}
-	}
-	if queueLen(s) != 0 || s.dirtyCount.Load() != 0 {
-		t.Fatalf("queue %d dirtyCount %d; want 0, 0", queueLen(s), s.dirtyCount.Load())
 	}
 }
 
@@ -178,34 +198,7 @@ func TestUpdateRejectsMalformedChange(t *testing.T) {
 	if after, _ := s.Get(context.Background(), k); after != before {
 		t.Fatalf("row changed to %+v", after)
 	}
-	if dirty, _ := state(entryOf(s, k)); dirty != 0 || queueLen(s) != 0 || s.dirtyCount.Load() != 0 {
-		t.Fatalf("dirty %#x queue %d dirtyCount %d; want 0, 0, 0", dirty, queueLen(s), s.dirtyCount.Load())
-	}
-}
-
-// N goroutines each increment the same column K times: the result is exactly N*K (design.md 12.2 M2).
-func TestConcurrentIncrements(t *testing.T) {
-	const N, K = 16, 200
-	d := fakedb.New()
-	s := newTestStore(t, d)
-	k := key(t, s, 1)
-	r := testRow(k, 1)
-	r.Vals[2] = int64(0)
-	d.Put(r)
-	var wg sync.WaitGroup
-	for range N {
-		wg.Go(func() {
-			for range K {
-				if _, err := s.Update(context.Background(), k, Change{Cols: []ColChange{incr(2, 1)}}); err != nil {
-					t.Error(err)
-					return
-				}
-			}
-		})
-	}
-	wg.Wait()
-	got, err := s.Get(context.Background(), k)
-	if err != nil || got.Vals[2] != int64(N*K) || got.Ver != 3+N*K {
-		t.Fatalf("Get = %+v, %v; want score %d, Ver %d", got, err, N*K, 3+N*K)
+	if got := bookkeeping(s, k); got != clean {
+		t.Fatalf("%s, want %s", got, clean)
 	}
 }
