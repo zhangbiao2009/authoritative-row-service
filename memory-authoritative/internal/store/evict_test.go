@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"sync"
 	"testing"
@@ -238,4 +239,204 @@ func TestFlushDropsDeadEntry(t *testing.T) {
 	if d.Updates() != 0 || queueLen(s) != 0 || e.queued {
 		t.Fatalf("Updates %d, queue %d, queued %v; want 0, 0, false", d.Updates(), queueLen(s), e.queued)
 	}
+}
+
+// ttls sets the eviction config of a test Store.
+func ttls(idle, negative time.Duration) func(*Config) {
+	return func(c *Config) { c.IdleTTL, c.NegativeIdleTTL, c.EvictInterval = idle, negative, time.Second }
+}
+
+// runEvictor starts RunEvictor; the returned func stops it and waits for it.
+func runEvictor(s *Store) (stop func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.RunEvictor(ctx) }()
+	return func() { cancel(); <-done }
+}
+
+func TestIdleEntryEvicted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		s := newTestStore(t, d, ttls(10*time.Second, time.Hour))
+		k := key(t, s, 1)
+		loaded(t, s, d, k)
+		defer runEvictor(s)()
+		time.Sleep(5 * time.Second)
+		if entryOf(s, k) == nil {
+			t.Fatal("evicted after 5s of a 10s IdleTTL")
+		}
+		s.Get(context.Background(), k) // an access
+		time.Sleep(9 * time.Second)
+		if entryOf(s, k) == nil {
+			t.Fatal("evicted 9s after its last access")
+		}
+		time.Sleep(3 * time.Second)
+		if entryOf(s, k) != nil {
+			t.Fatal("not evicted 12s after its last access")
+		}
+		loaded(t, s, d, k) // a miss reloads it
+	})
+}
+
+func TestNegativeEntryUsesNegativeTTL(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		s := newTestStore(t, d, ttls(time.Hour, 5*time.Second))
+		missing, deleted, row := key(t, s, 1), key(t, s, 2), key(t, s, 3)
+		notFound(t, s, missing)
+		create(t, s, newRow(deleted, 2, 100))
+		del(t, s, deleted, 0)
+		loaded(t, s, d, row)
+		defer runEvictor(s)()
+		time.Sleep(3 * time.Second)
+		if entryOf(s, missing) == nil || entryOf(s, deleted) == nil {
+			t.Fatal("a negative entry was evicted before NegativeIdleTTL")
+		}
+		time.Sleep(5 * time.Second)
+		if entryOf(s, missing) != nil || entryOf(s, deleted) != nil || entryOf(s, row) == nil {
+			t.Fatalf("after 8s: missing %v, tombstone %v, row %v; want gone, gone, kept",
+				entryOf(s, missing) != nil, entryOf(s, deleted) != nil, entryOf(s, row) != nil)
+		}
+		notFound(t, s, deleted) // still deleted, from the DB
+	})
+}
+
+// Review Focus 1.
+func TestFailedLoadEntryIsEvicted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		s := newTestStore(t, d, ttls(time.Hour, 5*time.Second))
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1))
+		script(d, map[fakedb.Kind][]step{fakedb.Select: {fail(errors.New("boom"))}})
+		if _, err := s.Get(context.Background(), k); err == nil {
+			t.Fatal("Get succeeded; want the load error")
+		}
+		if e := entryOf(s, k); e == nil || e.snap.Load() != nil {
+			t.Fatal("want an entry with no row after a failed load")
+		}
+		defer runEvictor(s)()
+		time.Sleep(8 * time.Second)
+		if entryOf(s, k) != nil {
+			t.Fatal("the entry of a failed load was not evicted after NegativeIdleTTL")
+		}
+		loaded(t, s, d, k)
+	})
+}
+
+// Review Focus 2; mutation EvictDirty (I10).
+func TestDirtyEntryNotEvicted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		s := newTestStore(t, d, ttls(time.Second, time.Second), func(c *Config) { c.MaxEntries = 1 })
+		var ks []schema.Key
+		for i := range 3 {
+			k := key(t, s, int64(i+1))
+			loaded(t, s, d, k)
+			update(t, s, k, set(1, "x"))
+			ks = append(ks, k)
+		}
+		stop := runEvictor(s)
+		time.Sleep(10 * time.Second)
+		for _, k := range ks {
+			if entryOf(s, k) == nil {
+				t.Fatal("a dirty entry was evicted")
+			}
+		}
+		drain(t, s) // not one flushAll: a round may find op held by the evictor and requeue the entry
+		time.Sleep(3 * time.Second)
+		stop()
+		if n := s.entryCount.Load(); n != 0 {
+			t.Fatalf("entryCount %d after the rows were flushed, want 0", n)
+		}
+		checkInvariants(t, s, d)
+	})
+}
+
+// The eligible re-check (gap evict-sample): an entry accessed after the sweep chose it is kept.
+func TestSampledEntryAccessedAgainIsKept(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		s := newTestStore(t, d, ttls(time.Second, time.Second))
+		k := key(t, s, 1)
+		loaded(t, s, d, k)
+		fired := make(chan struct{})
+		at(s, "evict-sample", func(*entry) {
+			s.Get(context.Background(), k) // the access comes between the sample and tryEvict
+			close(fired)
+		})
+		time.Sleep(5 * time.Second) // idle long enough to be chosen
+		defer runEvictor(s)()
+		<-fired
+		synctest.Wait() // that round is over
+		if entryOf(s, k) == nil {
+			t.Fatal("evicted although it was accessed after the sweep chose it")
+		}
+	})
+}
+
+func TestCapacityEvictsOldestFirst(t *testing.T) {
+	d := fakedb.New()
+	s := newTestStore(t, d, ttls(time.Hour, time.Hour), func(c *Config) { c.NumShards, c.MaxEntries = 1, 10 }) // one shard: exact LRU
+	var ks []schema.Key
+	for i := range 20 {
+		s.nowSec.Store(int64(1000 + i)) // each key accessed at its own second
+		k := key(t, s, int64(i+1))
+		create(t, s, newRow(k, int64(i+1), 0))
+		ks = append(ks, k)
+	}
+	s.nowSec.Store(2000)
+	s.evictOnce()
+	if n := s.entryCount.Load(); n != 9 {
+		t.Fatalf("entryCount %d, want 9 (the low-water mark)", n)
+	}
+	for i, k := range ks {
+		if kept := entryOf(s, k) != nil; kept != (i >= 11) {
+			t.Fatalf("key %d (accessed at second %d): kept %v; want only the 9 most recent kept", i, 1000+i, kept)
+		}
+	}
+	checkInvariants(t, s, d)
+}
+
+// Review Focus 3.
+func TestCapacityEvictionAllDirtyReturns(t *testing.T) {
+	d := fakedb.New()
+	s := newTestStore(t, d, func(c *Config) { c.MaxEntries = 2 })
+	for i := range 6 {
+		k := key(t, s, int64(i+1))
+		loaded(t, s, d, k)
+		update(t, s, k, set(1, "x"))
+	}
+	s.evictOnce() // returns
+	if n := s.entryCount.Load(); n != 6 {
+		t.Fatalf("entryCount %d, want 6: every entry is dirty", n)
+	}
+}
+
+// Review Focus 5: hole 2 with the tombstone evicted before the retry.
+func TestRetryAfterTombstoneEvicted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		giveUp(t, s, d, newRow(k, 1, 100))()
+		del(t, s, k, 0)
+		if !evict(t, s, k) {
+			t.Fatal("the tombstone was not evicted")
+		}
+		if r, err := s.Create(context.Background(), newRow(k, 1, 100)); r != nil || err != nil {
+			t.Fatalf("retry = %+v, %v; want (nil, nil): the create took effect earlier", r, err)
+		}
+		if d.Row(k) != nil {
+			t.Fatalf("the deleted row is back: %+v", d.Row(k))
+		}
+		notFound(t, s, k)
+	})
+}
+
+func TestRunEvictorStops(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestStore(t, fakedb.New())
+		runEvictor(s)() // returns once RunEvictor has
+	})
 }

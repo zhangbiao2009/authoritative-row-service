@@ -126,6 +126,7 @@ func (s *Store) createLocked(e *entry, in *schema.Row) (*schema.Row, error) {
 	e.snap.Store(got) // linearization point
 	s.clearDirtyLocked(e)
 	e.mu.Unlock()
+	s.touch(e)
 	return got, nil
 }
 

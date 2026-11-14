@@ -42,6 +42,7 @@ func (s *Store) deleteLocked(e *entry, gen int64) error {
 	e.snap.Store(absent) // linearization point
 	s.clearDirtyLocked(e)
 	e.mu.Unlock()
+	s.touch(e) // the tombstone's NegativeIdleTTL counts from the delete
 	return nil
 }
 

@@ -38,6 +38,7 @@ func (s *Store) Update(ctx context.Context, key schema.Key, ch Change) (*schema.
 	}
 	for {
 		e := s.getOrCreate(key)
+		s.touch(e)
 		// TLA: U_mu. The whole read-modify-write is inside mu, so concurrent updates of other columns, and
 		// concurrent increments, are not lost.
 		e.mu.Lock()

@@ -13,6 +13,7 @@ import (
 func (s *Store) Get(ctx context.Context, key schema.Key) (*schema.Row, error) {
 	for {
 		e := s.getOrCreate(key)
+		s.touch(e)
 		// TLA: G_read. Linearization point: the load of snap.
 		if r := e.snap.Load(); r != nil {
 			if r == absent {
