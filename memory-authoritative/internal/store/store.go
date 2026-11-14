@@ -192,10 +192,13 @@ const (
 
 // backoff waits before the next attempt of an until-sure loop: backoffMin doubled per attempt, at most
 // backoffMax.
-func (s *Store) backoff(attempt int) {
-	d := backoffMax
-	if attempt < 7 {
-		d = min(backoffMin<<attempt, backoffMax)
+func backoff(attempt int) {
+	d := backoffMin
+	for range attempt {
+		if d >= backoffMax {
+			break
+		}
+		d *= 2
 	}
-	time.Sleep(d)
+	time.Sleep(min(d, backoffMax))
 }

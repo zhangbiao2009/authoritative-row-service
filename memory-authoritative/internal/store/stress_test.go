@@ -182,9 +182,12 @@ func TestStressCreateDelete(t *testing.T) {
 		var ambThenNotExecuted, notExecutedAfterFence, lateInsertOfDeleted, retryFindsOtherLife atomic.Int64
 		var lateExecs sync.WaitGroup
 		d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
-			if st.Kind == fakedb.GenClaimed && !faults.Load() {
+			if st.Kind == fakedb.GenClaimed {
+				if faults.Load() && rand.IntN(100) < 5 {
+					return fail(db.ErrNotExecuted)(st)
+				}
 				st.Exec()
-				if d.Claimed(st.Key, st.Gen) { // W_RetryFindsOtherLife
+				if d.Claimed(st.Key, st.Gen) { // W_RetryFindsOtherLife: a retry of a create met another life
 					retryFindsOtherLife.Add(1)
 				}
 				return nil
@@ -201,15 +204,9 @@ func TestStressCreateDelete(t *testing.T) {
 				}
 				mu.Unlock()
 				return nil
-			case fakedb.Select, fakedb.GenClaimed:
+			case fakedb.Select:
 				if rand.IntN(100) < 5 {
-					return fmt.Errorf("%w: injected", db.ErrNotExecuted)
-				}
-				if st.Kind == fakedb.GenClaimed {
-					st.Exec()
-					if d.Claimed(st.Key, st.Gen) {
-						retryFindsOtherLife.Add(1)
-					}
+					return fail(db.ErrNotExecuted)(st)
 				}
 				return nil
 			}
@@ -253,35 +250,37 @@ func TestStressCreateDelete(t *testing.T) {
 					notExecutedAfterFence.Add(1)
 				}
 				mu.Unlock()
-				return fmt.Errorf("%w: injected", db.ErrNotExecuted)
+				return fail(db.ErrNotExecuted)(st)
 			}
 		}
 		flipping, flipped := make(chan struct{}), make(chan struct{})
 		go func() {
 			defer close(flipped)
+			tick := time.NewTicker(time.Millisecond)
+			defer tick.Stop()
 			for {
 				select {
 				case <-flipping:
 					return
-				case <-time.After(time.Millisecond):
+				case <-tick.C:
 					d.SetCrossRow(ks[rand.IntN(keys)], rand.IntN(2) == 0)
 				}
 			}
 		}()
 
 		// History, recorded by the driver.
-		var seq atomic.Int64 // counts successful deletes of a known gen
-		var deleted sync.Map // gen -> seq of its delete
+		var seq atomic.Int64 // counts successful deletes
+		var deleted sync.Map // gen -> seq of its successful delete
 		type calls struct {  // the answers to the Create, and to the Delete, calls of one gen
 			key                               schema.Key
 			unknown, success, failed, refused bool // refused: ErrAlreadyExists or a cross-row rejection
-			deleteUnknown, deleteSuccess      bool
+			deleteUnknown                     bool
 		}
 		var hmu sync.Mutex
 		history := map[int64]*calls{}
 		var gens atomic.Int64
 		gens.Store(1000)
-		var deletesOK, recreates, outcomeUnknown, queueTimeouts atomic.Int64
+		var recreates, outcomeUnknown, queueTimeouts atomic.Int64
 		var deletedOnce [keys]atomic.Bool
 
 		allowed := func(op string, err error) bool {
@@ -395,13 +394,12 @@ func TestStressCreateDelete(t *testing.T) {
 						if !allowed("Delete", err) {
 							break
 						}
-						hmu.Lock()
-						h := history[gen]
-						h.deleteSuccess = h.deleteSuccess || err == nil
-						h.deleteUnknown = h.deleteUnknown || errors.Is(err, ErrOutcomeUnknown)
-						hmu.Unlock()
+						if errors.Is(err, ErrOutcomeUnknown) {
+							hmu.Lock()
+							history[gen].deleteUnknown = true
+							hmu.Unlock()
+						}
 						if err == nil {
-							deletesOK.Add(1)
 							deletedOnce[i].Store(true)
 							deleted.Store(gen, seq.Add(1))
 							seen[i] = 0
@@ -435,7 +433,7 @@ func TestStressCreateDelete(t *testing.T) {
 				t.Errorf("key %q: Get: %v", k, err)
 			default:
 				dbMatches(t, d, r)
-				if _, ok := deleted.Load(r.Gen); ok {
+				if d.Deleted(k, r.Gen) {
 					t.Errorf("key %q: gen %d was deleted and is back (NoResurrection)", k, r.Gen)
 				}
 			}
@@ -449,8 +447,9 @@ func TestStressCreateDelete(t *testing.T) {
 			}
 			// The delete side: a row is deleted only by a Delete call that was answered success or unknown, and
 			// a success means the row is gone (hole 4).
-			if dl := d.Deleted(h.key, gen); dl && !h.deleteSuccess && !h.deleteUnknown || !dl && h.deleteSuccess {
-				t.Errorf("gen %d: deleted in the DB %v, but its Delete calls were answered success %v, unknown %v", gen, dl, h.deleteSuccess, h.deleteUnknown)
+			_, deleteSuccess := deleted.Load(gen)
+			if dl := d.Deleted(h.key, gen); dl && !deleteSuccess && !h.deleteUnknown || !dl && deleteSuccess {
+				t.Errorf("gen %d: deleted in the DB %v, but its Delete calls were answered success %v, unknown %v", gen, dl, deleteSuccess, h.deleteUnknown)
 			}
 		}
 
@@ -458,7 +457,7 @@ func TestStressCreateDelete(t *testing.T) {
 		counters := map[string]int64{
 			"late statements": int64(st.Late), "effective late statements": int64(st.LateEffective),
 			"gen claimed": int64(st.GenClaimed), "cross-row rejections": int64(st.CrossRow), "fenced sessions": int64(st.Fenced),
-			"deletes": deletesOK.Load(), "re-creates": recreates.Load(), "unknown outcomes": outcomeUnknown.Load(),
+			"deletes": seq.Load(), "re-creates": recreates.Load(), "unknown outcomes": outcomeUnknown.Load(),
 			"queue timeouts": queueTimeouts.Load(), "not executed after ambiguous": ambThenNotExecuted.Load(),
 			"not executed after a fence": notExecutedAfterFence.Load(), "late inserts of a deleted gen": lateInsertOfDeleted.Load(),
 			"retries finding the gen claimed": retryFindsOtherLife.Load(),

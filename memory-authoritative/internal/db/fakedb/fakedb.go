@@ -54,8 +54,8 @@ type dedupKey struct {
 
 type DB struct {
 	// Hook, if set, runs for every statement before it executes, without the DB's lock held.
-	//   - nil: the statement executes (Exec is called now unless the hook already called it) and its own
-	//     result is returned.
+	//   - nil: the statement goes on like a plain DB call: if ctx is done it is not executed (unless the hook
+	//     already called Exec), else it executes now and its own result is returned.
 	//   - an error: that error is returned. The statement executes only if and when the hook calls Exec:
 	//     now (executed, response lost), later from any goroutine (late), or never.
 	// Exec of a statement whose session was fenced does nothing. Set it before concurrent use.
@@ -164,15 +164,17 @@ func (d *DB) violateLocked(format string, args ...any) {
 }
 
 // run sends st: it gives it a session and an Exec that runs execLocked once, with d.mu held, unless the
-// session has been fenced; then it lets the hook decide. Without a hook, a statement whose ctx is done is
-// not executed. execLocked reports whether it changed a row or the dedup table.
+// session has been fenced; then it lets the hook decide. When the hook returns nil, or there is none, the
+// statement goes on like a plain DB call: not executed if ctx is done, else executed. execLocked reports
+// whether it changed a row or the dedup table.
 func (d *DB) run(ctx context.Context, st *Stmt, execLocked func() bool) error {
 	st.Session = db.SessionID(d.sessions.Add(1))
-	var returned atomic.Bool
+	var returned, ran atomic.Bool
 	defer returned.Store(true)
 	var once sync.Once
 	st.Exec = func() {
 		once.Do(func() {
+			ran.Store(true)
 			d.mu.Lock()
 			defer d.mu.Unlock()
 			changed := !d.fenced[st.Session] && execLocked()
@@ -188,7 +190,8 @@ func (d *DB) run(ctx context.Context, st *Stmt, execLocked func() bool) error {
 		if err := d.Hook(ctx, st); err != nil {
 			return err
 		}
-	} else if err := ctx.Err(); err != nil {
+	}
+	if err := ctx.Err(); err != nil && !ran.Load() {
 		return fmt.Errorf("%w: %w", db.ErrNotExecuted, err)
 	}
 	st.Exec()
@@ -297,7 +300,7 @@ func (d *DB) Delete(ctx context.Context, key schema.Key, gen int64) error {
 				return false
 			}
 			delete(d.rows, key)
-			d.deleted[dedupKey{key, cur.Gen}] = true // the life of the row removed
+			d.deleted[dedupKey{key, cur.Gen}] = true // cur.Gen, not gen: so a Delete that ignores gen shows up
 			return true
 		}
 		return false

@@ -353,3 +353,20 @@ func TestCrossRowOnlyWhenTheRowWouldChange(t *testing.T) {
 		t.Fatalf("delete of the row while blocked: %v, row %+v; want a cross-row rejection, the row kept", err, d.Row("k"))
 	}
 }
+
+// A hook that returns nil means "behave like the DB": a statement whose ctx is done is not executed, unless
+// the hook executed it already.
+func TestHookNilWithDoneCtx(t *testing.T) {
+	d := New()
+	d.Put(&schema.Row{Key: "k", Gen: 1, Ver: 1, Vals: []any{int64(0)}})
+	ctx, cancel := context.WithCancel(context.Background())
+	d.Hook = func(context.Context, *Stmt) error { cancel(); return nil }
+	err := d.Update(ctx, &schema.Row{Key: "k", Gen: 1, Ver: 2, Vals: []any{int64(7)}}, 1)
+	if !db.NotExecuted(err) || d.Row("k").Ver != 1 {
+		t.Fatalf("err %v, row %+v; want not executed, the row unchanged", err, d.Row("k"))
+	}
+	d.Hook = func(_ context.Context, st *Stmt) error { st.Exec(); return nil }
+	if err := d.Update(ctx, &schema.Row{Key: "k", Gen: 1, Ver: 3, Vals: []any{int64(8)}}, 1); err != nil || d.Row("k").Ver != 3 {
+		t.Fatalf("executed by the hook: err %v, row %+v; want nil and the write applied", err, d.Row("k"))
+	}
+}

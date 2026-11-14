@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"errors"
-	"reflect"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -184,8 +183,7 @@ func TestLateDeleteDoesNotDeleteNewLife(t *testing.T) {
 	k := key(t, s, 1)
 	create(t, s, newRow(k, 1, 100))
 	var late func()
-	var session db.SessionID
-	script(d, map[fakedb.Kind][]step{fakedb.Delete: {amb(&late, &session)}})
+	script(d, map[fakedb.Kind][]step{fakedb.Delete: {amb(&late)}})
 	del(t, s, k, 0) // the first DELETE is stuck; the retry deletes the row
 	create(t, s, newRow(k, 1, 200))
 	late() // the first DELETE (gen 100) lands now
@@ -218,14 +216,11 @@ func TestDeleteCrossRowAfterAmbiguousIsFenced(t *testing.T) {
 	loaded(t, s, d, k)
 	d.SetCrossRow(k, true)
 	var late func()
-	var session db.SessionID
-	rec := script(d, map[fakedb.Kind][]step{fakedb.Delete: {amb(&late, &session)}})
+	rec := script(d, map[fakedb.Kind][]step{fakedb.Delete: {amb(&late)}})
 	if err := s.Delete(context.Background(), k, 0); !db.IsCrossRow(err) {
 		t.Fatalf("Delete: %v, want a cross-row rejection", err)
 	}
-	if f := rec.of(fakedb.Fence); len(f) != 1 || !reflect.DeepEqual(f[0].Sessions, []db.SessionID{session}) {
-		t.Fatalf("Fence statements %+v, want one with session %d", f, session)
-	}
+	rec.wantFences(t, 1, fakedb.Delete)
 	d.SetCrossRow(k, false)
 	late()
 	memMatchesDB(t, s, d, k) // the row is still in both
@@ -239,8 +234,7 @@ func TestLateInsertDoesNotResurrect(t *testing.T) {
 	s := newTestStore(t, d)
 	k := key(t, s, 1)
 	var late func()
-	var session db.SessionID
-	script(d, map[fakedb.Kind][]step{fakedb.Insert: {amb(&late, &session)}})
+	script(d, map[fakedb.Kind][]step{fakedb.Insert: {amb(&late)}})
 	if r := create(t, s, newRow(k, 1, 100)); r.Gen != 100 {
 		t.Fatalf("Create = %+v, want gen 100", r)
 	}
@@ -253,29 +247,13 @@ func TestLateInsertDoesNotResurrect(t *testing.T) {
 	checkInvariants(t, s, d)
 }
 
-// createGivesUp creates gen 100 with a client that gives up while the INSERT is slow; the INSERT then
-// succeeds in the background.
-func createGivesUp(t *testing.T, s *Store, d *fakedb.DB, k schema.Key) {
-	t.Helper()
-	release := make(chan struct{})
-	script(d, map[fakedb.Kind][]step{fakedb.Insert: {blockOn(release)}})
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if r, err := s.Create(ctx, newRow(k, 1, 100)); !errors.Is(err, ErrOutcomeUnknown) {
-		t.Fatalf("Create = %+v, %v; want ErrOutcomeUnknown", r, err)
-	}
-	close(release)
-	s.inflight.Wait()
-	d.Hook = nil
-}
-
 // Hole 2 (13.2; trace: hole2): the client's retry, after someone deleted the row, must not insert it again.
 func TestCreateRetryAfterDeleteDoesNotResurrect(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
-		createGivesUp(t, s, d, k)
+		giveUp(t, s, d, newRow(k, 1, 100))() // the create takes effect after its client gave up
 		del(t, s, k, 0)
 		if r, err := s.Create(context.Background(), newRow(k, 1, 100)); r != nil || err != nil {
 			t.Fatalf("retry = %+v, %v; want (nil, nil): the create took effect earlier", r, err)
@@ -293,7 +271,7 @@ func TestCreateRetryFindsOtherLife(t *testing.T) {
 		d := fakedb.New()
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
-		createGivesUp(t, s, d, k)
+		giveUp(t, s, d, newRow(k, 1, 100))() // the create takes effect after its client gave up
 		del(t, s, k, 0)
 		r200 := create(t, s, newRow(k, 1, 200))
 		if r, err := s.Create(context.Background(), newRow(k, 1, 100)); r != nil || err != nil {
@@ -314,8 +292,7 @@ func lateFlush(t *testing.T, s *Store, d *fakedb.DB, k schema.Key) (late func())
 	t.Helper()
 	create(t, s, newRow(k, 1, 100))
 	update(t, s, k, set(1, "old"))
-	var session db.SessionID
-	script(d, map[fakedb.Kind][]step{fakedb.Update: {amb(&late, &session)}})
+	script(d, map[fakedb.Kind][]step{fakedb.Update: {amb(&late)}})
 	flushAll(s)
 	d.Hook = nil
 	return late
@@ -360,15 +337,9 @@ func TestDeleteFenceKeepsUnsure(t *testing.T) {
 	loaded(t, s, d, k)
 	d.SetCrossRow(k, true)
 	var late func()
-	var session db.SessionID
-	landBeforeFence := func(*fakedb.Stmt) error {
-		d.SetCrossRow(k, false)
-		late() // A deletes the row just before its session is terminated
-		return nil
-	}
 	script(d, map[fakedb.Kind][]step{
-		fakedb.Delete: {amb(&late, &session), nil, fail(db.ErrNotExecuted)},
-		fakedb.Fence:  {landBeforeFence},
+		fakedb.Delete: {amb(&late), nil, fail(db.ErrNotExecuted)},
+		fakedb.Fence:  {landBefore(d, k, &late)}, // A deletes the row just before its session is terminated
 	})
 	if err := s.Delete(context.Background(), k, 0); err != nil {
 		t.Fatalf("Delete: %v; want nil, the row is gone from the DB", err)
@@ -385,7 +356,7 @@ func TestDeleteLoadErrorHasNoEffect(t *testing.T) {
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1)) // not loaded
 		rec := script(d, map[fakedb.Kind][]step{fakedb.Select: {fail(db.ErrNotExecuted)}})
-		if err := s.Delete(context.Background(), k, 0); !errors.Is(err, db.ErrNotExecuted) {
+		if err := s.Delete(context.Background(), k, 0); !db.NotExecuted(err) {
 			t.Fatalf("Delete: %v; want the load error", err)
 		}
 		if n := len(rec.of(fakedb.Delete)); n != 0 || d.Row(k) == nil {

@@ -19,7 +19,7 @@ import (
 func (s *Store) Create(ctx context.Context, in *schema.Row) (*schema.Row, error) {
 	// The create may go on after the caller has its answer (ErrOutcomeUnknown), and the caller may then reuse
 	// its row. The values themselves are immutable (I11).
-	in = &schema.Row{Key: in.Key, Gen: in.Gen, Vals: slices.Clone(in.Vals)}
+	in = &schema.Row{Key: in.Key, Gen: in.Gen, Vals: slices.Clone(in.Vals)} // Ver 0: a new life
 	if err := s.checkRow(in); err != nil {
 		return nil, err
 	}
@@ -62,12 +62,15 @@ func runSync[T any](ctx context.Context, s *Store, e *entry, fn func() (T, error
 	done := make(chan result, 1)
 	s.inflight.Add(1)
 	go func() {
-		// TLA: FinishOp. op is released on every path, before the answer, so a caller that has its
-		// answer finds op free.
 		defer s.inflight.Done()
-		v, err := fn()
-		e.unlockOp()
-		done <- result{v, err}
+		var r result
+		// TLA: FinishOp. op is released on every path, and before the answer, so a caller that has its
+		// answer finds op free.
+		defer func() {
+			e.unlockOp()
+			done <- r
+		}()
+		r.v, r.err = fn()
 	}()
 	// TLA: X_wait
 	select {
@@ -91,10 +94,10 @@ func (s *Store) createLocked(e *entry, in *schema.Row) (*schema.Row, error) {
 		return nil, err
 	}
 	if cur != absent {
-		if in.Gen != 0 && cur.Gen == in.Gen {
-			return cur, nil // a retry of a create that succeeded
-		}
 		if in.Gen != 0 {
+			if cur.Gen == in.Gen {
+				return cur, nil // a retry of a create that succeeded
+			}
 			// Another life is here. If in.Gen is in the dedup table, this is a retry of a create that took
 			// effect; that life has been deleted since and the key created again (13.2 hole 6). Every earlier
 			// attempt of in.Gen has settled (op is held), so the answer cannot be overtaken by a late INSERT.
@@ -110,12 +113,10 @@ func (s *Store) createLocked(e *entry, in *schema.Row) (*schema.Row, error) {
 		}
 		return nil, ErrAlreadyExists
 	}
-	nr := *in
-	if nr.Gen == 0 {
-		nr.Gen = newGen()
+	if in.Gen == 0 { // in is Create's own copy
+		in.Gen = newGen()
 	}
-	nr.Ver = 0
-	got, err := s.insertUntilSure(&nr)
+	got, err := s.insertUntilSure(in)
 	if err != nil || got == nil {
 		// Definitely failed, or inserted long ago and deleted since: memory keeps absent (13.2 hole 2).
 		return nil, err
@@ -182,7 +183,7 @@ func (s *Store) insertUntilSure(r *schema.Row) (*schema.Row, error) {
 			// this create in flight (had an earlier attempt succeeded, this one would have found its gen).
 			return nil, err
 		}
-		s.backoff(attempt)
+		backoff(attempt)
 	}
 }
 

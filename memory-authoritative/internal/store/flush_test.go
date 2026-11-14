@@ -179,10 +179,7 @@ func TestUpdateDuringFlushIsWrittenNext(t *testing.T) {
 		d.Put(testRow(k, 1))
 		update(t, s, k, set(1, "x"))
 		release := make(chan struct{})
-		d.Hook = func(context.Context, *fakedb.Stmt) error {
-			<-release
-			return nil
-		}
+		script(d, map[fakedb.Kind][]step{fakedb.Update: {blockOn(release)}})
 		var wg sync.WaitGroup
 		wg.Go(func() { flushAll(s) })
 		synctest.Wait() // the flush has taken its snapshot and waits for the DB

@@ -30,10 +30,20 @@ func lost(st *fakedb.Stmt) error {
 }
 
 // amb tells the caller the outcome is ambiguous and keeps the statement, so the test can execute it late.
-func amb(late *func(), session *db.SessionID) step {
+func amb(late *func()) step {
 	return func(st *fakedb.Stmt) error {
-		*late, *session = st.Exec, st.Session
+		*late = st.Exec
 		return fakedb.Ambiguous(st, context.DeadlineExceeded)
+	}
+}
+
+// landBefore lets the kept statement land just before this one: the other row has changed, then the late
+// statement executes, then this one goes on (TLC's counterexample for the first fix of hole 5).
+func landBefore(d *fakedb.DB, k schema.Key, late *func()) step {
+	return func(*fakedb.Stmt) error {
+		d.SetCrossRow(k, false)
+		(*late)()
+		return nil
 	}
 }
 
@@ -50,19 +60,20 @@ func blockOn(release chan struct{}) step {
 // recorder is a Hook that runs a script and records every statement.
 type recorder struct {
 	mu    sync.Mutex
-	steps map[fakedb.Kind][]step // the n-th statement of a kind runs steps[kind][n]
-	seen  []fakedb.Stmt
+	steps map[fakedb.Kind][]step // the next statement of a kind runs the first step left for it
+	seen  []fakedb.Stmt          // without Exec
 }
 
 func script(d *fakedb.DB, steps map[fakedb.Kind][]step) *recorder {
 	r := &recorder{steps: steps}
 	d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
 		r.mu.Lock()
-		n := len(r.ofLocked(st.Kind))
-		r.seen = append(r.seen, *st)
+		seen := *st
+		seen.Exec = nil
+		r.seen = append(r.seen, seen)
 		var f step
-		if s := r.steps[st.Kind]; n < len(s) {
-			f = s[n]
+		if s := r.steps[st.Kind]; len(s) > 0 {
+			f, r.steps[st.Kind] = s[0], s[1:]
 		}
 		r.mu.Unlock()
 		if f == nil {
@@ -73,7 +84,10 @@ func script(d *fakedb.DB, steps map[fakedb.Kind][]step) *recorder {
 	return r
 }
 
-func (r *recorder) ofLocked(k fakedb.Kind) []fakedb.Stmt {
+// of returns the statements of kind k seen so far.
+func (r *recorder) of(k fakedb.Kind) []fakedb.Stmt {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	var out []fakedb.Stmt
 	for _, st := range r.seen {
 		if st.Kind == k {
@@ -83,11 +97,38 @@ func (r *recorder) ofLocked(k fakedb.Kind) []fakedb.Stmt {
 	return out
 }
 
-// of returns the statements of kind k seen so far.
-func (r *recorder) of(k fakedb.Kind) []fakedb.Stmt {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.ofLocked(k)
+// wantFences checks that n Fence statements were sent, each terminating exactly the session of the first
+// statement of kind k: the attempt the test kept ambiguous.
+func (r *recorder) wantFences(t *testing.T, n int, k fakedb.Kind) {
+	t.Helper()
+	session := r.of(k)[0].Session
+	f := r.of(fakedb.Fence)
+	if len(f) != n {
+		t.Fatalf("Fence statements %+v, want %d", f, n)
+	}
+	for _, st := range f {
+		if !reflect.DeepEqual(st.Sessions, []db.SessionID{session}) {
+			t.Fatalf("Fence statements %+v, want each with session %d", f, session)
+		}
+	}
+}
+
+// giveUp creates in with a client that gives up while the INSERT is held; the create goes on in the
+// background. settle lets the INSERT run and waits for the create to finish. Call it inside synctest.
+func giveUp(t *testing.T, s *Store, d *fakedb.DB, in *schema.Row) (settle func()) {
+	t.Helper()
+	release := make(chan struct{})
+	script(d, map[fakedb.Kind][]step{fakedb.Insert: {blockOn(release)}})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if r, err := s.Create(ctx, in); !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("Create = %+v, %v; want ErrOutcomeUnknown", r, err)
+	}
+	return func() {
+		close(release)
+		s.inflight.Wait() // L2 BackgroundSettles
+		d.Hook = nil
+	}
 }
 
 func (r *recorder) count() int {
@@ -200,7 +241,7 @@ func TestCreateLoadErrorHasNoEffect(t *testing.T) {
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		rec := script(d, map[fakedb.Kind][]step{fakedb.Select: {fail(db.ErrNotExecuted)}})
-		if r, err := s.Create(context.Background(), newRow(k, 1, 100)); !errors.Is(err, db.ErrNotExecuted) {
+		if r, err := s.Create(context.Background(), newRow(k, 1, 100)); !db.NotExecuted(err) {
 			t.Fatalf("Create = %+v, %v; want the load error", r, err)
 		}
 		if n := len(rec.of(fakedb.Insert)); n != 0 {
@@ -241,16 +282,9 @@ func TestCreateOutcomeUnknown(t *testing.T) {
 		d := fakedb.New()
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
-		release := make(chan struct{})
-		script(d, map[fakedb.Kind][]step{fakedb.Insert: {blockOn(release)}})
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		if r, err := s.Create(ctx, newRow(k, 1, 100)); !errors.Is(err, ErrOutcomeUnknown) {
-			t.Fatalf("Create = %+v, %v; want ErrOutcomeUnknown", r, err)
-		}
+		settle := giveUp(t, s, d, newRow(k, 1, 100))
 		notFound(t, s, k) // linearized before the create, which has not taken effect
-		close(release)
-		s.inflight.Wait() // L2 BackgroundSettles
+		settle()
 		if r, err := s.Get(context.Background(), k); err != nil || r.Gen != 100 {
 			t.Fatalf("Get after the create settled = %+v, %v", r, err)
 		}
@@ -293,8 +327,7 @@ func TestCreateRejectedByOwnDataIsFinal(t *testing.T) {
 	s := newTestStore(t, d)
 	k := key(t, s, 1)
 	var late func()
-	var session db.SessionID
-	script(d, map[fakedb.Kind][]step{fakedb.Insert: {amb(&late, &session), fail(db.ErrRejected)}})
+	script(d, map[fakedb.Kind][]step{fakedb.Insert: {amb(&late), fail(db.ErrRejected)}})
 	if r, err := s.Create(context.Background(), newRow(k, 1, 100)); !errors.Is(err, db.ErrRejected) {
 		t.Fatalf("Create = %+v, %v; want ErrRejected", r, err)
 	}
@@ -360,14 +393,11 @@ func TestCrossRowRejectionAfterAmbiguousIsFenced(t *testing.T) {
 	k := key(t, s, 1)
 	d.SetCrossRow(k, true)
 	var late func()
-	var session db.SessionID
-	rec := script(d, map[fakedb.Kind][]step{fakedb.Insert: {amb(&late, &session)}})
+	rec := script(d, map[fakedb.Kind][]step{fakedb.Insert: {amb(&late)}})
 	if r, err := s.Create(context.Background(), newRow(k, 1, 100)); !db.IsCrossRow(err) {
 		t.Fatalf("Create = %+v, %v; want a cross-row rejection", r, err)
 	}
-	if f := rec.of(fakedb.Fence); len(f) != 1 || !reflect.DeepEqual(f[0].Sessions, []db.SessionID{session}) {
-		t.Fatalf("Fence statements %+v, want one with session %d", f, session)
-	}
+	rec.wantFences(t, 1, fakedb.Insert)
 	d.SetCrossRow(k, false)
 	late() // the first attempt arrives after the other row changed
 	if d.Row(k) != nil || d.Claimed(k, 100) {
@@ -385,15 +415,9 @@ func TestFenceKeepsUnsure(t *testing.T) {
 	k := key(t, s, 1)
 	d.SetCrossRow(k, true)
 	var late func()
-	var session db.SessionID
-	landBeforeFence := func(*fakedb.Stmt) error {
-		d.SetCrossRow(k, false)
-		late() // A lands just before its session is terminated
-		return nil
-	}
 	script(d, map[fakedb.Kind][]step{
-		fakedb.Insert: {amb(&late, &session), nil, fail(db.ErrNotExecuted)},
-		fakedb.Fence:  {landBeforeFence},
+		fakedb.Insert: {amb(&late), nil, fail(db.ErrNotExecuted)},
+		fakedb.Fence:  {landBefore(d, k, &late)}, // A lands just before its session is terminated
 	})
 	r, err := s.Create(context.Background(), newRow(k, 1, 100))
 	if err != nil || r == nil || r.Gen != 100 {
@@ -411,18 +435,14 @@ func TestFenceNotConfirmedKeepsTrying(t *testing.T) {
 		k := key(t, s, 1)
 		d.SetCrossRow(k, true)
 		var late func()
-		var session db.SessionID
 		rec := script(d, map[fakedb.Kind][]step{
-			fakedb.Insert: {amb(&late, &session)},
+			fakedb.Insert: {amb(&late)},
 			fakedb.Fence:  {fail(errors.New("not confirmed"))},
 		})
 		if r, err := s.Create(context.Background(), newRow(k, 1, 100)); !db.IsCrossRow(err) {
 			t.Fatalf("Create = %+v, %v; want a cross-row rejection", r, err)
 		}
-		f := rec.of(fakedb.Fence)
-		if len(f) != 2 || !reflect.DeepEqual(f[0].Sessions, []db.SessionID{session}) || !reflect.DeepEqual(f[1].Sessions, []db.SessionID{session}) {
-			t.Fatalf("Fence statements %+v, want two, each with session %d", f, session)
-		}
+		rec.wantFences(t, 2, fakedb.Insert)
 		d.SetCrossRow(k, false)
 		late()
 		if d.Row(k) != nil {
@@ -438,17 +458,10 @@ func TestCreateDoesNotKeepCallersRow(t *testing.T) {
 		d := fakedb.New()
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
-		release := make(chan struct{})
-		script(d, map[fakedb.Kind][]step{fakedb.Insert: {blockOn(release)}})
 		in := newRow(k, 1, 100)
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		if _, err := s.Create(ctx, in); !errors.Is(err, ErrOutcomeUnknown) {
-			t.Fatalf("Create: %v; want ErrOutcomeUnknown", err)
-		}
+		settle := giveUp(t, s, d, in)
 		in.Vals[1] = "reused" // the caller reuses its row
-		close(release)
-		s.inflight.Wait()
+		settle()
 		if r := d.Row(k); r == nil || r.Vals[1] != "a" {
 			t.Fatalf("DB row %+v; want the values given to Create (name \"a\")", r)
 		}

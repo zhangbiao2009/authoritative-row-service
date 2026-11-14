@@ -76,6 +76,6 @@ func (s *Store) deleteUntilSure(key schema.Key, gen int64) error {
 			// in flight: had an earlier attempt deleted the row, this one would have affected 0 rows.
 			return err
 		}
-		s.backoff(attempt)
+		backoff(attempt)
 	}
 }
