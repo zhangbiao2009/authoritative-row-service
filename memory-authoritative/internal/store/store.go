@@ -30,13 +30,20 @@ var (
 )
 
 type Config struct {
-	NumShards  int           // power of 2
-	LoadErrTTL time.Duration // after a load failure, how long the same error is returned directly
+	NumShards     int           // power of 2
+	LoadErrTTL    time.Duration // after a load failure, how long the same error is returned directly
+	FlushInterval time.Duration // how often RunFlusher writes dirty rows back
+	DBTimeout     time.Duration // bound on each DB write of the flusher
 }
 
 // DefaultConfig returns the reference values of design.md 11.4.
 func DefaultConfig() Config {
-	return Config{NumShards: 256, LoadErrTTL: 100 * time.Millisecond}
+	return Config{
+		NumShards:     256,
+		LoadErrTTL:    100 * time.Millisecond,
+		FlushInterval: 200 * time.Millisecond,
+		DBTimeout:     3 * time.Second,
+	}
 }
 
 // Store is one table.
@@ -53,6 +60,9 @@ type Store struct {
 func New(sch *schema.Schema, d db.DB, cfg Config) (*Store, error) {
 	if cfg.NumShards <= 0 || cfg.NumShards&(cfg.NumShards-1) != 0 {
 		return nil, fmt.Errorf("NumShards %d is not a positive power of 2", cfg.NumShards)
+	}
+	if cfg.FlushInterval <= 0 || cfg.DBTimeout <= 0 {
+		return nil, fmt.Errorf("FlushInterval %v and DBTimeout %v must be positive", cfg.FlushInterval, cfg.DBTimeout)
 	}
 	s := &Store{schema: sch, db: d, cfg: cfg, seed: maphash.MakeSeed(), shards: make([]*shard, cfg.NumShards)}
 	for i := range s.shards {
