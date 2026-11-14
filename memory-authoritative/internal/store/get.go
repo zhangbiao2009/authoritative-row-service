@@ -34,6 +34,9 @@ func (s *Store) load(ctx context.Context, e *entry) error {
 	}
 	defer e.unlockOp()
 	// TLA: L_load
+	if e.dead {
+		return nil // removed while we queued: the caller looks the key up again
+	}
 	_, err := s.ensureLoadedLocked(ctx, e)
 	return err
 }

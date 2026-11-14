@@ -10,29 +10,45 @@ import (
 	"rowsvc/internal/db/fakedb"
 )
 
-// checkInvariants checks the M2 properties of tla-mapping.md section 5 for every entry. Call it at a
+// checkInvariants checks the properties of tla-mapping.md section 5 for every entry (M2, M5). Call it at a
 // quiescent point: no flush round, Update or load running.
 func checkInvariants(t *testing.T, s *Store, d *fakedb.DB) {
 	t.Helper()
 	for _, sh := range s.shards {
 		sh.qmu.Lock()
-		inQueue := make(map[*entry]bool, len(sh.queue))
-		for _, e := range sh.queue {
+		queue := slices.Clone(sh.queue)
+		sh.qmu.Unlock()
+		inQueue := make(map[*entry]bool, len(queue))
+		for _, e := range queue {
 			inQueue[e] = true
 		}
-		sh.qmu.Unlock()
 		sh.mu.RLock()
 		entries := slices.Collect(maps.Values(sh.m))
+		inMap := maps.Clone(sh.m)
 		sh.mu.RUnlock()
+		for _, e := range queue { // a dead entry may still be queued: the flusher drops it
+			e.mu.Lock()
+			dead, dirty := e.dead, e.dirty
+			e.mu.Unlock()
+			if !dead && inMap[e.id] != e {
+				t.Errorf("key %q: a queued live entry is not the map's entry (LiveEntryInMap, I1)", e.id)
+			}
+			if dead && dirty != 0 {
+				t.Errorf("key %q: a dead entry has dirty %#x (NoDirtyEviction, I10)", e.id, dirty)
+			}
+		}
 		for _, e := range entries {
 			if !e.tryLockOp() {
 				t.Errorf("key %q: op is still held (NoLockLeak)", e.id)
 				continue
 			}
 			e.mu.Lock()
-			r, dirty, queued := e.snap.Load(), e.dirty, e.queued
+			r, dirty, queued, dead := e.snap.Load(), e.dirty, e.queued, e.dead
 			e.mu.Unlock()
 			e.unlockOp()
+			if dead {
+				t.Errorf("key %q: a dead entry is still in the map (LiveEntryInMap, I1)", e.id)
+			}
 			if dirty != 0 && !queued {
 				t.Errorf("key %q: dirty %#x but not queued (DirtyImpliesQueued)", e.id, dirty)
 			}

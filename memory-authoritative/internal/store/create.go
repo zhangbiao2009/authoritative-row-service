@@ -23,9 +23,9 @@ func (s *Store) Create(ctx context.Context, in *schema.Row) (*schema.Row, error)
 	if err := s.checkRow(in); err != nil {
 		return nil, err
 	}
-	e := s.getOrCreate(in.Key)
 	// TLA: X_lock
-	if err := e.lockOp(ctx); err != nil {
+	e, err := s.lockOpLive(ctx, in.Key)
+	if err != nil {
 		return nil, err // TLA: X_qtimeout. Gave up while queued: definitely not executed
 	}
 	return runSync(ctx, s, e, func() (*schema.Row, error) { return s.createLocked(e, in) })

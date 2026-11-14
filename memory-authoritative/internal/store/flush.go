@@ -41,7 +41,7 @@ func (s *Store) flushShard(ctx context.Context, sh *shard) {
 		}
 		e.mu.Lock()
 		r, mask := e.snap.Load(), e.dirty
-		if r == nil || r == absent || mask == 0 {
+		if e.dead || r == nil || r == absent || mask == 0 {
 			e.queued = false
 			e.mu.Unlock()
 			e.unlockOp()

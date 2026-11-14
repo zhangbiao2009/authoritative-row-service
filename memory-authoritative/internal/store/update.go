@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"slices"
 
 	"rowsvc/internal/schema"
@@ -40,6 +41,11 @@ func (s *Store) Update(ctx context.Context, key schema.Key, ch Change) (*schema.
 		// TLA: U_mu. The whole read-modify-write is inside mu, so concurrent updates of other columns, and
 		// concurrent increments, are not lost.
 		e.mu.Lock()
+		if e.dead { // being removed (7.7): wait for the map to drop it, then look the key up again
+			e.mu.Unlock()
+			runtime.Gosched()
+			continue
+		}
 		old := e.snap.Load()
 		if old == nil {
 			e.mu.Unlock() // mu is a leaf lock: release it before waiting for op (6.4)

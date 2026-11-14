@@ -1,10 +1,14 @@
 // Package store holds one table's rows in memory and is their authority (design.md 3, 4).
 //
 // Locks (design.md 6). Only op may be held while taking another lock (I8):
-//   - entry.op: per key, held across DB IO; serializes the DB operations of one key (load, flush). The
-//     root lock.
+//   - entry.op: per key, held across DB IO; serializes the DB operations of one key (load, create, delete,
+//     flush, eviction). The root lock.
 //   - entry.mu: leaf lock; guards writes of snap (I3), dirty and queued.
-//   - shard.mu: leaf lock; guards the shard's map.
+//   - shard.mu: leaf lock; guards the shard's map. Taken with op held (eviction), never with mu held.
+//
+// The dead protocol (design.md 7.7): the remover holds op and mu, finds dirty == 0, sets dead, then deletes
+// the entry from the map. Whoever takes op or mu checks dead first and, if it is set, looks the key up
+// again. Lock-free readers (Get) do not check it: they read the value the entry had when it was removed.
 //   - shard.qmu: leaf lock; guards the shard's flush queue.
 //
 // While holding a leaf lock: take no other lock, do no channel operation, no IO, no logging.
@@ -61,6 +65,18 @@ type Store struct {
 
 	dirtyCount atomic.Int64   // entries with dirty != 0; changed only with that entry's mu held
 	inflight   sync.WaitGroup // runSync goroutines: creates and deletes still running
+	entryCount atomic.Int64   // entries in the maps
+
+	// failpoint, if set, runs at the named points of a gap that is not a DB call (tla-mapping.md 3.1). Tests
+	// only; nil in production.
+	failpoint func(at string, e *entry)
+}
+
+// fail runs the failpoint at, if there is one.
+func (s *Store) fail(at string, e *entry) {
+	if s.failpoint != nil {
+		s.failpoint(at, e)
+	}
 }
 
 func New(sch *schema.Schema, d db.DB, cfg Config) (*Store, error) {
@@ -106,6 +122,8 @@ type entry struct {
 	mu     sync.Mutex
 	dirty  uint64 // columns changed in memory and not yet written to the DB (schema.ColBit); mu
 	queued bool   // in its shard's flush queue, or about to be appended to it; mu
+	// dead: removed from the map, or about to be (I1). Written with op and mu held, read with either (I9).
+	dead bool
 
 	// Accessed only with op held.
 	lastLoadErr   error
@@ -131,8 +149,23 @@ func (s *Store) getOrCreate(key schema.Key) *entry {
 	if e = sh.m[key]; e == nil { // another goroutine may have added it between the two locks
 		e = &entry{id: key, op: make(chan struct{}, 1)}
 		sh.m[key] = e
+		s.entryCount.Add(1)
 	}
 	return e
+}
+
+// lockOpLive returns key's entry with op held and dead false (design.md 7.1).
+func (s *Store) lockOpLive(ctx context.Context, key schema.Key) (*entry, error) {
+	for {
+		e := s.getOrCreate(key)
+		if err := e.lockOp(ctx); err != nil {
+			return nil, err
+		}
+		if !e.dead { // op is enough to read dead (I9)
+			return e, nil
+		}
+		e.unlockOp() // removed: the map holds another entry for the key, or will
+	}
 }
 
 func (e *entry) lockOp(ctx context.Context) error {
