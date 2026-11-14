@@ -11,7 +11,7 @@ created: 2026-11-13
 >
 > **Where things are.** Each design has its own directory, so that both can be implemented and compared: this one is `db-authoritative/`; the other is [`memory-authoritative/`](../memory-authoritative/), which holds `design.md`, `correctness-properties.md` and the TLA+ model in `tla/`. Section, invariant and hole numbers below refer to those documents.
 >
-> **Status of the alternative: a sketch.** It has no TLA+ model and no benchmark. Every throughput or latency figure below is an estimate to be replaced by the measurement in section 8.
+> **Status of the alternative: a sketch with a checked model.** Its concurrency protocol is modeled in TLA+ and checked with TLC (`tla/`, section 11); writing the model settled several points the first sketch left open, and they are now in section 3.2. It has no benchmark: every throughput or latency figure below is an estimate to be replaced by the measurement in section 8.
 
 ---
 
@@ -92,8 +92,18 @@ When a statement times out or its connection breaks, the outcome is unknown. des
    SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND backend_start = $2;  -- repeat until 0
    ```
 
-2. The statement has now either committed or will never execute (design.md 7.8, correctness-properties.md A4). SELECT the row, store it, and decide the answer from what is there.
+2. The statement has now either committed or will never execute (design.md 7.8, correctness-properties.md A4). SELECT the row, store it, and decide the answer from what is there:
+
+   | Operation | It took effect if | Otherwise |
+   |---|---|---|
+   | Create | the row is there with this create's gen, **or** the gen is in the dedup table (inserted earlier, deleted since: the case of an SDK retry) | not created, and never will be |
+   | Delete | the row that was loaded (same gen) is gone | not deleted, and never will be |
+   | Update | the row is there with the same gen and `ver` = the loaded `ver` + 1 | not applied, and never will be |
+
+   "Otherwise" is a definite failure of the kind "not executed" (`UNAVAILABLE`). Nothing is retried inside the server; the SDK rule of design.md 7.10 applies to it as to any other "not executed" answer.
 3. `op` stays held throughout. If the client's deadline expires first, it gets `OUTCOME_UNKNOWN` and the work continues in the background, as `runSync` does today.
+
+The rule for update is what makes an increment written as a delta safe: the statement is sent once, and `ver` tells whether that one statement ran. It depends on nobody else writing the row while `op` is held. A second instance breaks that, which is one of the two reasons the owner epoch is kept (section 4). The model has a mutation for each way of getting step 2 wrong: skipping the fence, answering "failed" without reading, and taking "the row is there" as "my update was applied"; each is caught (section 11).
 
 This gives one invariant that replaces several mechanisms: **a statement for a key is in flight only while that key's `op` is held.** Late statements do not exist once `op` is released, so:
 
@@ -120,8 +130,9 @@ Any entry whose `op` is free may be evicted. There is no dirty condition. The de
 | `ver` as a fencing token, `AND ver < ?` (I6, 8.2 example 1) | Gone. `ver` remains as a counter the DB increments, for observation only |
 | Flush writes absolute values, no `col = col + delta` (I12) | Gone. A delta in SQL is correct |
 | Retry until sure, the `unsure` and `inflight` flags, three kinds of definite failure, the session fence used only after a rejection caused by another row (7.4, 7.5, 8.4, holes 4 and 5) | Replaced by one rule: "fence the connection, then read", on every ambiguous outcome (3.2) |
-| Owner epoch in every write (I16, hole 8) | Optional. A second instance makes cache entries stale; it cannot corrupt the authoritative copy. Keeping the epoch is cheap and still stops the old instance |
-| Late statements blocked by gen conditions (8.2 examples 2, 3; hole 1) | Cannot occur (3.2). `gen` in WHERE stays as a cheap second line of defence |
+| Owner epoch in every write (I16, hole 8) | Kept. A second instance cannot corrupt the authoritative copy, and what it writes is durable. But without the epoch the model shows two things going wrong in the newer instance: its cache entry stays stale until the next write or eviction, and the `ver` rule of 3.2 can take the other instance's update for its own |
+| Load re-checks `snap` after taking `op` (7.2) | Still done, but only to save a query: reloading returns the same row. The model passes without it |
+| Late statements blocked by gen conditions (8.2 examples 2, 3; hole 1) | Cannot occur (3.2). `gen` in WHERE stays as a cheap second line of defence: the model passes with the condition removed |
 | Hole 3 (old process's late UPDATE diverges memory and DB forever) | Cannot diverge the authoritative copy. The startup fence is kept so that the cache is not stale either |
 | Exact value agreement between memory and DB | Automatic: the cache holds the `RETURNING` row |
 | Flush interval, batch size, HOT tuning to limit write amplification (8.5) | No flush settings. HOT and autovacuum tuning matter more, see section 6 |
@@ -133,7 +144,7 @@ Any entry whose `op` is free may be evicted. There is no dirty condition. The de
 
 Invariants of design.md section 4: I10 and I12 disappear. I4 simplifies to "while `op` is free, a loaded entry equals the DB row". I5 becomes the stronger statement in 3.2. I7 extends to update. The others are unchanged.
 
-For the TLA+ model: the flusher, `dirty`, masks and "a crash loses unflushed updates" can be deleted. Create, delete, the dedup table, client retries, eviction and the fence stay. The alternative needs its own (smaller) model before it is implemented.
+For the TLA+ model: the flusher, `dirty`, masks and "a crash loses unflushed updates" are gone. Create, delete, the dedup table, client retries, eviction and the fence stay. The alternative has its own, smaller model (section 11).
 
 ---
 
@@ -143,7 +154,8 @@ These come from clients retrying creates and deletes over an unreliable network,
 
 - **Hole 2 and the dedup table.** A create whose response was lost is retried by the SDK with the same gen. If someone deleted the row in between, only a durable record of "this gen was already inserted" stops the retry from inserting it again.
 - **SDK retry rules.** Once any attempt of one logical operation had an unknown outcome, a later answer obtained before `op` was acquired (`DEADLINE_EXCEEDED`, `UNAVAILABLE`, `BUSY`) says nothing about the earlier attempt. A retried create must also be answered "success" when its gen is in the dedup table but the row now belongs to another life. Both points were fixed in design.md on 2026-11-13 (holes 6 and 7 of its 13.2) and apply here unchanged.
-- **Single instance.** A linearizable cache still needs one instance per key. What changes is the consequence of a second instance: stale reads, where design.md needs the owner epoch (hole 8) to keep two authorities from overwriting each other.
+- **The startup fence** (hole 3). A statement of the old process that lands after the new process has loaded the row leaves the cache stale; the model reproduces it without the fence.
+- **Single instance.** A linearizable cache still needs one instance per key. What changes is the consequence of a second instance: stale reads, where design.md needs the owner epoch (hole 8) to keep two authorities from overwriting each other. The epoch is kept here too (section 4).
 - **Only this service writes the tables.** Another writer makes cache entries stale. The DB stays correct.
 
 ---
@@ -167,7 +179,7 @@ The review of design.md found five gaps. Four of them were fixed in design.md on
 |---|---|---|---|
 | 1 | "Rejected by data" is treated as final after an ambiguous attempt, on the argument that the same parameters give the same result. Foreign keys, non-primary unique indexes, exclusion constraints and triggers depend on DB state, so the earlier statement can still land later. Also, SQLSTATE 23505 from a non-primary unique index is mapped to `ErrInternal`. | Fixed (hole 5): such tables are refused unless enabled per table; with the option, the sessions of the ambiguous attempts are terminated before the rejection is trusted | Gone: the ambiguous statement is fenced before anything is decided (3.2), and a unique violation is an ordinary synchronous error |
 | 2 | SDK retries: a retried create can be answered `ALREADY_EXISTS` although it took effect; a retry that times out while queued behind the first attempt is reported as "did not take effect". No property checks the responses of create and delete. | Fixed (holes 6 and 7; property S18) | The same fixes apply unchanged |
-| 3 | "One instance at a time" is guaranteed only by deployment, and a violation silently corrupts the authoritative copy. | Fixed (hole 8): an owner epoch checked by every write | Still an assumption, but a violation causes stale reads, not corruption. The epoch check becomes optional |
+| 3 | "One instance at a time" is guaranteed only by deployment, and a violation silently corrupts the authoritative copy. | Fixed (hole 8): an owner epoch checked by every write | A violation causes stale reads and can fool the update rule of 3.2, but cannot corrupt the authoritative copy. The epoch is kept (section 4) |
 | 4 | Values PG normalizes (float4, numeric scale, char(n) padding, timestamp precision, jsonb) differ between memory and DB, so a Get can change after eviction with no write. | Not fixed (13.3) | Gone: the cache holds the `RETURNING` row |
 | 5 | The loss window grows without bound while the DB is slow; `synchronous_commit = on` and "restart the service after a PG failover or restore" are unstated assumptions. | Fixed: `MaxDirtyAge` caps the window; the PostgreSQL assumptions are stated in section 2 | The loss window is bounded by PG, not by load. The failover and restore assumption remains, and the PG crash rule of section 6 is added |
 
@@ -224,6 +236,96 @@ Also watch `pg_stat_user_tables.n_tup_hot_upd / n_tup_upd` and table size during
 ## 10. If the alternative is adopted
 
 1. Run the measurement of section 8 and record the numbers in design.md section 1, together with the target rates and latencies, which design.md does not state today.
-2. Write the TLA+ model for section 3 (start from `../memory-authoritative/tla/RowService.tla`, put the copy in `db-authoritative/tla/`, delete the flusher and dirty state, add the connection fence) and carry over the properties of correctness-properties.md that still apply, including S18 on what create answers. Check each step with `python3 suite.py quick` (correctness-properties.md 9.1).
+2. The TLA+ model for section 3 exists (`tla/RowCache.tla`, section 11). Extend it before implementing anything it does not cover yet: the "updates without `op`" variant of section 9, and the PG crash rule of section 6 if `synchronous_commit = off` is chosen.
 3. Keep the fixes for holes 6 and 7 (the dedup lookup in `createLocked`, the SDK rule after an ambiguous attempt); they are independent of this choice.
 4. Rewrite design.md sections 7.3, 7.6, 7.9, 8.2, 8.4 and 11.1 accordingly; sections 5.3, 6, 7.2, 7.7, 7.8 and 7.10 need little or no change.
+
+---
+
+## 11. TLA+ model
+
+The protocol of section 3 is modeled in `tla/RowCache.tla` and checked with TLC. The model is the counterpart of `../memory-authoritative/tla/RowService.tla`: same structure, same names, same method (an abstract sequential state, planted bugs that must be caught, reachability witnesses that must be violated), so that the two can be read side by side.
+
+| File | Content |
+|---|---|
+| `tla/RowCache.tla` | The model. Comments refer to the sections of this document |
+| `tla/suite.py` | The suites: `python3 suite.py quick|main|full|ext|claims|mutants|witnesses|sim|liveness|all`. Every configuration is generated by it (into `out/suite/`); there are no `.cfg` files |
+| `tla/trace.py` | Condenses a counterexample: `python3 trace.py < out/suite/<job>.out` |
+
+It needs Java 11+ and `tla2tools.jar` in `~/.local/share/tla/` (or `TLA2TOOLS`), like the other model.
+
+### 11.1 What is modeled
+
+One key. The entry in the shard map and the dead protocol; the snapshot, `op`, lock-free Get and load; create, delete **and update** handed to `runSync`, which continues after the client gives up; one statement per write; on an ambiguous outcome the connection fence, then the read and the decision table of 3.2; eviction of any entry whose `op` is free; the SDK retrying create with the same gen, also while its first attempt is still running; a request timing out while queued for `op`. The environment is the one of the other model: a DB that executes late, loses responses, does not execute, or rejects because of another row; crash and restart with statements still in flight; a superseded instance that keeps sending statements.
+
+Not modeled: the PG crash rule of section 6 (`synchronous_commit = off`), a fence that fails or cannot be confirmed (it is retried), SDK retry of delete, more than one key, the variants of section 9, and everything about performance.
+
+### 11.2 Properties
+
+| Property (TLA+) | Statement |
+|---|---|
+| `NoViolation` | A Get returns a value the abstract state held during the Get. The first state read after a crash is the state at the crash, or that state with the one write that was in progress applied: **a crash loses nothing**. A result that "cannot happen" (0 rows affected, a primary key conflict) never happens |
+| `MemMatchesAbs` | The loaded snapshot equals the abstract state: every linearization point is the store of the row the DB returned |
+| `CacheCoherent` | Whenever nobody holds `op`, the loaded snapshot is exactly the DB row (gen, ver and values) |
+| `StmtOnlyUnderOp` | A statement of this instance is in flight only while its sender holds `op` for the key: the invariant of 3.2 |
+| `DbMatchesAbs` | The DB equals the abstract state except while a write is in progress under `op` |
+| `UpdateAnswerSound` | An update answered "ok" changed the row; an update answered "failed" did not and never will. The write-behind design makes no such promise about updates |
+| `CreateFailureIsFinal` | A create whose call ended in "failed" is never inserted (S18 of the other design) |
+| `NoResurrection`, `CreateDurable`, `OneWriterPerKey`, `LiveEntryInMap`, `DbValsBelongToGen`, `FencedRestart`, `DbVerMonotonic` | As in the other design |
+| `EventuallyResponds`, `BackgroundSettles`, `NoLockLeak` (liveness) | Every request is answered; every background write settles; `op` is never held forever |
+
+### 11.3 Results (2026-11-13, 48-core machine)
+
+| Run | Environment | Result |
+|---|---|---|
+| `main` | 2 clients, 3 operations each, 2 entries, 2 creates, 2 updates; one each of: ambiguous statement, statement not executed, client giving up, crash; SDK retry; every fix on | **Pass**: 100,406,278 distinct states, depth 53, 9 minutes |
+| `full` | The same with 3 entries, which is the scale of the other design's `fixed.cfg` | **Pass**: 588,066,918 distinct states, depth 57, 44 minutes |
+| `ext_crossrow`, `ext_sdk`, `ext_epoch` | 2 operations per client, the faults above, plus a cross-row constraint that flips / a queue timeout and retry while busy / a superseded instance | **Pass**: 13.8 / 5.0 / 18.7 million distinct states |
+| `ext_all` | The three extra faults together | **Pass**: 93,578,684 distinct states, depth 43, 8 minutes |
+| `sim` | Random simulation: 3 clients, 2 columns, every fault twice, 2 minutes | **No violation**: about 48 million states checked |
+| mutants | 7 planted bugs in the `main` environment | **All 7 caught** (table below) |
+| witnesses | 18 situations in `main`, 7 in the `ext` environments | **All 25 reached** |
+| claims | 10 statements of this document about the holes of design.md (11.4) | **All 10 as stated** |
+| `live` | Liveness under weak fairness, 2 clients x 2 operations, the faults of `main` | **Pass**: 7,386,673 distinct states, all three liveness properties, 23 minutes; the liveness mutant `LeakOpOnNotFound` is caught by `NoLockLeak` |
+
+`python3 suite.py quick` runs all of it except `full` and `live`: 48 runs, 9 minutes.
+
+| Planted bug (`Mut`) | What it does | Caught by | Trace (states) |
+|---|---|---|---|
+| `NoConnFence` | On an ambiguous outcome, reads without terminating the session first | `StmtOnlyUnderOp` | 9 |
+| `ReleaseOnAmbiguous` | On an ambiguous outcome, answers "unknown" and releases `op` | `CacheCoherent` | 8 |
+| `AmbIsFailure` | After the fence, answers "failed" without reading | `CacheCoherent` | 9 |
+| `UpdateNoVerCompare` | After the fence, takes "the row is there" as "my update was applied" | `UpdateAnswerSound` | 16 |
+| `EvictNoDead` | Eviction removes the entry from the map without setting dead | `LiveEntryInMap` | 5 |
+| `DedupDeletedWithRow` | Deleting the row also deletes its dedup record | `NoResurrection` | 20 |
+| `LeakOpOnNotFound` | Update or delete of a missing row returns without releasing `op` | deadlock (and `NoLockLeak` under fairness) | 14 |
+
+### 11.4 What the model says about the eight holes of design.md
+
+Each line is a run in `suite.py claims`: the environment of `ext` or of a small `main`, with the fix in question switched off.
+
+| Hole of design.md 13.2 | Without its fix, in this design | So |
+|---|---|---|
+| 1. A late INSERT resurrects a deleted row | **Pass** without the dedup table (and without SDK retries) | Cannot occur: no statement outlives `op` |
+| 2. A create retried by the SDK resurrects a deleted row | Violates `NoResurrection` (20 states) | Remains. The dedup table is needed |
+| 3. A statement of the old process lands after the restart | Violates `StmtOnlyUnderOp` (10 states); the cache then holds "absent" for a row the DB has | Remains. The startup fence is needed |
+| 4. "Ambiguous, then not executed" taken as a failure | **Pass**; there is no fix to switch off | Cannot occur: after the fence the row is read once, and nothing is retried |
+| 5. A retry rejected because of another row | **Pass** with a constraint that flips between attempts; no mechanism of its own | Cannot occur: the ambiguous attempt is fenced before anything is decided |
+| 6. A create retry answered "exists" although it took effect | Violates `CreateFailureIsFinal` (27 states) | Remains. The dedup lookup is needed |
+| 7. The SDK reports "not executed" after an ambiguous attempt | Violates `CreateFailureIsFinal` (11 states) | Remains. The SDK rule is needed |
+| 8. A second instance | Violates `DbMatchesAbs` (10 states); also `CacheCoherent` and, after 20 states, `UpdateAnswerSound` | Remains, with milder consequences: the DB stays right, the newer instance's cache and its answer to an ambiguous update do not. The owner epoch is kept |
+
+Two rules that design.md needs for correctness turn out not to be needed here; the model passes with either removed (`redundant_NoGenCheck`, `redundant_LoadNoRecheck`): `AND gen = ?` in UPDATE and DELETE, and the re-check of `snap` after a load has taken `op`. Both stay in the design, the first as a second line of defence and the second to save a query.
+
+### 11.5 The two models side by side
+
+| | `memory-authoritative` (`RowService.tla`) | `db-authoritative` (`RowCache.tla`) |
+|---|---|---|
+| Size of the spec (lines that are not blank or comments) | 816 | 610 |
+| Fixes it needs, each with a switch | 7: dedup table, startup fence, "not executed is not final", session fence after a cross-row rejection, dedup lookup, SDK rule, owner epoch | 5: dedup table, startup fence, dedup lookup, SDK rule, owner epoch. The connection fence is the mechanism itself, not a fix |
+| Holes of design.md 13.2 that can occur without their fix | all 8 | 5 (holes 2, 3, 6, 7, 8) |
+| Distinct states at the same scale (2 clients x 3 operations, 3 entries, 2 creates, 2 updates, one of each fault, one crash) | 1,667,861,866 (`fixed`, before the fixes of holes 5-8) | 588,066,918 (`full`) |
+| What a crash may lose, as checked | unflushed updates (`Plausible` allows stale values) | nothing (`Plausible` allows only the one write in progress) |
+| What an update's answer promises, as checked | visible to later reads | "ok": applied in the DB; "failed": never applied (`UpdateAnswerSound`) |
+
+The state counts are an indication of how much interleaving each protocol has, not a measure of the code. Both models stop at one key and at the bounds above.
