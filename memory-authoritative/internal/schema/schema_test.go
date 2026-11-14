@@ -100,4 +100,8 @@ func TestNewRejects(t *testing.T) {
 			t.Errorf("%s: New accepted pk %v", name, pk)
 		}
 	}
+	// design.md 5.3: a table whose primary key type is not supported is refused when it is loaded.
+	if _, err := New("t", []Column{{Name: "id"}}, []int{0}); err == nil {
+		t.Error("New accepted a primary key column of type 0")
+	}
 }

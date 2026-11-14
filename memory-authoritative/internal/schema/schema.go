@@ -57,6 +57,11 @@ func New(table string, cols []Column, pk []int) (*Schema, error) {
 		if slices.Contains(pk[:i], c) {
 			return nil, fmt.Errorf("table %s: column %s twice in the primary key", table, cols[c].Name)
 		}
+		switch cols[c].Type {
+		case Int2, Int4, Int8, Text, UUID:
+		default:
+			return nil, fmt.Errorf("table %s: column %s: type %d cannot be a primary key", table, cols[c].Name, cols[c].Type)
+		}
 	}
 	return &Schema{Table: table, Cols: slices.Clone(cols), PK: slices.Clone(pk)}, nil
 }
