@@ -69,13 +69,10 @@ func (d *DB) Select(ctx context.Context, key schema.Key) (*schema.Row, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %w", db.ErrNotExecuted, err)
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	r, ok := d.rows[key]
-	if !ok {
-		return nil, db.ErrNoRows
+	if r := d.Row(key); r != nil {
+		return r, nil
 	}
-	return clone(r), nil
+	return nil, db.ErrNoRows
 }
 
 func clone(r *schema.Row) *schema.Row {

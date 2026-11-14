@@ -4,11 +4,10 @@
 // Locks (design.md 6). Only op may be held while taking another lock, and the only other lock is
 // shard.mu (I8):
 //   - entry.op: per key, held across DB IO; serializes everything that changes the entry. The root lock.
-//   - shard.mu: leaf lock; guards the shard's map only.
+//   - shard.mu: leaf lock; guards the shard's map only. While holding it: take no other lock, do no
+//     channel operation, no IO, no logging.
 //
-// There is no per-entry mu: snap is written only with op held (I3). While holding shard.mu: take no
-// other lock, do no channel operation, no IO, no logging. snap is read without any lock: a published
-// Row is never modified (I2).
+// There is no per-entry mu; entry.snap says how it is read and written (I2, I3).
 package store
 
 import (
@@ -74,13 +73,12 @@ var absent = &schema.Row{}
 type entry struct {
 	id schema.Key
 
-	// Read without locks; written only with op held (I3). nil = not loaded; absent = does not exist;
+	// Read without locks, since a published Row is never modified (I2); written only with op held (I3). nil = not loaded; absent = does not exist;
 	// otherwise the row, equal to the DB row while op is free (I4).
 	snap atomic.Pointer[schema.Row]
 
-	// op serializes this key's loads and writes and is held across DB IO. A channel of capacity 1, so
-	// that waiting for it can be cancelled by ctx. While it is held, the only other lock that may be
-	// taken is shard.mu (I8).
+	// op serializes this key's loads and writes and is held across DB IO (the root lock, I8). A channel
+	// of capacity 1, so that waiting for it can be cancelled by ctx.
 	op chan struct{}
 
 	// Accessed only with op held.

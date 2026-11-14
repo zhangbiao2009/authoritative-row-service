@@ -18,9 +18,9 @@ var ErrInvalid = errors.New("invalid argument")
 // is stored in the dedup table (5.1), so the encoding must never change once live.
 type Key string
 
-// Row is one row of a table. A published Row is never modified (I2): a change builds a new Row and
-// swaps the pointer; neither the Vals slice nor its values may be modified (I2). Vals is indexed by
-// the schema's column ordinals (I10).
+// Row is one row of a table. A published Row, including its Vals slice and every value in it, is never
+// modified (I2): a change builds a new Row and swaps the pointer. Vals is indexed by the schema's column
+// ordinals (I10).
 type Row struct {
 	Key  Key
 	Gen  int64 // incarnation: distinguishes the lives of one key

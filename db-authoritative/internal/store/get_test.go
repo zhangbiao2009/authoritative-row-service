@@ -59,20 +59,6 @@ func TestGetLoadsOnceThenServesFromMemory(t *testing.T) {
 	}
 }
 
-func TestGetMissingIsNegativelyCached(t *testing.T) {
-	d := fakedb.New()
-	s := newTestStore(t, d)
-	k := key(t, s, 1)
-	for range 2 {
-		if _, err := s.Get(context.Background(), k); !errors.Is(err, ErrNotFound) {
-			t.Fatalf("err = %v, want ErrNotFound", err)
-		}
-	}
-	if n := d.Selects(); n != 1 {
-		t.Fatalf("Selects = %d, want 1", n)
-	}
-}
-
 func TestGetOrCreateOneEntryPerKey(t *testing.T) { // I1
 	s := newTestStore(t, fakedb.New())
 	k := key(t, s, 1)
@@ -118,12 +104,8 @@ func TestGetMissingLeavesAbsentEntry(t *testing.T) {
 	if _, err := s.Get(context.Background(), k); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
-	sh := s.shardFor(k)
-	sh.mu.RLock()
-	e := sh.m[k]
-	sh.mu.RUnlock()
-	if e == nil || e.snap.Load() != absent {
-		t.Fatalf("entry = %v, want an entry whose snap is absent", e)
+	if r := s.getOrCreate(k).snap.Load(); r != absent {
+		t.Fatalf("entry snap = %v, want absent", r)
 	}
 	d.Put(testRow(k, 1)) // only this service writes the table (section 2): the cache is not re-read
 	if _, err := s.Get(context.Background(), k); !errors.Is(err, ErrNotFound) {

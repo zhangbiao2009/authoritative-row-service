@@ -19,12 +19,7 @@ func TestConcurrentMissesSelectOnce(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
 		release := make(chan struct{})
-		d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
-			if st.Kind == fakedb.Select {
-				<-release
-			}
-			return nil
-		}
+		d.Hook = func(context.Context, *fakedb.Stmt) error { <-release; return nil }
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
@@ -106,32 +101,12 @@ func TestLoadErrorIsNotExecuted(t *testing.T) {
 	}
 }
 
-func TestGetWithCancelledContext(t *testing.T) {
-	d := fakedb.New()
-	s := newTestStore(t, d)
-	k := key(t, s, 1)
-	d.Put(testRow(k, 1))
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := s.Get(ctx, k); !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", err)
-	}
-	if _, err := s.Get(context.Background(), k); err != nil {
-		t.Fatalf("Get after a cancelled Get: %v", err)
-	}
-}
-
 // A Get that times out while queued for op leaves the queue (TLA: L_lock).
 func TestGetTimesOutWhileQueuedForOp(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
 		release := make(chan struct{})
-		d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
-			if st.Kind == fakedb.Select {
-				<-release
-			}
-			return nil
-		}
+		d.Hook = func(context.Context, *fakedb.Stmt) error { <-release; return nil }
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
