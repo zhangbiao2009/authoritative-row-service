@@ -62,7 +62,6 @@ func stepRow(s rowState, in opInput, out opOutput) []rowState {
 	if !s.loaded {
 		return nil
 	}
-	gone := rowState{loaded: true}
 	switch in.kind {
 	case opGet:
 		if s.exists && out.err == nil && out.row == s || !s.exists && out.err == ErrNotFound {
@@ -106,11 +105,11 @@ func stepRow(s rowState, in opInput, out opOutput) []rowState {
 		match := s.exists && (in.gen == 0 || in.gen == s.gen)
 		switch {
 		case out.err == nil && match:
-			return []rowState{gone}
+			return []rowState{absentRow}
 		case out.err == ErrNotFound && !match:
 			return []rowState{s}
 		case out.err == ErrOutcomeUnknown && match:
-			return []rowState{s, gone}
+			return []rowState{s, absentRow}
 		case out.err == ErrOutcomeUnknown:
 			return []rowState{s}
 		}
@@ -158,18 +157,18 @@ var rowModel = porcupine.NondeterministicModel{
 	Equal: func(a, b any) bool { return a.(rowState) == b.(rowState) },
 	DescribeOperation: func(input, output any) string {
 		in, out := input.(opInput), output.(opOutput)
-		answer := out.row.String()
+		desc := out.row.String()
 		switch {
 		case in.kind == opInit:
-			answer = in.init.String()
+			desc = in.init.String()
 		case out.err != nil:
-			answer = out.err.Error()
+			desc = out.err.Error()
 		case out.deleted:
-			answer = "created earlier, deleted since"
+			desc = "created earlier, deleted since"
 		case in.kind == opDelete:
-			answer = "ok"
+			desc = "ok"
 		}
-		return fmt.Sprintf("%s(gen %d %v) -> %s", opNames[in.kind], in.gen, in.cols, answer)
+		return fmt.Sprintf("%s(gen %d %v) -> %s", opNames[in.kind], in.gen, in.cols, desc)
 	},
 	DescribeState: func(state any) string { return state.(rowState).String() },
 }
@@ -181,8 +180,7 @@ func op(call, ret int64, in opInput, out opOutput) porcupine.Operation {
 }
 
 func check(ops ...porcupine.Operation) porcupine.CheckResult {
-	res, _ := porcupine.CheckOperationsVerbose(rowModel.ToModel(), ops, 30*time.Second)
-	return res
+	return porcupine.CheckOperationsTimeout(rowModel.ToModel(), ops, 30*time.Second)
 }
 
 func r(gen, ver int64, name string, score int64) rowState {
@@ -191,8 +189,9 @@ func r(gen, ver int64, name string, score int64) rowState {
 
 var absentRow = rowState{loaded: true}
 
-func initOp(k string, s rowState) porcupine.Operation {
-	return op(-2, -1, opInput{kind: opInit, key: schema.Key(k), init: s}, opOutput{})
+// initOp sets the key's starting row, before everything else.
+func initOp(k schema.Key, s rowState) porcupine.Operation {
+	return op(-2, -1, opInput{kind: opInit, key: k, init: s}, opOutput{})
 }
 
 func get(k string, call, ret int64, out opOutput) porcupine.Operation {

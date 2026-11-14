@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,27 @@ type faults struct {
 	fenced    map[stmtOf]bool         // one of those sessions was fenced
 
 	flipping, flipped chan struct{}
+}
+
+// What a Store answer means under these faults.
+type answerKind uint8
+
+const (
+	answered   answerKind = iota // took effect, or tells something about the row: nil, ErrNotFound, ErrAlreadyExists, ErrOutcomeUnknown
+	noEffect                     // definitely had no effect: not executed, rejected because of another row, timed out queued
+	unexpected                   // anything else, a DB ambiguity reaching the caller included
+)
+
+func classify(err error) answerKind {
+	switch {
+	case db.IsAmbiguous(err):
+		return unexpected
+	case err == nil, errors.Is(err, ErrNotFound), errors.Is(err, ErrAlreadyExists), errors.Is(err, ErrOutcomeUnknown):
+		return answered
+	case db.NotExecuted(err), db.IsCrossRow(err), errors.Is(err, context.DeadlineExceeded):
+		return noEffect
+	}
+	return unexpected
 }
 
 // stmtOf names the Inserts, or the Deletes, of one life.
@@ -100,6 +122,9 @@ func (f *faults) hook(_ context.Context, st *fakedb.Stmt) error {
 		return nil
 	}
 	time.Sleep(time.Duration(rand.IntN(500)) * time.Microsecond)
+	if !f.on.Load() { // stopped while this hook slept: no new fault after stop
+		return nil
+	}
 	switch st.Kind {
 	case fakedb.Fence:
 		f.mu.Lock()
@@ -131,7 +156,7 @@ func (f *faults) hook(_ context.Context, st *fakedb.Stmt) error {
 		return lost(st)
 	case n < 75:
 		f.mu.Lock()
-		if !f.on.Load() { // stopped while this hook slept: run normally
+		if !f.on.Load() { // stop ran since the check above: register nothing after its late.Wait
 			f.mu.Unlock()
 			return nil
 		}

@@ -147,6 +147,26 @@ func TestStressUpdates(t *testing.T) {
 	t.Logf("%d flushes, %d failed, %d late", d.Updates(), failed.Load(), late.Load())
 }
 
+// opCtx is a client's ctx: 5ms for shortPercent of the calls, to get unknown outcomes and timeouts while
+// queued, else 5s (L1 EventuallyResponds).
+func opCtx(shortPercent int) (context.Context, context.CancelFunc) {
+	if rand.IntN(100) < shortPercent {
+		return context.WithTimeout(context.Background(), 5*time.Millisecond)
+	}
+	return context.WithTimeout(context.Background(), 5*time.Second)
+}
+
+// nonVacuous fails t for every counter that is 0: the test did not reach that case (tla-mapping.md section 8).
+func nonVacuous(t *testing.T, counters map[string]int64) {
+	t.Helper()
+	for name, n := range counters {
+		if n == 0 {
+			t.Errorf("non-vacuity: no %s", name)
+		}
+	}
+	t.Logf("%v", counters)
+}
+
 // Acceptance (design.md 12.2 M3): a stress test with fault injection. Afterwards memory and the DB match row
 // for row, and the history checks of tla-mapping.md section 5 hold. synctest: the backoffs and timeouts run
 // on virtual time; the goroutines still run concurrently.
@@ -186,28 +206,20 @@ func TestStressCreateDelete(t *testing.T) {
 
 		allowed := func(op string, err error) bool {
 			switch {
-			case err == nil, errors.Is(err, ErrNotFound), errors.Is(err, ErrAlreadyExists), db.NotExecuted(err), db.IsCrossRow(err):
-				return true
+			case classify(err) == unexpected:
+				t.Errorf("%s: unexpected error %v", op, err)
+				return false
 			case errors.Is(err, ErrOutcomeUnknown):
 				outcomeUnknown.Add(1)
-				return true
-			case !db.IsAmbiguous(err) && errors.Is(err, context.DeadlineExceeded):
+			case errors.Is(err, context.DeadlineExceeded):
 				queueTimeouts.Add(1)
-				return true
 			}
-			t.Errorf("%s: unexpected error %v", op, err)
-			return false
+			return true
 		}
 		noResurrection := func(op string, r *schema.Row, start int64) {
 			if v, ok := deleted.Load(r.Gen); ok && v.(int64) <= start {
 				t.Errorf("%s returned gen %d, deleted before it started (NoResurrection)", op, r.Gen)
 			}
-		}
-		opCtx := func(shortPercent int) (context.Context, context.CancelFunc) {
-			if rand.IntN(100) < shortPercent {
-				return context.WithTimeout(context.Background(), 5*time.Millisecond)
-			}
-			return context.WithTimeout(context.Background(), 5*time.Second) // L1 EventuallyResponds
 		}
 
 		stop := startFlusher(s)
@@ -357,11 +369,6 @@ func TestStressCreateDelete(t *testing.T) {
 			"not executed after a fence": f.notExecutedAfterFence.Load(), "late inserts of a deleted gen": f.lateInsertOfDeleted.Load(),
 			"retries finding the gen claimed": f.retryFindsOtherLife.Load(),
 		}
-		for name, n := range counters {
-			if n == 0 {
-				t.Errorf("non-vacuity: no %s", name)
-			}
-		}
-		t.Logf("%+v", counters)
+		nonVacuous(t, counters)
 	})
 }

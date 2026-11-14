@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"math/rand/v2"
 	"os"
 	"sync"
@@ -15,7 +14,6 @@ import (
 
 	"github.com/anishathalye/porcupine"
 
-	"rowsvc/internal/db"
 	"rowsvc/internal/db/fakedb"
 	"rowsvc/internal/schema"
 )
@@ -36,7 +34,7 @@ func (h *history) call() int64 { return h.clock.Add(1) }
 func (h *history) add(client int, in opInput, call int64, out opOutput) {
 	ret := h.clock.Add(1)
 	if out.err == ErrOutcomeUnknown {
-		ret = math.MaxInt64
+		ret = never
 	}
 	h.mu.Lock()
 	h.ops = append(h.ops, porcupine.Operation{ClientId: client, Input: in, Call: call, Output: out, Return: ret})
@@ -85,56 +83,70 @@ func checkLinearizable(t *testing.T, ops []porcupine.Operation, timeout time.Dur
 // Acceptance (design.md 12.2 M4): random concurrent operations under injected DB faults are linearizable
 // per key (correctness-properties.md C1, S1, S2). Each round runs on a fresh Store, in synctest, as a subtest;
 // its history is checked after it, whatever the subtest found, and on real time, so the check's timeout
-// works. Many short histories rather than a few long ones: the cost of the check grows much faster than the
-// length of a history, and two workers per key keep the operations of a key concurrent.
+// works.
 func TestLinearizable(t *testing.T) {
-	const rounds, keys, workers, ops = 12, 16, 32, 25
-	var unknown, getRow, getNotFound, updateGenNotFound, created, deletedOK atomic.Int64
-	overlaps, total := 0, 0 // overlapping pairs: operations on one key whose intervals overlap, the cases with a choice of order
+	const rounds = 12
+	counters := map[string]int64{}
+	total := 0
 	for i := range rounds {
 		h := &history{}
-		t.Run(fmt.Sprint("round ", i), func(t *testing.T) {
-			linearizableRound(t, h, keys, workers, ops, &unknown, &getRow, &getNotFound, &updateGenNotFound, &created, &deletedOK)
-		})
-		for _, part := range rowModel.Partition(h.ops) {
-			for i, a := range part {
-				for _, b := range part[i+1:] {
-					if a.Call < b.Return && b.Call < a.Return {
-						overlaps++
-					}
-				}
-			}
-		}
+		t.Run(fmt.Sprint("round ", i), func(t *testing.T) { linearizableRound(t, h) })
+		witnesses(counters, h.ops)
 		total += len(h.ops)
 		checkLinearizable(t, h.ops, 30*time.Second)
 	}
-	counters := map[string]int64{
-		"unknown outcomes": unknown.Load(), "Gets of a row": getRow.Load(), "Gets of no row": getNotFound.Load(),
-		"Updates with a gen answered not found": updateGenNotFound.Load(), "creates": created.Load(),
-		"deletes": deletedOK.Load(), "overlapping pairs": int64(overlaps),
-	}
-	for name, n := range counters {
-		if n == 0 {
-			t.Errorf("non-vacuity: no %s", name)
+	t.Logf("%d operations in %d rounds", total, rounds)
+	nonVacuous(t, counters)
+}
+
+// One round: many short histories rather than a few long ones, because the cost of the check grows much
+// faster than the length of a history; two workers per key keep the operations of a key concurrent.
+const linKeys, linWorkers, linOps = 16, 32, 25
+
+// witnesses counts, in a history, the cases that show it reached the hard parts.
+func witnesses(counters map[string]int64, ops []porcupine.Operation) {
+	for _, part := range rowModel.Partition(ops) {
+		for j, a := range part {
+			in, out := a.Input.(opInput), a.Output.(opOutput)
+			switch {
+			case in.kind == opInit:
+			case out.err == ErrOutcomeUnknown:
+				counters["unknown outcomes"]++
+			case in.kind == opGet && out.err == nil:
+				counters["Gets of a row"]++
+			case in.kind == opGet:
+				counters["Gets of no row"]++
+			case in.kind == opUpdate && out.err == ErrNotFound && in.gen != 0:
+				counters["Updates with a gen answered not found (absent or another life)"]++
+			case in.kind == opCreate && out.err == nil:
+				counters["creates"]++
+			case in.kind == opDelete && out.err == nil:
+				counters["deletes"]++
+			}
+			for _, b := range part[j+1:] { // overlapping intervals: the cases with a choice of order
+				if a.Call < b.Return && b.Call < a.Return {
+					counters["overlapping pairs"]++
+				}
+			}
 		}
 	}
-	t.Logf("%d operations in %d rounds; %v", total, rounds, counters)
 }
 
 // linearizableRound runs one round of TestLinearizable, recording its history in h.
-func linearizableRound(t *testing.T, h *history, keys, workers, ops int, unknown, getRow, getNotFound, updateGenNotFound, created, deletedOK *atomic.Int64) {
+func linearizableRound(t *testing.T, h *history) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
 		s := newTestStore(t, d)
-		ks := make([]schema.Key, keys)
-		for i := range keys {
+		ks := make([]schema.Key, linKeys)
+		for i := range linKeys {
 			ks[i] = key(t, s, int64(i+1))
 			start := absentRow
-			if i < keys/2 { // preloaded: gen 101+i, ver 3, "a", 10
-				d.Put(testRow(ks[i], int64(i+1)))
-				start = r(int64(i+101), 3, "a", 10)
+			if i < linKeys/2 {
+				row := testRow(ks[i], int64(i+1))
+				d.Put(row)
+				start = answer(row, nil).row
 			}
-			h.ops = append(h.ops, porcupine.Operation{Input: opInput{kind: opInit, key: ks[i], init: start}, Call: -2, Output: opOutput{}, Return: -1})
+			h.ops = append(h.ops, initOp(ks[i], start))
 		}
 		stop := startFlusher(s)
 		f := startFaults(d, ks)
@@ -142,18 +154,13 @@ func linearizableRound(t *testing.T, h *history, keys, workers, ops int, unknown
 		gens.Store(1000)
 
 		// record keeps an answer that took effect or tells something, and leaves out the ones that
-		// definitely had no effect and say nothing about the row (decision 3).
+		// definitely had no effect and say nothing about the row (M4 plan, decision 3).
 		record := func(client int, in opInput, call int64, row *schema.Row, err error) {
-			switch {
-			case db.IsAmbiguous(err):
-				t.Errorf("%s: a DB ambiguity leaked to the caller: %v", opNames[in.kind], err)
-				return
-			case err == nil, errors.Is(err, ErrNotFound), errors.Is(err, ErrAlreadyExists), errors.Is(err, ErrOutcomeUnknown):
-			case db.NotExecuted(err), db.IsCrossRow(err), errors.Is(err, db.ErrRejected),
-				errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-				return
-			default:
+			switch classify(err) {
+			case unexpected:
 				t.Errorf("%s: unexpected error %v", opNames[in.kind], err)
+				return
+			case noEffect:
 				return
 			}
 			for _, sentinel := range []error{ErrNotFound, ErrAlreadyExists, ErrOutcomeUnknown} {
@@ -163,78 +170,53 @@ func linearizableRound(t *testing.T, h *history, keys, workers, ops int, unknown
 			}
 			out := answer(row, err)
 			out.deleted = in.kind == opCreate && row == nil && err == nil
-			switch {
-			case err == ErrOutcomeUnknown:
-				unknown.Add(1)
-			case in.kind == opGet && err == nil:
-				getRow.Add(1)
-			case in.kind == opGet:
-				getNotFound.Add(1)
-			case in.kind == opUpdate && err == ErrNotFound && in.gen != 0:
-				updateGenNotFound.Add(1)
-			case in.kind == opCreate && err == nil:
-				created.Add(1)
-			case in.kind == opDelete && err == nil:
-				deletedOK.Add(1)
-			}
 			h.add(client, in, call, out)
-		}
-		ctxFor := func(shortPercent int) (context.Context, context.CancelFunc) {
-			if rand.IntN(100) < shortPercent {
-				return context.WithTimeout(context.Background(), 5*time.Millisecond)
-			}
-			return context.WithTimeout(context.Background(), 5*time.Second) // L1 EventuallyResponds
 		}
 
 		var wg sync.WaitGroup
-		for w := range workers {
+		for w := range linWorkers {
 			wg.Go(func() {
-				seen := make([]int64, keys) // the gen this worker last saw per key
+				seen := make([]int64, linKeys) // the gen this worker last saw per key
 				genOrZero := func(i int) int64 {
 					if rand.IntN(2) == 0 {
 						return 0
 					}
 					return seen[i]
 				}
-				for range ops {
-					i := rand.IntN(keys)
+				for range linOps {
+					i := rand.IntN(linKeys)
 					k := ks[i]
 					var in opInput
-					var row *schema.Row
-					var err error
-					var call int64
+					var do func(context.Context) (*schema.Row, error)
+					short := 0 // percent of calls with a 5ms ctx
 					switch n := rand.IntN(10); {
 					case n < 3:
 						in = opInput{kind: opGet, key: k}
-						ctx, cancel := ctxFor(0)
-						call = h.call()
-						row, err = s.Get(ctx, k)
-						cancel()
+						do = func(ctx context.Context) (*schema.Row, error) { return s.Get(ctx, k) }
 					case n < 6:
 						c := incr(2, int64(rand.IntN(11)-5))
 						if rand.IntN(2) == 0 {
 							c = set(1, string(rune('a'+rand.IntN(5))))
 						}
 						in = opInput{kind: opUpdate, key: k, gen: genOrZero(i), cols: []ColChange{c}}
-						ctx, cancel := ctxFor(0)
-						call = h.call()
-						row, err = s.Update(ctx, k, Change{Cols: in.cols, Gen: in.gen})
-						cancel()
+						do = func(ctx context.Context) (*schema.Row, error) {
+							return s.Update(ctx, k, Change{Cols: in.cols, Gen: in.gen})
+						}
 					case n < 8:
 						in = opInput{kind: opCreate, key: k, gen: gens.Add(1), name: "c", score: int64(rand.IntN(10))}
 						nr := newRow(k, int64(i+1), in.gen)
 						nr.Vals[1], nr.Vals[2] = in.name, in.score
-						ctx, cancel := ctxFor(20)
-						call = h.call()
-						row, err = s.Create(ctx, nr)
-						cancel()
+						short = 20
+						do = func(ctx context.Context) (*schema.Row, error) { return s.Create(ctx, nr) }
 					default:
 						in = opInput{kind: opDelete, key: k, gen: genOrZero(i)}
-						ctx, cancel := ctxFor(20)
-						call = h.call()
-						err = s.Delete(ctx, k, in.gen)
-						cancel()
+						short = 20
+						do = func(ctx context.Context) (*schema.Row, error) { return nil, s.Delete(ctx, k, in.gen) }
 					}
+					ctx, cancel := opCtx(short)
+					call := h.call()
+					row, err := do(ctx)
+					cancel()
 					record(w, in, call, row, err)
 					if row != nil {
 						seen[i] = row.Gen
@@ -249,7 +231,6 @@ func linearizableRound(t *testing.T, h *history, keys, workers, ops int, unknown
 		drain(t, s)
 		checkInvariants(t, s, d)
 	})
-
 }
 
 // Review Focus 4: only Ok passes.
