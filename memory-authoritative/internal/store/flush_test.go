@@ -164,6 +164,46 @@ func TestUpdateNotBlockedByHangingFlush(t *testing.T) {
 	})
 }
 
+// I5 (OneWriterPerKey): while one write of a key is in progress, the next flush round must not start
+// another; it finds op held and puts the entry back.
+func TestSecondFlushWaitsForFirstWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1))
+		update(t, s, k, incr(2, 1))
+		d.UpdateHook = func(ctx context.Context, _ schema.Key, _ func()) error {
+			<-ctx.Done() // a DB that never answers
+			return ctx.Err()
+		}
+		first, second := make(chan struct{}), make(chan struct{})
+		go func() {
+			flushAll(s)
+			close(first)
+		}()
+		synctest.Wait()                  // the first write is in progress
+		r := update(t, s, k, incr(2, 1)) // queues the entry again
+		go func() {
+			flushAll(s)
+			close(second)
+		}()
+		synctest.Wait()
+		if n := d.Updates(); n != 1 {
+			t.Fatalf("Updates = %d while the first write is in progress, want 1", n)
+		}
+		<-first
+		<-second
+		if n := queueLen(s); n != 1 {
+			t.Fatalf("queue %d after both rounds, want 1", n)
+		}
+		d.UpdateHook = nil
+		flushAll(s)
+		dbMatches(t, d, r)
+		checkInvariants(t, s, d)
+	})
+}
+
 // W_UpdateDuringFlush: an Update between the flush's snapshot and its write is written by the next flush.
 func TestUpdateDuringFlushIsWrittenNext(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {

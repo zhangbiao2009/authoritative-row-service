@@ -47,6 +47,8 @@ func (s *Store) flushShard(ctx context.Context, sh *shard) {
 			e.unlockOp()
 			continue
 		}
+		// I4: dirty is cleared only here, with op held until the write returns, and merged back below if
+		// the write fails. So dirty == 0 with op free means the DB holds this row.
 		s.clearDirtyLocked(e)
 		e.queued = false
 		e.mu.Unlock()
