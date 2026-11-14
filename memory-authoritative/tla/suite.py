@@ -286,11 +286,18 @@ def declared_constants(spec_text):
 def regress_jobs(ref, full):
     ref_dir = os.path.join(HERE, "out", "suite", "ref")
     os.makedirs(ref_dir, exist_ok=True)
-    try:
-        ref_text = subprocess.run(["git", "show", f"{ref}:tla/RowService.tla"], cwd=HERE, check=True,
-                                  capture_output=True, text=True).stdout
-    except subprocess.CalledProcessError as e:
-        sys.exit(f"regress: cannot read tla/RowService.tla at git ref {ref}: {e.stderr.strip()}")
+    # Where the model is in the repository: its current path, or tla/RowService.tla for a ref from before each
+    # design was moved into its own directory (BASELINE_REF is such a ref).
+    here = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=HERE, capture_output=True, text=True).stdout.strip()
+    ref_text, tried = None, []
+    for path in dict.fromkeys([here + "RowService.tla", "tla/RowService.tla"]):
+        p = subprocess.run(["git", "show", f"{ref}:{path}"], cwd=HERE, capture_output=True, text=True)
+        tried.append(path)
+        if p.returncode == 0:
+            ref_text = p.stdout
+            break
+    if ref_text is None:
+        sys.exit(f"regress: git ref {ref} has no model at {' or '.join(tried)}")
     with open(os.path.join(ref_dir, "RowService.tla"), "w") as f:
         f.write(ref_text)
     known = declared_constants(ref_text)

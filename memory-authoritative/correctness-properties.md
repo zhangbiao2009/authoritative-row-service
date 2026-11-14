@@ -366,7 +366,7 @@ What this does and does not establish for the long runs:
 2. Put new variables into `extV`, not into the old groups, unless they are a function of old variables while the switches are off (`bfl` equals `bamb` then).
 3. With the switches off, no old action may read a new variable.
 4. Then run `python3 suite.py quick`. A `DIFF` line from `regress` means rule 1, 2 or 3 was broken, or an old action was changed by accident (a changed guard, or a variable listed as `UNCHANGED` that the action used to change).
-5. After the change is accepted, set `BASELINE_REF` in `suite.py` to its commit, so the next change is compared against it.
+5. Before starting the next change, make this one the baseline: set `BASELINE_REF` in `suite.py` to its commit, and fold `extV` into `OldVars` in `RowService.tla`, so that "old" again means "everything the baseline has". The next change then gets a variable group and switches of its own.
 
 ---
 

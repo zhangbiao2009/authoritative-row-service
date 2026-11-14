@@ -7,7 +7,9 @@ created: 2026-11-13
 # Alternative Design: DB-Authoritative Write-Through Cache
 
 > [!info] What this document is
-> A comparison between the design in [design.md](design.md) (memory is authoritative, updates are written behind) and a simpler alternative (PostgreSQL stays authoritative, every write goes to the DB before it is acknowledged, memory is only a cache). It records a design review discussion of 2026-11-13 so that the choice can be revisited later.
+> A comparison between the design in [design.md](../memory-authoritative/design.md) (memory is authoritative, updates are written behind) and a simpler alternative (PostgreSQL stays authoritative, every write goes to the DB before it is acknowledged, memory is only a cache). It records a design review discussion of 2026-11-13 so that the choice can be revisited later.
+>
+> **Where things are.** Each design has its own directory, so that both can be implemented and compared: this one is `db-authoritative/`; the other is [`memory-authoritative/`](../memory-authoritative/), which holds `design.md`, `correctness-properties.md` and the TLA+ model in `tla/`. Section, invariant and hole numbers below refer to those documents.
 >
 > **Status of the alternative: a sketch.** It has no TLA+ model and no benchmark. Every throughput or latency figure below is an estimate to be replaced by the measurement in section 8.
 
@@ -222,6 +224,6 @@ Also watch `pg_stat_user_tables.n_tup_hot_upd / n_tup_upd` and table size during
 ## 10. If the alternative is adopted
 
 1. Run the measurement of section 8 and record the numbers in design.md section 1, together with the target rates and latencies, which design.md does not state today.
-2. Write the TLA+ model for section 3 (start from `tla/RowService.tla`, delete the flusher and dirty state, add the connection fence) and carry over the properties of correctness-properties.md that still apply, including S18 on what create answers. Check each step with `python3 suite.py quick` (correctness-properties.md 9.1).
+2. Write the TLA+ model for section 3 (start from `../memory-authoritative/tla/RowService.tla`, put the copy in `db-authoritative/tla/`, delete the flusher and dirty state, add the connection fence) and carry over the properties of correctness-properties.md that still apply, including S18 on what create answers. Check each step with `python3 suite.py quick` (correctness-properties.md 9.1).
 3. Keep the fixes for holes 6 and 7 (the dedup lookup in `createLocked`, the SDK rule after an ambiguous attempt); they are independent of this choice.
 4. Rewrite design.md sections 7.3, 7.6, 7.9, 8.2, 8.4 and 11.1 accordingly; sections 5.3, 6, 7.2, 7.7, 7.8 and 7.10 need little or no change.

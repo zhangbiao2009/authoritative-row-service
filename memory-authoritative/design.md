@@ -8,6 +8,8 @@ created: 2026-11-11
 
 > [!info] Purpose of this document
 > This document records the requirements, design, underlying principles, and trade-offs of this service, and is handed to Claude Code for implementation. Section 0 is the working agreement for the implementer; sections 14-15 cover design methodology and trade-offs, for later review.
+>
+> This design lives in the directory `memory-authoritative/`, together with its correctness properties and its TLA+ model (`tla/`); its implementation goes here too. The alternative that was considered, in which the DB stays authoritative, has its own directory: [db-authoritative/alternative-design.md](../db-authoritative/alternative-design.md).
 
 ---
 
@@ -108,7 +110,7 @@ Row    → Row'           (update)
 Row    → absent         (delete, tombstone)
 ```
 
-Suggested directory layout:
+Suggested directory layout (paths are relative to this design's directory, `memory-authoritative/`):
 
 ```
 /api/rowsvc/v1            external protocol: .proto files and generated Go code (see 7.10)
