@@ -9,8 +9,8 @@ import sys
 
 # The variables most worth watching in a counterexample (shown in this order)
 KEY = ["up", "pc", "bpc", "fpc", "vpc", "mapE", "snap", "dirty", "queued", "dead", "opH",
-       "queue", "fitem", "net", "wait", "resp", "db", "dedup", "abs", "absKnown",
-       "deletedGens", "violation"]
+       "queue", "fitem", "net", "wait", "resp", "db", "dedup", "dbEpoch", "blocked", "abs", "absKnown",
+       "deletedGens", "unkGen", "retry", "failedGens", "violation"]
 
 
 def parse(lines):

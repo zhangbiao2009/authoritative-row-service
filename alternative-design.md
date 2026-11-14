@@ -20,7 +20,7 @@ created: 2026-11-13
 | Who is authoritative | Memory. The DB is a near-real-time mirror. | The DB. Memory is a cache that can be dropped at any time. |
 | Update returns | After memory is changed (microseconds) | After the DB accepted the statement (one round trip, expected 0.2-1 ms) |
 | DB writes per row | At most one per flush interval, however many updates | One per update |
-| A service crash loses | Updates not yet flushed: 200 ms normally, unbounded while the DB is slow | Nothing |
+| A service crash loses | Updates not yet flushed: 200 ms normally, up to `MaxDirtyAge` (30 s) while the DB cannot be written | Nothing |
 | A PG or host crash loses | Nothing the DB confirmed | With `synchronous_commit = off`: up to about 600 ms of updates. With `on`: nothing |
 | Worst outcome of a bug or a broken assumption | The authoritative copy is silently and permanently wrong | A cache entry is stale until it is reloaded |
 | Mechanisms needed | All of design.md | About half: the whole write-behind half disappears (section 4) |
@@ -112,12 +112,13 @@ Any entry whose `op` is free may be evicted. There is no dirty condition. The de
 | design.md mechanism | In the alternative |
 |---|---|
 | Dirty bitmap, flush queue, flusher, mask merge-back (7.6) | Gone |
-| Backpressure on dirty rows, `MaxDirty` (11.1) | Gone. The connection pool and `MaxInflightPerConn` limit load |
+| Backpressure on dirty rows, `MaxDirty` and `MaxDirtyAge` (11.1) | Gone. The connection pool and `MaxInflightPerConn` limit load |
 | Poison rows, quarantine, admin interface (7.9) | Gone. Constraint errors are returned synchronously |
 | "Dirty entries are never evicted" (I10) | Gone |
 | `ver` as a fencing token, `AND ver < ?` (I6, 8.2 example 1) | Gone. `ver` remains as a counter the DB increments, for observation only |
 | Flush writes absolute values, no `col = col + delta` (I12) | Gone. A delta in SQL is correct |
-| Retry until sure, the `unsure` flag, two kinds of definite failure (7.4, 7.5, 8.4, hole 4) | Replaced by "fence the connection, then read" (3.2) |
+| Retry until sure, the `unsure` and `inflight` flags, three kinds of definite failure, the session fence used only after a rejection caused by another row (7.4, 7.5, 8.4, holes 4 and 5) | Replaced by one rule: "fence the connection, then read", on every ambiguous outcome (3.2) |
+| Owner epoch in every write (I16, hole 8) | Optional. A second instance makes cache entries stale; it cannot corrupt the authoritative copy. Keeping the epoch is cheap and still stops the old instance |
 | Late statements blocked by gen conditions (8.2 examples 2, 3; hole 1) | Cannot occur (3.2). `gen` in WHERE stays as a cheap second line of defence |
 | Hole 3 (old process's late UPDATE diverges memory and DB forever) | Cannot diverge the authoritative copy. The startup fence is kept so that the cache is not stale either |
 | Exact value agreement between memory and DB | Automatic: the cache holds the `RETURNING` row |
@@ -139,8 +140,8 @@ For the TLA+ model: the flusher, `dirty`, masks and "a crash loses unflushed upd
 These come from clients retrying creates and deletes over an unreliable network, which is the same in both designs:
 
 - **Hole 2 and the dedup table.** A create whose response was lost is retried by the SDK with the same gen. If someone deleted the row in between, only a durable record of "this gen was already inserted" stops the retry from inserting it again.
-- **SDK retry rules.** Once any attempt of one logical operation had an unknown outcome, a later answer obtained before `op` was acquired (`DEADLINE_EXCEEDED`, `UNAVAILABLE`, `BUSY`) says nothing about the earlier attempt. A retried create must also be answered "success" when its gen is in the dedup table but the row now belongs to another life. Both points are open in design.md (section 7 below, finding 2).
-- **Single instance.** A linearizable cache still needs one instance per key. What changes is the consequence of a second instance: stale reads instead of two authorities overwriting each other.
+- **SDK retry rules.** Once any attempt of one logical operation had an unknown outcome, a later answer obtained before `op` was acquired (`DEADLINE_EXCEEDED`, `UNAVAILABLE`, `BUSY`) says nothing about the earlier attempt. A retried create must also be answered "success" when its gen is in the dedup table but the row now belongs to another life. Both points were fixed in design.md on 2026-11-13 (holes 6 and 7 of its 13.2) and apply here unchanged.
+- **Single instance.** A linearizable cache still needs one instance per key. What changes is the consequence of a second instance: stale reads, where design.md needs the owner epoch (hole 8) to keep two authorities from overwriting each other.
 - **Only this service writes the tables.** Another writer makes cache entries stale. The DB stays correct.
 
 ---
@@ -150,7 +151,7 @@ These come from clients retrying creates and deletes over an unreliable network,
 - **Update latency.** One DB round trip per update instead of a memory write. Expected 0.2 to 1 ms in one data centre; to be measured.
 - **Hot keys.** Updates of one key are serialized by `op` across the round trip, so one key takes at most 1 / round-trip-time updates per second. At 0.3 ms that is about 3,000 per second on a single key. design.md has no such limit and writes a hot row once per flush interval.
 - **No write coalescing.** Every update produces WAL and a dead tuple. At 3,000 updates per second that is about 260 million row versions per day. HOT updates (fillfactor, no index on updated columns) and aggressive autovacuum settings become requirements, not optimizations.
-- **DB outage.** Updates fail while the DB is unavailable. design.md keeps accepting them until `MaxDirty` is reached. Cached reads work in both.
+- **DB outage.** Updates fail while the DB is unavailable. design.md keeps accepting them until `MaxDirty` or `MaxDirtyAge` (30 s by default) is reached. Cached reads work in both.
 - **PG crash with `synchronous_commit = off`.** PG may lose the last moments of acknowledged updates (up to three times `wal_writer_delay`, 600 ms with defaults), and the cache then holds values the DB no longer has. The service must drop the whole cache when PG has restarted: compare `pg_postmaster_start_time()` on every new connection with the value seen at startup, and on a change clear every entry (or exit and let the supervisor restart it). With `synchronous_commit = on` this case does not arise.
 - **The stated reason for a custom TCP protocol weakens.** design.md 7.10 chose it because an update costs a few microseconds and protocol overhead is a large share. With a DB round trip per update that argument no longer holds, and gRPC would be an acceptable simplification. This is optional.
 
@@ -158,15 +159,17 @@ These come from clients retrying creates and deletes over an unreliable network,
 
 ## 7. Effect on the review findings of 2026-11-13
 
-The review of design.md found five gaps. Finding 2 (first part) was confirmed with TLC by adding one invariant to a copy of the model; the others were found by reading and are not model-checked.
+The review of design.md found five gaps. Four of them were fixed in design.md on the same day and are now its holes 5-8 (13.2), each reproduced and checked in the TLA+ model; the fourth finding was deliberately left open (13.3). The table records what each finding was, what design.md does about it now, and what becomes of it in the alternative.
 
-| # | Finding in design.md | In the alternative |
-|---|---|---|
-| 1 | "Rejected by data" is treated as final after an ambiguous attempt, on the argument that the same parameters give the same result. Foreign keys, non-primary unique indexes, exclusion constraints and triggers depend on DB state, so the earlier statement can still land later. Also, SQLSTATE 23505 from a non-primary unique index is mapped to `ErrInternal`. | Gone: the ambiguous statement is fenced before anything is decided (3.2), and a unique violation is an ordinary synchronous error |
-| 2 | SDK retries: a retried create can be answered `ALREADY_EXISTS` although it took effect (confirmed with TLC, 26 steps in the `fixed` environment); a retry that times out while queued behind the first attempt is reported as "did not take effect". No property checks the responses of create and delete. | Unchanged. Must be fixed in either design |
-| 3 | "One instance at a time" is guaranteed only by deployment, and a violation silently corrupts the authoritative copy. Proposed: an owner epoch checked by every write. | Still an assumption, but a violation causes stale reads, not corruption. The epoch check becomes optional |
-| 4 | Values PG normalizes (float4, numeric scale, char(n) padding, timestamp precision, jsonb) differ between memory and DB, so a Get can change after eviction with no write. | Gone: the cache holds the `RETURNING` row |
-| 5 | The loss window grows without bound while the DB is slow; `synchronous_commit = on` and "restart the service after a PG failover or restore" are unstated assumptions. | The loss window is bounded by PG, not by load. The failover and restore assumption remains, and the PG crash rule of section 6 is added |
+| # | Finding in design.md | Now in design.md | In the alternative |
+|---|---|---|---|
+| 1 | "Rejected by data" is treated as final after an ambiguous attempt, on the argument that the same parameters give the same result. Foreign keys, non-primary unique indexes, exclusion constraints and triggers depend on DB state, so the earlier statement can still land later. Also, SQLSTATE 23505 from a non-primary unique index is mapped to `ErrInternal`. | Fixed (hole 5): such tables are refused unless enabled per table; with the option, the sessions of the ambiguous attempts are terminated before the rejection is trusted | Gone: the ambiguous statement is fenced before anything is decided (3.2), and a unique violation is an ordinary synchronous error |
+| 2 | SDK retries: a retried create can be answered `ALREADY_EXISTS` although it took effect; a retry that times out while queued behind the first attempt is reported as "did not take effect". No property checks the responses of create and delete. | Fixed (holes 6 and 7; property S18) | The same fixes apply unchanged |
+| 3 | "One instance at a time" is guaranteed only by deployment, and a violation silently corrupts the authoritative copy. | Fixed (hole 8): an owner epoch checked by every write | Still an assumption, but a violation causes stale reads, not corruption. The epoch check becomes optional |
+| 4 | Values PG normalizes (float4, numeric scale, char(n) padding, timestamp precision, jsonb) differ between memory and DB, so a Get can change after eviction with no write. | Not fixed (13.3) | Gone: the cache holds the `RETURNING` row |
+| 5 | The loss window grows without bound while the DB is slow; `synchronous_commit = on` and "restart the service after a PG failover or restore" are unstated assumptions. | Fixed: `MaxDirtyAge` caps the window; the PostgreSQL assumptions are stated in section 2 | The loss window is bounded by PG, not by load. The failover and restore assumption remains, and the PG crash rule of section 6 is added |
+
+The fixes cost design.md three more mechanisms (the per-operation session fence, the owner epoch, the age limit). That widens the difference in size between the two designs a little; it does not change the decision rule of section 1.
 
 ---
 
@@ -219,6 +222,6 @@ Also watch `pg_stat_user_tables.n_tup_hot_upd / n_tup_upd` and table size during
 ## 10. If the alternative is adopted
 
 1. Run the measurement of section 8 and record the numbers in design.md section 1, together with the target rates and latencies, which design.md does not state today.
-2. Write the TLA+ model for section 3 (start from `tla/RowService.tla`, delete the flusher and dirty state, add the connection fence) and carry over the properties of correctness-properties.md that still apply, plus a property on create and delete responses (finding 2).
-3. Fix finding 2 in the SDK and in `createLocked`; it is independent of this choice.
+2. Write the TLA+ model for section 3 (start from `tla/RowService.tla`, delete the flusher and dirty state, add the connection fence) and carry over the properties of correctness-properties.md that still apply, including S18 on what create answers. Check each step with `python3 suite.py quick` (correctness-properties.md 9.1).
+3. Keep the fixes for holes 6 and 7 (the dedup lookup in `createLocked`, the SDK rule after an ambiguous attempt); they are independent of this choice.
 4. Rewrite design.md sections 7.3, 7.6, 7.9, 8.2, 8.4 and 11.1 accordingly; sections 5.3, 6, 7.2, 7.7, 7.8 and 7.10 need little or no change.

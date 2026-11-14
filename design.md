@@ -14,7 +14,7 @@ created: 2026-11-11
 ## 0. Working agreement for the implementer (Claude Code)
 
 1. Read the whole document first, especially **section 4 (invariants)** and **section 6 (lock design)**.
-2. The questions in section 13 have been answered one by one by the user (13.1). 13.2 lists the four design holes that were found; the fixes have been verified with TLA+ (12.3), confirmed by the user, and written into 5.1, 7.4, 7.5, 7.8, 8.3, and 8.4.
+2. The questions in section 13 have been answered one by one by the user (13.1). 13.2 lists the eight design holes that were found; the fixes have been verified with TLA+ (12.3), confirmed by the user, and written into 5.1, 5.3, 7.4, 7.5, 7.6, 7.8, 7.10, 8.3, and 8.4. 13.3 lists what is known and deliberately not fixed.
 3. Proceed according to the **milestones in section 12**. Every milestone must pass `go test -race` and the concurrency tests required for that stage.
 4. Write the invariants from section 4, and the role of each lock (whether it is a leaf lock, what it protects), into code comments.
 5. The following are **deliberate design choices**; do not remove them for the sake of "simplification":
@@ -29,6 +29,9 @@ created: 2026-11-11
    - create loads first; INSERTing the business row and writing the dedup record must be in the same statement; deleting a business row does not delete the dedup record (I14, 7.4)
    - At startup, first terminate the previous process's sessions and confirm they have exited, and only then load data (I15, 7.8)
    - After an attempt with an ambiguous outcome has occurred, a "not executed" kind of definite failure must not be treated as the final result (7.4, 8.4)
+   - After an ambiguous attempt, a rejection caused by another row is final only once the sessions of the earlier attempts have been terminated; terminating them does not clear `unsure` (7.4, 13.2 hole 5)
+   - Every write carries the owner-epoch condition, and an instance that finds another epoch stops at once without flushing (I16, 7.8)
+   - The SDK never reports a "not executed" status as the final result of a call in which an earlier attempt was ambiguous (7.10)
 6. If you find something in the design that does not make sense or is missing, stop and ask the user first; do not modify the design on your own.
 
 ---
@@ -49,7 +52,7 @@ created: 2026-11-11
 - An Update may modify only **one or a few columns** of a row; besides direct assignment, it also supports **increment** (adding a delta to the old value, see 7.3).
 - The service manages **multiple tables of the business side**, and the table structures are **dynamic**: the service reads table structures from PG's system catalogs at runtime rather than hard-coding them. The only requirement is that each table must have the gen and ver columns (column names are configurable).
 - Place as few restrictions on the business side as possible: primary keys may be integers, strings, UUIDs, or composite primary keys (see 5.3).
-- **Tolerable**: when the service crashes and restarts, losing a small number of the most recent updates within the flush window.
+- **Tolerable**: when the service crashes and restarts, losing a small number of the most recent updates within the flush window. While the DB cannot be written the window grows beyond `FlushInterval`; it is capped by `MaxDirtyAge` (11.1).
 - **Not tolerable**:
   - A confirmed create disappearing
   - Data whose delete has been confirmed reappearing
@@ -62,9 +65,14 @@ created: 2026-11-11
 
 ## 2. Assumptions
 
-- At any moment, a given key is owned by only **one service instance**. v1 is a **single-instance deployment** (confirmed); the deployment guarantees that only one instance runs at a time. Multi-instance routing by key will come later (see 11.3).
+- At any moment, a given key is owned by only **one service instance**. v1 is a **single-instance deployment** (confirmed); the deployment runs one instance at a time. If a second instance is started anyway, the owner epoch (I16, 7.8) turns that into a crash of the older instance instead of two writers: the older one can no longer change the DB and stops. Multi-instance routing by key will come later (see 11.3).
 - These tables are **written only by this service**. If other programs of the business side bypass this service and write these tables directly, memory is no longer authoritative, and data will be overwritten or become inconsistent. **This is a hard prerequisite for adopting this service, and the business side has confirmed and accepted it** (together with the other conventions in 5.3 and 7.9).
-- The **DB account** used by this service **is for this service only**: at startup it terminates all other sessions of that account (7.8). The database also needs a dedup table managed by this service (5.1).
+- The **DB account** used by this service **is for this service only**: at startup it terminates all other sessions of that account (7.8). The database also needs a dedup table and an owner-epoch table managed by this service (5.1).
+- **A transaction PostgreSQL has acknowledged is never lost, and the DB never goes back in time under a running service.** Concretely:
+  - The service's sessions run with `synchronous_commit = on` (the default; set it at the role level so a changed server default cannot switch it off). With `off`, a PG crash can drop a create that was already confirmed.
+  - A standby that can be promoted must be synchronous. Promoting an asynchronous standby, or restoring a backup, can drop confirmed creates and deletes; no design on top of PG can prevent that.
+  - After any failover or restore, **restart the service**: its memory may be ahead of the DB it is now connected to. The service also checks for this itself and stops (7.8).
+- **Tables with constraints that depend on other rows** (unique indexes other than the primary key, foreign keys, exclusion constraints, triggers) are refused unless enabled per table (5.3).
 - **Memory cannot hold the full data set**; only the working set is kept:
   - If an entry has not been accessed for longer than `IdleTTL`, it must be cleared from memory (provided it is clean, see 7.7)
   - When the total number of entries exceeds `MaxEntries`, entries are forcibly evicted by approximate LRU
@@ -104,7 +112,7 @@ Suggested directory layout:
 
 ```
 /api/rowsvc/v1            external protocol: .proto files and generated Go code (see 7.10)
-/cmd/server               entry point: load config, terminate the previous process's sessions (7.8), load schemas, start Store and TCP server
+/cmd/server               entry point: load config, take over the owner epoch and terminate the previous process's sessions (7.8), load schemas, start Store and TCP server
 /internal/server          TCP server: framing, connection management, request dispatch, Status mapping
 /internal/schema          load schemas from system catalogs, type conversion and validation, primary key encoding, increment arithmetic
 /internal/store           entry, shard, Get/Create/Update/Delete, eviction
@@ -128,7 +136,7 @@ All code must maintain the following invariants, and they must be written in cod
 | I2 | A published `*Row` is **never modified**. Any modification creates a new Row and then replaces the pointer. |
 | I3 | Writing `snap` requires holding `mu`. Transitions involving nil/absent (load, create, delete) additionally require holding `op` at the same time. Update only performs Row→Row transitions. |
 | I4 | While holding `op`, if `dirty == 0`, then this row in the DB is consistent with memory (or it exists in neither). |
-| I5 | For a given key, at any moment there is at most one write SQL issued by this service that is still awaiting its result. For writes that execute late after a timeout, UPDATE/DELETE are blocked by gen/ver, INSERT is blocked by the dedup table (I14), and writes from the previous process are blocked by the startup session cleanup (I15). |
+| I5 | For a given key, at any moment there is at most one write SQL issued by this service that is still awaiting its result. For writes that execute late after a timeout, UPDATE/DELETE are blocked by gen/ver, INSERT is blocked by the dedup table (I14), writes from the previous process are blocked by the startup session cleanup (I15), and writes of an instance that has been superseded are blocked by the owner epoch (I16). |
 | I6 | DB writes are always conditional writes: `UPDATE ... WHERE id AND gen AND ver <`, `DELETE ... WHERE id AND gen`, and INSERT relies on the unique constraints of the primary key and the dedup table. **Upsert is forbidden.** |
 | I7 | Create/Delete modify memory only after the DB outcome has **definitely succeeded**, and the memory modification (the linearization point) happens before returning to the client. |
 | I8 | Only `op` may acquire other locks while held. `mu`, `shard.mu`, and `qmu` are all leaf locks. |
@@ -139,6 +147,7 @@ All code must maintain the following invariants, and they must be written in cod
 | I13 | Primary key columns cannot be modified by update: `Row.Key` and the primary key columns in `Vals` are always consistent. |
 | I14 | A given (table, primary key, gen) can be inserted only once in its lifetime: INSERTing the business row and writing the dedup record are in the same statement, and deleting the business row does not delete the dedup record (5.1, 8.3). |
 | I15 | Before the service starts loading data, all of the previous process's sessions on PG have exited, and SQL it issued can no longer land (7.8). |
+| I16 | A write of this service changes the DB only while the owner-epoch row holds this instance's epoch: every INSERT, UPDATE and DELETE carries that condition (8.3). A starting instance takes the epoch over before its startup fence, and an instance that finds another epoch stops at once without flushing (7.8). |
 
 ---
 
@@ -176,6 +185,19 @@ CREATE INDEX ON row_service_gen_log (created_at);  -- for cleanup by retention p
 - A background task runs every `GenLogCleanInterval` and deletes records whose `created_at` is older than `GenLogRetention` (default 24 hours), a small batch at a time to avoid holding locks for long. This relies on one assumption: a duplicate INSERT will not arrive later than the retention period. Late statements within the process are bounded by the TCP timeout (on the order of minutes), statements from the old process are cleaned up on restart (7.8), and client retries are bounded by the client's own timeout, so 24 hours is ample.
 - `pk` uses the canonical encoding from 5.3, so once that encoding goes live it can no longer be changed.
 - This table has only INSERTs and time-based batch DELETEs, no UPDATEs, so write amplification is small.
+
+And an **owner-epoch table** with exactly one row (table name configurable), used to guarantee I16 (see 7.8, 13.2 hole 8):
+
+```sql
+CREATE TABLE row_service_epoch (
+  id    boolean PRIMARY KEY DEFAULT true CHECK (id),   -- exactly one row
+  epoch bigint  NOT NULL
+);
+INSERT INTO row_service_epoch (epoch) VALUES (0);
+```
+
+- A starting instance adds 1 to `epoch` and remembers the result as its own epoch. Nothing else ever writes this table.
+- Every write statement of the service contains `AND EXISTS (SELECT 1 FROM row_service_epoch WHERE epoch = <mine>)` (8.3). The row is read by every write and changed once per start, so it stays in shared buffers and costs one index probe.
 
 Examples in the rest of this document consistently use a sample table `items(id, gen, ver, name, score)`.
 
@@ -317,7 +339,11 @@ The business side has confirmed there are no complex types such as arrays, enums
 - **Default values**: create uses `INSERT ... RETURNING` to read the DB-filled default values back into memory, keeping memory and the DB consistent.
 - **Generated columns** (`GENERATED ALWAYS AS`): cannot be written, and once the columns they depend on are modified, the value in memory becomes stale. v1 does not load generated columns and does not expose them.
 - **Triggers that modify rows**: modifications made by a trigger on UPDATE (e.g. `updated_at = now()`) are not visible in memory, so memory and the DB would become inconsistent. The business side has confirmed: the onboarded tables have no triggers that modify row data; columns like `updated_at` are assigned by this service on update. If triggers are detected when the schema is loaded, log a warning and list them.
-- **CHECK constraints and foreign keys**: can cause poison rows during flush (see 7.9). If detected when the schema is loaded, also log a warning.
+- **CHECK constraints**: can cause poison rows during flush (see 7.9). If detected when the schema is loaded, log a warning.
+- **Constraints whose verdict depends on other rows**: unique indexes other than the primary key, exclusion constraints, foreign keys in either direction (this table referencing another, or another table referencing this one), and triggers that can raise an error. By default **the table is refused** when the schema is loaded, and the error lists the objects found. Setting `AllowCrossRowConstraints` for that table accepts it. The reasons for refusing by default:
+  - Such a constraint can reject a statement now and accept the same statement later, once the other row has changed. The rule "a retry rejected by the data means the earlier attempt was rejected too" (7.4) does not hold for it (13.2 hole 5). With the option on, create and delete stay correct through the session fence of 7.4, at the price of terminating a connection in that rare case.
+  - A flush that violates such a constraint is a poison row (7.9): the update was already acknowledged. A unique index on a column that is updated through this service makes that an everyday event.
+  - **Always refused, with or without the option**: a foreign key on this table with `ON DELETE` / `ON UPDATE` `CASCADE`, `SET NULL` or `SET DEFAULT`. Deleting or changing the parent row would then modify this table behind the service's back, which breaks "only this service writes these tables" (section 2).
 
 **Table structure changes**
 
@@ -668,6 +694,18 @@ func (s *Store) createLocked(e *entry, in *Row) (*Row, error) {
 		if in.Gen != 0 && cur.Gen == in.Gen {
 			return cur, nil // client retry; the earlier attempt already succeeded (idempotent)
 		}
+		if in.Gen != 0 {
+			// Another life is here. If the dedup table holds in.Gen, this is a client retry of a create that took
+			// effect earlier: that life was deleted since, and the key was created again (13.2 hole 6).
+			// Answer success with no row, exactly like the "inserted, then deleted" case below.
+			claimed, err := s.db.GenClaimed(s.bgCtx, e.id, in.Gen) // one SELECT on the dedup table's primary key
+			if err != nil {
+				return nil, err // not executed; the SDK does not take this as the final answer of a retry (7.10)
+			}
+			if claimed {
+				return nil, nil
+			}
+		}
 		return nil, ErrAlreadyExists
 	}
 	nr := *in
@@ -698,7 +736,8 @@ func (s *Store) createLocked(e *entry, in *Row) (*Row, error) {
 // Each attempt writes the dedup record and the business row in the same statement (I14, see 8.3).
 // On success it returns the full row from the DB; returning (nil, nil) means this gen was inserted and then deleted.
 func (s *Store) insertUntilSure(ctx context.Context, r *Row) (*Row, error) {
-	unsure := false // whether any attempt had an ambiguous outcome (13.2 hole 4)
+	unsure := false             // some attempt had an ambiguous outcome and may have executed (13.2 hole 4). Never reset.
+	var inflight []db.SessionID // PG sessions of ambiguous attempts that may still execute (13.2 hole 5). Emptied by a fence.
 	for attempt := 0; ; attempt++ {
 		got, err := s.db.InsertDedup(ctx, r)
 		switch {
@@ -726,11 +765,24 @@ func (s *Store) insertUntilSure(ctx context.Context, r *Row) (*Row, error) {
 		switch {
 		case db.IsAmbiguous(err):
 			unsure = true // ambiguous outcome: keep retrying
+			inflight = append(inflight, db.SessionOf(err)) // the session this attempt was sent on (8.3)
 		case db.NotExecuted(err) && unsure:
 			// This attempt was not executed at all, so it tells us nothing about the earlier ambiguous outcome: keep retrying (13.2 hole 4)
+		case db.IsCrossRow(err) && len(inflight) > 0:
+			// Rejected because of ANOTHER row (unique index, foreign key, ...; 8.4). That row can change, and then an
+			// earlier attempt that is still in flight would succeed (13.2 hole 5). Terminate the sessions of those
+			// attempts and confirm they are gone: after that, each of them has either executed already or never will.
+			if ferr := s.db.FenceSessions(ctx, inflight); ferr != nil {
+				break // could not confirm: back off and come round again, inflight is kept
+			}
+			inflight = nil // unsure stays true: an earlier attempt may have executed before the fence finished
+			continue       // try again; with nothing in flight, the next verdict on the data is final
 		default:
-			// Definite failure: either there was no earlier ambiguous attempt,
-			// or PG explicitly rejected it based on the data (the earlier attempt had identical parameters, so it must have been rejected too)
+			// Definite failure, one of:
+			//  - there was no earlier ambiguous attempt;
+			//  - PG rejected it based on this row's own data (the earlier attempt had identical parameters, so it was rejected too);
+			//  - PG rejected it because of another row, and nothing of this create is in flight any more. Had an earlier
+			//    attempt succeeded, this one would have conflicted on the dedup table first and never reached that check.
 			return nil, err
 		}
 		if werr := s.backoff(ctx, attempt); werr != nil {
@@ -744,7 +796,12 @@ func (s *Store) insertUntilSure(ctx context.Context, r *Row) (*Row, error) {
 - When the outcome is ambiguous, **you cannot just "confirm" with a SELECT and call it done**: SELECT seeing nothing does not mean that the late INSERT will not land afterwards. You must retry with the same gen until the outcome is determined.
 - **The primary-key unique constraint alone is not enough** (13.2 holes 1, 2): after a row is deleted, a late INSERT, or a client retry carrying the same gen, would insert it back. So the INSERT and the dedup record are written in the same statement (8.3): the same (table, primary key, gen) can be inserted only once in its lifetime (I14). Deleting the business row does not delete the dedup record.
 - **Why load first**: if we INSERT directly without memory having been loaded, and the DB actually already holds a different life, the dedup record gets written but the business row fails to insert, and this gen is "burned". A later retry sees "already inserted" and cannot tell whether it was "inserted and then deleted" or "never inserted at all". After loading first, INSERT happens only when memory definitely says it does not exist; then the row is also definitely absent from the DB (I4), and the two are necessarily written together.
-- **Definite failures must be split into two kinds** (13.2 hole 4): after an ambiguous attempt has occurred, "not executed"-type failures (`db.NotExecuted`, see 8.4) tell us nothing about the earlier attempt, so we must keep retrying; failures "rejected by PG based on the data" (violating NOT NULL, CHECK, foreign keys, etc.) can be returned, because the earlier attempt had exactly the same parameters and must have been rejected too. If the earlier attempt had actually succeeded, this attempt would first conflict on the dedup table and never reach those checks.
+- **Definite failures must be split into three kinds** (13.2 holes 4, 5; classification in 8.4). After an ambiguous attempt has occurred:
+  - **Not executed** (`db.NotExecuted`): tells us nothing about the earlier attempt, so we must keep retrying.
+  - **Rejected based on this row's own data** (NOT NULL, CHECK, type, length): can be returned, because the earlier attempt had exactly the same parameters and must have been rejected too. If the earlier attempt had actually succeeded, this attempt would first conflict on the dedup table and never reach those checks.
+  - **Rejected because of another row** (`db.IsCrossRow`: a unique index other than the primary key, a foreign key, an exclusion constraint, a trigger): the same statement can be rejected now and accepted later, so the earlier attempt may still succeed after we have answered "failed". It can be returned only when no earlier attempt can still be in flight. `inflight` records the sessions of the ambiguous attempts; `FenceSessions` terminates them and confirms they are gone (8.3), which is the per-operation form of the startup fence (7.8). Only tables with `AllowCrossRowConstraints` reach this branch (5.3).
+- **`unsure` and `inflight` are two different facts.** `unsure` means "an earlier attempt may have executed"; `inflight` means "an earlier attempt may still execute". A fence settles the second and not the first: an attempt can land a moment before its session is terminated. So the fence empties `inflight` and leaves `unsure` set, and a later "not executed" failure still does not end the loop. (The first version of this fix cleared both; TLC produced the counterexample in two seconds: ambiguous A, B rejected by another row, A lands, fence, C not executed, "failed" returned while the row exists.)
+- **A retry that finds another life** (13.2 hole 6): when memory holds a row with a different gen, `createLocked` looks the request's gen up in the dedup table before answering `ErrAlreadyExists`. If it is there, the create took effect earlier and the answer is success with no row. The lookup happens while op is held. By then every earlier attempt with this gen has either put the gen into the dedup table or can no longer take effect (that is what "until sure" guarantees), so an `ErrAlreadyExists` answer cannot be overtaken by a late INSERT.
 - When the client receives `ErrOutcomeUnknown` (or the connection drops after the request was sent), it retries the create with the same gen, which is idempotent: even if someone else deleted the row in the meantime, the dedup table blocks the re-insertion. The Go SDK generates the gen and retries automatically, so the business side never needs to touch gen (see 7.10).
 
 ### 7.5 Delete (synchronous)
@@ -786,7 +843,8 @@ func (s *Store) deleteLocked(e *entry, gen int64) error {
 // deleteUntilSure: DELETE FROM items WHERE id=? AND gen=?
 // Affecting 0 or 1 rows both count as success (DELETE is idempotent). If the outcome is ambiguous, retry until it is determined.
 func (s *Store) deleteUntilSure(ctx context.Context, id Key, gen int64) error {
-	unsure := false // whether any attempt had an ambiguous outcome (13.2 hole 4)
+	unsure := false             // some attempt had an ambiguous outcome and may have executed (13.2 hole 4). Never reset.
+	var inflight []db.SessionID // sessions of ambiguous attempts that may still execute (13.2 hole 5)
 	for attempt := 0; ; attempt++ {
 		err := s.db.Delete(ctx, id, gen)
 		switch {
@@ -794,10 +852,21 @@ func (s *Store) deleteUntilSure(ctx context.Context, id Key, gen int64) error {
 			return nil
 		case db.IsAmbiguous(err):
 			unsure = true
+			inflight = append(inflight, db.SessionOf(err))
 		case db.NotExecuted(err) && unsure:
 			// This attempt was not executed at all, so it tells us nothing about the earlier one: the earlier one may already have deleted it; keep retrying
+		case db.IsCrossRow(err) && len(inflight) > 0:
+			// A child row references this one. Once that child is gone, an earlier DELETE still in flight would
+			// succeed: fence those sessions first, then try again (same rule as insertUntilSure; unsure stays true).
+			if ferr := s.db.FenceSessions(ctx, inflight); ferr != nil {
+				break
+			}
+			inflight = nil
+			continue
 		default:
-			return err // definite failure (same rules as insertUntilSure)
+			// Definite failure (same rules as insertUntilSure). For "rejected because of another row" with nothing in
+			// flight: had an earlier attempt deleted the row, this one would have affected 0 rows and returned nil.
+			return err
 		}
 		if werr := s.backoff(ctx, attempt); werr != nil {
 			return werr // the service is shutting down
@@ -887,7 +956,7 @@ Key points:
 - **Coalesced writes**: between two flushes, no matter how many updates happen, the same row is written to the DB only once. The backlog is bounded by the "number of dirty rows", not the "number of updates".
 - A new update arriving during a flush re-enqueues the row, but the next flush has to wait for op. So for the same key, only one UPDATE is executing at any moment (I5).
 - During batch flush, op is taken with TryLock to avoid create/delete and the flush waiting on each other. Each shard has only one worker, so workers never contend for the same key.
-- Affecting 0 rows is **not an error**: it may be that an earlier "timed out" write actually succeeded, or that the row has been deleted. Just record a `flush_noop_rows` metric.
+- Affecting 0 rows is **not an error by itself**: it may be that an earlier "timed out" write actually succeeded, or that the row has been deleted. Record a `flush_noop_rows` metric. But 0 rows is also what a write returns when this instance has been superseded (I16), so **whenever an UPDATE or DELETE affects 0 rows, check the owner epoch before using the result** (`SELECT epoch FROM row_service_epoch`). If it is no longer this instance's epoch, stop the instance (7.8). The extra query runs only on this rare path.
 - PostgreSQL's RowsAffected is the number of rows matched and updated (rows whose values did not change are counted too); it does not have MySQL's issue of "counting only rows actually changed".
 - See 8.3 for the concrete SQL of batch writes.
 
@@ -988,35 +1057,50 @@ Capacity eviction (`capacityEvictShard`) follows the same flow: take K samples u
 
 **Startup**
 
-1. Load the configuration and connect to PG.
-2. **Clean up the sessions the previous process left on PG** (I15, 13.2 hole 3). On a separate connection, execute:
+1. Load the configuration and open **one** connection to PG (the pool is opened in step 4).
+2. **Take over the owner epoch** (I16, 13.2 hole 8):
+
+   ```sql
+   UPDATE row_service_epoch SET epoch = epoch + 1 RETURNING epoch;   -- autocommit; the result is this instance's epoch
+   SELECT clock_timestamp();                                         -- a separate statement, after the commit: the fence cutoff
+   ```
+
+   From the moment this commits, any statement that starts with an older epoch changes nothing.
+3. **Clean up the sessions the previous process left on PG** (I15, 13.2 hole 3). On the same connection, execute:
 
    ```sql
    SELECT pg_terminate_backend(pid, 5000)      -- PG 14+: wait up to 5 seconds until it actually exits
    FROM pg_stat_activity
    WHERE usename = current_user
      AND backend_type = 'client backend'
+     AND backend_start <= $1                   -- the cutoff from step 2
      AND pid <> pg_backend_pid();
    ```
 
-   Then repeatedly query `pg_stat_activity` until no such sessions remain; if any remain after `StartupFenceTimeout`, refuse to start and report an error.
-3. Load the schema, and start the Store and background tasks (flush, eviction, dedup table cleanup).
-4. The TCP server starts accepting connections.
+   Then repeatedly query `pg_stat_activity` until no session with `backend_start <= cutoff` remains; if any remain after `StartupFenceTimeout`, refuse to start and report an error.
+4. Open the connection pool, load the schema, and start the Store and background tasks (flush, eviction, dedup table cleanup, epoch check).
+5. The TCP server starts accepting connections.
 
-**Why step 2 must complete before loading any data**: when the previous process crashed (or its graceful shutdown timed out), SQL it issued may still be in flight. ver is monotonic only within one process; after the new process loads from the DB, the ver it uses may collide with those SQL statements; if those statements land after the load, memory and the DB diverge permanently (13.2 hole 3). In PG, a SQL statement can only execute within the session it belongs to. Once the session is terminated, uncommitted statements are rolled back, and in-flight packets that arrive later have no session to execute them. So after step 2 completes, the previous process's SQL has either already finished executing (and step 3 will load it), or will never execute.
+**Why the epoch and the fence are both needed, in this order.** A statement checks the epoch when it runs. A statement of the old instance that started before step 2 committed has already read the old epoch and passes the check; only terminating its session stops it, which is step 3. A statement that starts after step 2 committed sees the new epoch and changes nothing, whichever session it runs in; that covers everything the old instance sends after it reconnects, which step 3 cannot (the old instance's pool reconnects at once, so "no other session of this account" might never become true; that is why step 3 uses a cutoff). The cutoff is read after the bump has committed, so a session that starts after the cutoff can only run statements that see the new epoch.
 
-**Prerequisite**: the DB account used by this service is used only by this service (section 2); otherwise other programs' sessions would be terminated too. Also, this step does not protect against accidentally starting a second instance: the second instance terminates the first instance's sessions, but after the first instance reconnects both would write at the same time. So "only one instance runs at any moment" must still be guaranteed by deployment (11.3).
+**What happens to an instance that has been superseded.** It finds out in one of three ways: a create's result says it is not the owner (8.3), a write affects 0 rows and the check of 7.6 shows another epoch, or the periodic check (every `EpochCheckInterval`) shows another epoch. It then **stops at once**: it closes all client connections and exits, without flushing (a flush would change nothing). Its unflushed updates are lost, exactly as in a crash. The old instance therefore behaves like a process that crashed at the moment the new one took over, plus at most one `EpochCheckInterval` during which it still answers reads from its own memory and acknowledges updates that will be lost. During that interval, clients still connected to it are not served linearizably; routing clients to one instance remains the deployment's job (11.3). What the epoch guarantees is that the DB is written by one instance only, so none of the "not tolerable" clauses of section 1 can be violated by a second instance.
 
-**Why "the new process can only bind the port after the old one exits" does not replace step 2**: it proves that the old *process* is gone, not that its SQL is gone. A PG backend notices that its client died only when it next talks to it, so a statement that is executing (or waiting on a lock) runs to completion and commits, and bytes already in the kernel send buffer or on the network are still delivered and executed. Verified on PG 16: after `kill -9` of a client whose UPDATE was running, its backend stayed `active` and the UPDATE committed 3 seconds later, after a new client had already read the old value; with step 2 run first, it never committed. (`client_connection_check_interval`, PG 14+, only narrows the window: a statement that finishes before the next check still commits.) Binding the same port is still useful: on a single host it makes "the old process is dead" (the prerequisite above) checkable.
+**The same check covers a DB that went back in time** (section 2): the periodic check also reads `pg_control_checkpoint()`'s `timeline_id` and compares it with the value read at startup. A promotion or a point-in-time recovery starts a new timeline; when the value changes, the instance stops in the same way. This is a detector, not a guarantee: restarting the service after a failover or restore remains an operations rule. (M7 must verify on the PG version in use that the service account may call this function and how soon after a promotion the value changes.)
+
+**Why step 3 must complete before loading any data**: when the previous process crashed (or its graceful shutdown timed out), SQL it issued may still be in flight. ver is monotonic only within one process; after the new process loads from the DB, the ver it uses may collide with those SQL statements; if those statements land after the load, memory and the DB diverge permanently (13.2 hole 3). In PG, a SQL statement can only execute within the session it belongs to. Once the session is terminated, uncommitted statements are rolled back, and in-flight packets that arrive later have no session to execute them. So after step 3 completes, the previous process's SQL has either already finished executing (and step 4 will load it), or will never execute.
+
+**Prerequisite**: the DB account used by this service is used only by this service (section 2); otherwise other programs' sessions would be terminated too. Step 3 alone does not protect against a second instance: the second instance terminates the first instance's sessions, but the first instance reconnects and keeps writing. Step 2 is what stops it (13.2 hole 8).
+
+**Why "the new process can only bind the port after the old one exits" does not replace step 3**: it proves that the old *process* is gone, not that its SQL is gone. A PG backend notices that its client died only when it next talks to it, so a statement that is executing (or waiting on a lock) runs to completion and commits, and bytes already in the kernel send buffer or on the network are still delivered and executed. Verified on PG 16: after `kill -9` of a client whose UPDATE was running, its backend stayed `active` and the UPDATE committed 3 seconds later, after a new client had already read the old value; with step 2 run first, it never committed. (`client_connection_check_interval`, PG 14+, only narrows the window: a statement that finishes before the next check still commits.) Binding the same port is still useful: on a single host it makes "the old process is dead" checkable before the new one serves clients.
 
 **Graceful shutdown**
 
 1. The TCP server stops accepting new connections; new requests arriving on existing connections all return `UNAVAILABLE` (see 7.10).
 2. Wait for in-progress create/delete to finish (`s.inflight.Wait()`; `bgCtx` has not been cancelled yet at this point).
-3. Flush in a loop until all queues are empty and `dirtyCount == 0`, or the shutdown deadline is reached.
+3. Flush in a loop until all queues are empty and `dirtyCount == 0`, or the shutdown deadline is reached. If the deadline is reached first, log how many rows were still dirty and the age of the oldest: those updates are lost. **Restarting the service does not help while the DB cannot be written; it throws away the backlog** (11.1).
 4. Close all connections, cancel `bgCtx`, and exit.
 
-If undetermined create/delete operations are interrupted during shutdown, that is fine: on restart, step 2 guarantees those SQL statements will not land anymore, and afterwards all data is reloaded from the DB, so it is naturally consistent with the DB.
+If undetermined create/delete operations are interrupted during shutdown, that is fine: on restart, step 3 guarantees those SQL statements will not land anymore, and afterwards all data is reloaded from the DB, so it is naturally consistent with the DB.
 
 ### 7.9 Poison rows: rows definitely rejected by the DB during flush
 
@@ -1187,14 +1271,16 @@ enum Status {
 |---|---|---|---|
 | `OK` | Success | Yes | — |
 | `NOT_FOUND` | Does not exist, or expected_gen does not match | No | Returned to the caller |
-| `ALREADY_EXISTS` | On create, the primary key already exists (another life) | No | Returned to the caller |
+| `ALREADY_EXISTS` | On create, the primary key already exists (another life), and the dedup table does not hold the request's gen (7.4) | No | Returned to the caller |
 | `OUTCOME_UNKNOWN` | The create/delete could not determine its outcome before the timeout; the server keeps executing it in the background | **Ambiguous** | create, delete with gen: retry with the same gen; delete without gen: returned to the caller |
-| `BUSY` | Backpressure (11.1) | No | Retry after backoff |
-| `INVALID_ARGUMENT` | Type mismatch, NOT NULL violation, too long, out of range, increment overflow or old value is NULL, modifying a primary key column, duplicate column; or, on create, rejected by a DB constraint | No | Returned to the caller |
+| `BUSY` | Backpressure (11.1) | **This request**: no | Retry after backoff |
+| `INVALID_ARGUMENT` | Type mismatch, NOT NULL violation, too long, out of range, increment overflow or old value is NULL, modifying a primary key column, duplicate column; or, on create or delete, rejected by a DB constraint (for a constraint on another row: with no earlier attempt in flight, 7.4) | No | Returned to the caller |
 | `SCHEMA_MISMATCH` | table_id / schema_version is stale | No | Describe again, then retry once |
-| `DEADLINE_EXCEEDED` | Timed out before execution started (queued waiting for the op, waiting for load) | No | Returned to the caller |
-| `UNAVAILABLE` | The service is shutting down; or the DB is unavailable (load failed, definite failure of create/delete) | No | Retry after backoff |
+| `DEADLINE_EXCEEDED` | Timed out before execution started (queued waiting for the op, waiting for load) | **This request**: no | Returned to the caller, unless an earlier attempt of the same call was ambiguous |
+| `UNAVAILABLE` | The service is shutting down, or has been superseded (7.8); or the DB is unavailable (load failed, create/delete not executed) | **This request**: no | Retry after backoff |
 | `INTERNAL` | Other errors (server bug) | Writes are treated as ambiguous | Returned to the caller |
+
+**"This request: no" is a statement about one request, not about the call.** `BUSY`, `DEADLINE_EXCEEDED` and `UNAVAILABLE` say that this request did nothing. If an earlier request of the same SDK call (same gen) ended with `OUTCOME_UNKNOWN` or a dropped connection, that earlier request may still take effect, or already has. The SDK rule that follows from this is below ("after an ambiguous attempt").
 
 **Returning gen and ver to the client**
 
@@ -1230,11 +1316,12 @@ err = items.Delete(ctx, client.Key(int64(42)))
 - **Connections**: maintain a small number of connections, each multiplexed. Column-name-to-ordinal translation is done in the SDK; on `SCHEMA_MISMATCH` it calls Describe again and retries once.
 - **Timeouts**: the SDK takes the time remaining on the caller's ctx, subtracts a small margin, and puts it in `timeout_ms`, so that the server times out first and returns an explicit Status (the same idea as "server-side timeout shorter than the Go-side timeout" in 8.4).
 - **Principle: the SDK automatically retries only idempotent requests** (Get, Create, Delete with gen). For other requests with an ambiguous outcome, `ErrOutcomeUnknown` is handed to the caller.
+- **After an ambiguous attempt, "not executed" is never the final answer** (13.2 hole 7). Once any attempt of a Create or Delete call has ended with `OUTCOME_UNKNOWN` or a dropped connection, the call can end in only three ways: a status that judges the data (`OK`, `ALREADY_EXISTS`, `NOT_FOUND`, `INVALID_ARGUMENT`), which is returned as usual; or `ErrOutcomeUnknown` when the caller's ctx expires. `DEADLINE_EXCEEDED`, `UNAVAILABLE` and `BUSY` received on a retry are retried after backoff, and if the ctx expires meanwhile the SDK returns `ErrOutcomeUnknown`, never the last status. The typical case: the first attempt is still running on the server and holds op; the retry queues behind it and times out there with `DEADLINE_EXCEEDED`; a moment later the first attempt succeeds.
 - **Get**: read-only; retried directly when the connection drops.
-- **Create**: automatically generates a non-zero random gen. On `OUTCOME_UNKNOWN`, or if the connection drops after the request was sent, it retries with the same gen until the outcome is determined or the caller's ctx expires (returning `ErrOutcomeUnknown` on expiry). The dedup table makes such retries idempotent: even if someone else deletes the row in the meantime, it will not be re-inserted (7.4). The gen must come from `crypto/rand` (or the OS-seeded `math/rand/v2` of Go 1.22+), never from a generator seeded with the time: SDKs started at the same moment, or cloned from one VM image, would produce identical sequences, a far likelier source of collisions than chance (correctness-properties.md A5).
+- **Create**: automatically generates a non-zero random gen. On `OUTCOME_UNKNOWN`, or if the connection drops after the request was sent, it retries with the same gen until the outcome is determined or the caller's ctx expires (returning `ErrOutcomeUnknown` on expiry). The dedup table makes such retries idempotent: even if someone else deletes the row in the meantime, it will not be re-inserted (7.4). A retry answered `OK` with no row means: this create took effect earlier and that life has been deleted since (possibly with another life created after it); the SDK returns success. The gen must come from `crypto/rand` (or the OS-seeded `math/rand/v2` of Go 1.22+), never from a generator seeded with the time: SDKs started at the same moment, or cloned from one VM image, would produce identical sequences, a far likelier source of collisions than chance (correctness-properties.md A5).
 - **Delete**: when the caller supplies a gen (`client.WithExpectedGen`), retries are exactly idempotent: on `OUTCOME_UNKNOWN` or a dropped connection, retry with the same gen; if the retry returns `NOT_FOUND`, the earlier attempt already deleted it (or someone else did), and it is treated as success. **Without a gen there is no automatic retry**; like Update, it returns `ErrOutcomeUnknown`: a retry in that case could delete the same primary key that someone else re-created during the retry (the client-level counterpart of example 3 in 8.2). Which life to delete is business semantics, left for the business side to decide (for example, Get first to obtain the gen, then delete).
 - **Update**: if the connection drops after the request was sent, it is **not retried automatically**; `ErrOutcomeUnknown` is returned to the caller. Reason: an INCR retry could add twice; a SET retry could overwrite a newer value someone else wrote in the meantime. The business side has confirmed: increments are only used on less important data and do not need "exactly once".
-- `BUSY`, `UNAVAILABLE`: retry after backoff.
+- `BUSY`, `UNAVAILABLE`: retry after backoff. When the caller's ctx expires first: for Get, Update, and a Create or Delete that never had an ambiguous attempt, return the last status (nothing happened); otherwise return `ErrOutcomeUnknown` (the rule above).
 - The business side normally does not need to deal with gen: only when it wants to distinguish different lives of the same primary key does it use `client.WithExpectedGen(row.Gen)`.
 
 ---
@@ -1288,10 +1375,11 @@ With `AND gen = 100` added, A affects 0 rows. gen distinguishes different lives 
 
 With `AND gen = 100` added, A affects 0 rows.
 
-**What gen/ver cannot block**: gen/ver are conditions in the WHERE clause and only apply to "rows that already exist". The following two kinds of cases rely on two other mechanisms (the counterexamples found by TLA+ are in 13.2):
+**What gen/ver cannot block**: gen/ver are conditions in the WHERE clause and only apply to "rows that already exist". The following three kinds of cases rely on three other mechanisms (the counterexamples found by TLA+ are in 13.2):
 
 - **Late or duplicate INSERTs** (holes 1, 2): after a row is deleted, an INSERT has no old row to compare against and succeeds as long as the row does not exist. Blocked by the **dedup table** (I14, see 7.4, 8.3).
 - **Late SQL from the previous process** (hole 3): ver is only monotonic within one process, so the ver used by a new process may duplicate one the previous process already sent. Blocked by the **startup fence (terminating the previous process's sessions)** (I15, see 7.8).
+- **SQL from an instance that is still running after a newer one has started** (hole 8): it keeps sending new statements, with gens and vers that collide with the newer instance's. Blocked by the **owner epoch** carried in every write (I16, see 7.8). This is the fencing token in its original role: one token per owner, checked by the storage.
 
 ### 8.3 SQL templates (PostgreSQL)
 
@@ -1303,26 +1391,46 @@ SELECT id, gen, ver, name, score FROM items WHERE id = $1
 
 -- create: the dedup record and the business row are written in the same statement; either both succeed or neither takes effect (I14).
 -- ON CONFLICT DO NOTHING does not modify existing rows, so it is allowed (what is forbidden is DO UPDATE).
-WITH claim AS (
-  INSERT INTO row_service_gen_log (tbl, pk, gen) VALUES ('items', $1, $2)
+WITH owner AS (
+  SELECT 1 FROM row_service_epoch WHERE epoch = $6               -- $6 is this instance's epoch (I16)
+), claim AS (
+  INSERT INTO row_service_gen_log (tbl, pk, gen)
+  SELECT 'items', $1, $2 WHERE EXISTS (SELECT 1 FROM owner)      -- nothing is written by an instance that is not the owner
   ON CONFLICT DO NOTHING
   RETURNING 1                         -- returns 0 rows if this gen has already been inserted
 ), ins AS (
   INSERT INTO items (id, gen, ver, name, score)
   SELECT $3, $2, 0, $4, $5 WHERE EXISTS (SELECT 1 FROM claim)   -- insert the business row only if the dedup record was claimed
-  ON CONFLICT (id) DO NOTHING
+  ON CONFLICT (id) DO NOTHING         -- names the primary key: a conflict on any OTHER unique index raises 23505 (8.4)
   RETURNING id, gen, ver, name, score -- return the full row, including defaults filled in by the DB
 )
-SELECT EXISTS (SELECT 1 FROM claim) AS claimed, ins.*
+SELECT EXISTS (SELECT 1 FROM owner) AS owner, EXISTS (SELECT 1 FROM claim) AS claimed, ins.*
 FROM (SELECT 1) AS one LEFT JOIN ins ON TRUE   -- always returns exactly one row
--- $1 is the canonical encoding of the primary key, $3 is the primary key itself (multiple parameters for a composite key). Three possible results:
+-- $1 is the canonical encoding of the primary key, $3 is the primary key itself (multiple parameters for a composite key). Four possible results:
+--   owner = false                              -> db.ErrNotOwner: nothing was written; the instance has been superseded and stops (7.8)
 --   claimed = true, business columns not null  -> insert succeeded
 --   claimed = false                            -> db.ErrGenClaimed (this gen was inserted before; 7.4 then SELECTs the business row to determine the current state)
 --   claimed = true, business columns null      -> db.ErrDuplicate (business row conflicts on the primary key; loading first guarantees this cannot happen, so it is treated as a broken invariant)
 -- Data-modifying CTEs and the main statement belong to the same statement and the same transaction: either both INSERTs take effect or neither does.
+-- An error raised by the business INSERT (a unique index other than the primary key, a foreign key) rolls the dedup record back with it.
 
--- delete (idempotent; affecting 0 rows also counts as success)
+-- has this gen been inserted before? (createLocked, when memory holds another life; 7.4)
+SELECT 1 FROM row_service_gen_log WHERE tbl = 'items' AND pk = $1 AND gen = $2
+
+-- delete (idempotent; affecting 0 rows also counts as success, after the epoch check of 7.6)
 DELETE FROM items WHERE id = $1 AND gen = $2
+  AND EXISTS (SELECT 1 FROM row_service_epoch WHERE epoch = $3)
+
+-- fence the sessions of earlier attempts (FenceSessions, 7.4): terminate, then confirm.
+-- A session is identified by (pid, backend_start): the pid alone can be reused. Both are read once per connection,
+-- in the pool's AfterConnect hook (SELECT pid, backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid()),
+-- and kept with the connection, so they are known even when the connection is already broken.
+SELECT pg_terminate_backend(a.pid, 5000)
+FROM pg_stat_activity a JOIN unnest($1::int[], $2::timestamptz[]) AS s(pid, backend_start)
+  ON a.pid = s.pid AND a.backend_start = s.backend_start;
+SELECT count(*)                       -- repeat until 0; an error or a timeout here means "not confirmed"
+FROM pg_stat_activity a JOIN unnest($1::int[], $2::timestamptz[]) AS s(pid, backend_start)
+  ON a.pid = s.pid AND a.backend_start = s.backend_start;
 ```
 
 There are two ways to write a flush, both requiring only one network round trip:
@@ -1331,6 +1439,7 @@ There are two ways to write a flush, both requiring only one network round trip:
 
    ```sql
    UPDATE items SET score = $1, ver = $2 WHERE id = $3 AND gen = $4 AND ver < $2
+     AND EXISTS (SELECT 1 FROM row_service_epoch WHERE epoch = $5)   -- I16
    ```
 
 2. **Single statement + unnest (for very large batches)**: writes whole rows at once.
@@ -1341,6 +1450,7 @@ There are two ways to write a flush, both requiring only one network round trip:
    FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::text[], $5::bigint[])
         AS v(id, gen, ver, name, score)
    WHERE t.id = v.id AND t.gen = v.gen AND t.ver < v.ver
+     AND EXISTS (SELECT 1 FROM row_service_epoch WHERE epoch = $6)   -- I16
    ```
 
    Because memory is authoritative and only this service writes the table, writing whole rows is also correct. In PG, an UPDATE rewrites the whole row anyway (see 8.5); writing only dirty columns saves only network transfer and SQL parsing, not disk writes.
@@ -1355,11 +1465,12 @@ There are two ways to write a flush, both requiring only one network round trip:
 | Error | Classification | Notes |
 |---|---|---|
 | `pgconn.SafeToRetry(err) == true` | Definite failure: **not executed** | pgx guarantees the statement was not sent yet |
-| `*pgconn.PgError`, SQLSTATE `23505` | Definite failure (duplicate key) | Mapped to `db.ErrDuplicate` (a dedup table conflict is mapped to `db.ErrGenClaimed`, see 8.3) |
+| `*pgconn.PgError`, SQLSTATE `23505` whose `ConstraintName` is the business table's primary key | Definite failure (duplicate key) | Mapped to `db.ErrDuplicate`. With `ON CONFLICT (id) DO NOTHING` this is reported through the result row, not as an error (8.3); a dedup table conflict is mapped to `db.ErrGenClaimed` the same way |
+| `*pgconn.PgError`, SQLSTATE `23505` on any other unique index, `23503` (foreign key), `23P01` (exclusion), `P0001` and other errors raised by a trigger | Definite failure: **rejected by PG because of another row** (`db.IsCrossRow`) | The same statement may succeed later, once the other row has changed. After an ambiguous attempt it is final only when no earlier attempt can still be in flight (7.4). Reaches the client as `INVALID_ARGUMENT` |
 | `*pgconn.PgError`, `57014` (cancelled, including when triggered by statement_timeout) | Definite failure: **not executed** | The statement has been rolled back |
 | `*pgconn.PgError`, `55P03` (lock_timeout) | Definite failure: **not executed** | The statement has been rolled back |
 | `*pgconn.PgError`, `40001` / `40P01` | Definite failure: **not executed** | The transaction has been rolled back and can be retried |
-| `*pgconn.PgError`, `23xxx` (except `23505`), `22xxx` | Definite failure: **rejected by PG based on the data** | NOT NULL, CHECK, or foreign key violation; type or length error. A statement with the same parameters always gets the same result |
+| `*pgconn.PgError`, `23502` (NOT NULL), `23514` (CHECK), `22xxx` | Definite failure: **rejected by PG based on this row's own data** | NOT NULL or CHECK violation; type or length error. A statement with the same parameters always gets the same result |
 | Other `*pgconn.PgError` | Definite failure: **not executed** | The server explicitly returned an error. Conservatively treated as "not executed": once an ambiguous attempt has occurred, retries continue |
 | ctx timeout or cancellation, connection interrupted, `io.EOF`, other network errors | **Ambiguous outcome** | The statement may have executed, or may execute later |
 | Network error during COMMIT | **Ambiguous outcome** | The transaction may have been committed |
@@ -1427,6 +1538,10 @@ The gaps "after releasing a lock and before acquiring it again" are where concur
 | DB timeout -> next SQL | The old SQL has a late execution | UPDATE/DELETE rely on gen/ver conditional writes, INSERT relies on the dedup table (I14); create/delete retry until the outcome is certain |
 | create confirmed successful -> later deleted | A late INSERT, or a client retry carrying the same gen, arrives | The dedup table blocks the re-insertion (I14, 7.4) |
 | Attempt A ambiguous -> retry B definite failure | A was actually executed | A "not executed" failure is not treated as the final result; keep retrying (7.4, 8.4) |
+| Attempt A ambiguous -> retry B rejected because of another row | The other row changes, then A lands | Terminate A's session and confirm it is gone, then try again; `unsure` stays set (7.4, 8.4) |
+| Client attempt ambiguous -> its retry answered "not executed" (queued behind the first attempt, DB down, backpressure) | The first attempt succeeds | The SDK never returns a "not executed" status as the final answer after an ambiguous attempt (7.10) |
+| Client attempt ambiguous -> its retry finds another life of the key | The first attempt had succeeded and that life was deleted since | Look the gen up in the dedup table before answering `ALREADY_EXISTS` (7.4) |
+| A new instance starts -> the old instance notices | The old instance keeps flushing, creating and deleting | Every write carries the owner epoch; the old instance's writes change nothing and it stops (I16, 7.8) |
 | Process crash -> new process loads data | The previous process's SQL has a late execution | At startup, terminate the previous process's sessions, and load only after confirming they have exited (I15, 7.8) |
 | tryEvict releases mu -> deletes from map | Update gets a dead e | Update checks dead, calls Gosched, then retries |
 | DB DELETE executing (holding only op) | An update writes to memory | Step 2 clears dirty inside mu |
@@ -1442,12 +1557,18 @@ If new code introduces a new gap, it must be added to this table with its remedy
 
 - Dirty rows cannot be evicted, so the lower bound on memory usage is the number of dirty rows. When the DB slows down, dirty rows pile up.
 - When `dirtyCount > MaxDirty`, new updates return `ErrBusy` (or wait briefly). A further update to a row that is already dirty does not add to the backlog and can be let through.
+- **`MaxDirty` bounds memory, not the loss window.** While the DB cannot be written, a workload that keeps updating the same rows never reaches `MaxDirty`, and every update is still acknowledged: after ten minutes of DB outage at 3000 updates/s, 1.8 million acknowledged updates exist only in memory, and a crash or a restart loses all of them. So there is a second limit, on age: when the oldest dirty row has been dirty for longer than `MaxDirtyAge`, **every** update returns `ErrBusy`, including updates to rows that are already dirty, until the flusher has caught up. Gets are not affected; create and delete depend on the DB anyway.
+  - The age is `now - dirtySince` of the oldest dirty row, which the flusher already tracks for the metric of 11.2. It is refreshed once per flush round, so the limit is approximate: the real bound on what a crash can lose is about `MaxDirtyAge + FlushInterval`.
+  - **Quarantined poison rows (7.9) are excluded** from this age. They stay dirty until a human acts, and they have their own alert; one poison row must not stop all updates.
+  - The choice is between two failure modes during a DB outage: with the limit, updates fail after `MaxDirtyAge`; without it (`MaxDirtyAge = 0`), the service looks healthy while the amount of data a crash would lose keeps growing. Section 1 allows only "a small number of the most recent updates", so the limit is on by default.
 
 ### 11.2 Metrics
 
 - Total number of entries, number of tombstones, number of negative-cache entries
-- `dirtyCount`, **age of the oldest dirty row**: this is the maximum window of data that can be lost in a crash; an alert must be configured on it
+- `dirtyCount`, **age of the oldest dirty row**: this is the maximum window of data that can be lost in a crash; an alert must be configured on it, well below `MaxDirtyAge`. Count of updates rejected by `MaxDirtyAge`
 - Flush latency, batch size, failure count, `flush_noop_rows`
+- Owner epoch: this instance's epoch; count of `ErrNotOwner` and of stops caused by a foreign epoch or a changed timeline (each one means a second instance was started or the DB was failed over under a running service: alert)
+- Count of per-operation session fences (`FenceSessions`, 7.4) and of fences that could not be confirmed
 - Load error count, op wait time
 - Count of create/delete with ambiguous outcome, count of `ErrOutcomeUnknown`
 - Eviction count, hit rate
@@ -1462,12 +1583,14 @@ In production, a background sampling audit can be run: randomly pick some clean 
 
 **v1: single instance (confirmed)**
 
-The whole service is deployed as a single instance, and the deployment process guarantees only one runs at any time (protection against accidentally starting a second instance is not implemented for now). If two instances run at the same time, each flushes independently and they overwrite each other, so memory is no longer authoritative.
+The whole service is deployed as a single instance, and the deployment process runs only one at any time. Without protection, two instances running at the same time would each flush independently and overwrite each other, and the damage would be silent: a flush that affects 0 rows is not an error (7.6), so an update acknowledged by one instance and overwritten by the other is lost without any crash (13.2 hole 8). The usual ways to get there are ordinary: a rolling deployment that starts the new instance before stopping the old one, or an old process still flushing during its graceful shutdown while the new one starts.
+
+**Protection (v1): the owner epoch (I16, 7.8).** The instance that started last owns the DB; every write of an older instance changes nothing, and the older instance stops as soon as it notices. A second instance therefore costs what a crash of the first one costs: its unflushed updates. What the epoch does not do is route clients: for at most `EpochCheckInterval`, clients still connected to the old instance get answers from its memory. The deployment must still stop the old instance before the new one accepts connections (or switch clients over atomically) if linearizability across the switch matters.
 
 **Later: multiple instances**
 
 - Since memory is authoritative, it must be guaranteed that only one instance writes a given key: route by key (consistent hashing), plus a lease.
-- During failover, the old instance may still be flushing. Add an owner epoch to the conditional write (this is the actual scenario for the fencing token in Kleppmann's original text) to block writes from the old instance.
+- During failover, the old instance may still be flushing. The owner epoch of v1 (one epoch for the whole service) becomes one epoch per key range, granted with the lease; the condition in the write statements stays the same.
 - The new owner loads data from the DB. The window lost in a crash is the part the original owner had not yet flushed.
 
 ### 11.4 Configuration
@@ -1485,6 +1608,11 @@ The whole service is deployed as a single instance, and the deployment process g
 | `MaxSweepRounds` | Maximum consecutive rounds per sampling run | 16 |
 | `MaxEntries` | Upper limit (high-water mark) on the number of entries per table, determined by the memory budget | TBD |
 | `MaxDirty` | Upper limit on dirty rows; beyond it, backpressure applies | TBD |
+| `MaxDirtyAge` | Upper limit on the age of the oldest dirty row; beyond it, every update returns `ErrBusy` (11.1). Bounds what a crash can lose while the DB cannot be written. 0 disables it | 30s |
+| `AllowCrossRowConstraints` | Per table: accept a table that has unique indexes other than the primary key, foreign keys, exclusion constraints or triggers (5.3) | false |
+| `EpochTable` | Table name of the owner-epoch table (5.1) | `row_service_epoch` |
+| `EpochCheckInterval` | Interval of the periodic owner-epoch and timeline check (7.8); bounds how long a superseded instance keeps answering | 1s |
+| `OpFenceTimeout` | Maximum time one `FenceSessions` call waits for the sessions to exit before it reports "not confirmed" and the loop backs off (7.4) | 10s |
 | `LoadErrTTL` | After a load failure, how long the same error is returned directly | 100ms |
 | `DBTimeout` | Timeout for DB calls on the Go side | 3s |
 | `StatementTimeout` / `LockTimeout` | PG server-side timeouts; must be less than `DBTimeout`; recommended to set at the role level | 2s / 1s |
@@ -1514,7 +1642,8 @@ The whole service is deployed as a single instance, and the deployment process g
    - **Can simulate "timed out, but executed later"**: immediately returns a ctx timeout to the caller, but the statement takes effect in the DB at some random later moment. This is the most important item; a real DB can hardly reproduce this reliably
    - Records all statements that actually took effect, in order, for after-the-fact checks
    - Simulates the dedup table (unique constraint), and "session terminated": after termination, statements in that session that have not yet executed never execute (7.8)
-   - Distinguishes two kinds of definite failure: "not executed" and "rejected based on the data" (8.4)
+   - Distinguishes three kinds of definite failure: "not executed", "rejected based on this row's data" and "rejected because of another row" (8.4); the last one is controlled by a switch the test flips between attempts, and `FenceSessions` is simulated per session
+   - Simulates the owner-epoch row: a second Store on the same fakedb takes the epoch over, after which every write of the first Store changes nothing
    - Can inject "definite failure" (e.g. simulating a constraint violation), to test poison row quarantine (7.9)
 3. **High-contention stress test**: with very few keys (e.g. 4) and many goroutines (e.g. 64), randomly perform create/delete/get/update. Afterwards, shut down gracefully and flush everything, then compare memory with the DB: every row matches exactly (including gen, ver), and absent if and only if it does not exist in the DB.
 4. **Porcupine linearizability checking** (`github.com/anishathalye/porcupine`):
@@ -1522,7 +1651,7 @@ The whole service is deployed as a single instance, and the deployment process g
    - Sequential model: each key's state is `{exists, gen, cols}`; Update modifies columns by mask; INCR is computed in the model from the current value, and the new value returned in the response is checked; Update/Delete with gen return NotFound when gen does not match
    - Operations with unknown outcome (`ErrOutcomeUnknown`): set their return time to the end of the history; the model accepts both "happened" and "did not happen" for such operations
    - `ErrBusy` is treated as "definitely did not happen"
-5. **Crash recovery test**: during a stress test, discard the whole Store and create a new Store with the same fakedb. Check: confirmed creates still exist (unless later confirmed deleted); data of confirmed deletes does not reappear (unless later re-created); only recent updates may be lost.
+5. **Crash recovery test**: during a stress test, discard the whole Store and create a new Store with the same fakedb. Check: confirmed creates still exist (unless later confirmed deleted); data of confirmed deletes does not reappear (unless later re-created); only recent updates may be lost. **Second-instance variant**: do not discard the old Store; keep driving it with requests after the new one has started. Check the same properties against the new Store, and that the old Store stops within `EpochCheckInterval` without changing the DB.
 6. **Failpoint tests**: plant test hooks at the key gaps (nil in production) to force specific interleavings:
    - After DB DELETE succeeds and before `Store(absent)`, insert an Update
    - After the flush takes its snapshot and before it writes to DB, insert an Update and a Delete
@@ -1540,12 +1669,12 @@ The whole service is deployed as a single instance, and the deployment process g
 | M0 | TLA+ model: first model the current design and reproduce the holes of 13.2; then add the fixes and verify | TLC exhausts the agreed scale and all invariants and properties hold; the fixes are written back into this document after the user confirms them |
 | M1 | Project skeleton (Go 1.25), DB interface, schema abstraction (schema constructed directly in fakedb), primary key encoding, fakedb (no fault injection yet), shard/entry, Get + load | `-race` unit tests pass; primary key encoding covers integer, string, UUID, composite primary keys |
 | M2 | Update (SET and INCR) + single-key flush + flush queue | Stress test passes; afterwards memory and DB match; N goroutines each increment the same column K times, the final value is exactly N×K and matches the DB; on increment overflow or an old value of NULL, the whole Change does not take effect |
-| M3 | Create/Delete (including runSync, create loads first, dedup table, retry until certain on ambiguous outcome, distinguishing the two kinds of definite failure, gen/ver conditional writes); optional gen for Update/Delete; fakedb gains fault injection | Stress test with fault injection passes; failpoint tests for the three counterexamples of section 8.2 and holes 1, 2, 4 of 13.2 pass (constructed step by step from the TLA+ counterexamples; expected to fail before the fix and pass after it) |
+| M3 | Create/Delete (including runSync, create loads first, dedup table, retry until certain on ambiguous outcome, distinguishing the three kinds of definite failure, the per-operation session fence, the dedup lookup when a retry finds another life, gen/ver conditional writes); optional gen for Update/Delete; fakedb gains fault injection | Stress test with fault injection passes; failpoint tests for the three counterexamples of section 8.2 and holes 1, 2, 4, 5, 6 of 13.2 pass (constructed step by step from the TLA+ counterexamples; expected to fail before the fix and pass after it) |
 | M4 | Porcupine linearizability tests | No violations over long random runs |
 | M5 | Eviction: idle TTL sampling cleanup, capacity-limit eviction, dead protocol | Failpoint tests plus stress test pass; in the stress test, IdleTTL is set very short so that eviction interleaves heavily with reads and writes |
-| M6 | Batch flush, poison row quarantine (7.9), backpressure, startup session cleanup and graceful shutdown (7.8), dedup table cleanup, metrics, crash recovery test | Crash recovery test passes, including "statements still in flight at crash time" (failpoint test for hole 3 of 13.2); when definite failures are injected, poison rows are quarantined and the other rows in the same batch are written normally |
-| M7 | PostgreSQL adaptation (pgx, pgxpool, server-side timeouts), loading schema from the system catalog, type mapping and validation, `IsAmbiguous` / `NotExecuted` classification, dedup table SQL (8.3), startup session cleanup with `pg_terminate_backend` (7.8), schema drift detection | Integration tests against real PG (PG 14 or later in docker, started with testcontainers-go or docker compose) pass; check the ratio of HOT updates; integration tests verify: duplicate INSERTs are blocked by the dedup table, and after an old session is terminated its statements no longer execute |
-| M8 | External protocol: .proto, TCP server (framing, multiplexing, backpressure, Status mapping), Go SDK (Describe cache, create/delete retry, timeout propagation) | End-to-end tests pass (SDK -> TCP -> Store -> PG); frame decoder fuzz tests pass; SDK behavior under random connection drops conforms to 7.10; load-test Update throughput and latency |
+| M6 | Batch flush, poison row quarantine (7.9), backpressure by count and by age (11.1), owner epoch, startup session cleanup and graceful shutdown (7.8), dedup table cleanup, metrics, crash recovery test | Crash recovery test passes, including "statements still in flight at crash time" (failpoint test for hole 3 of 13.2) and the second-instance variant (hole 8); when definite failures are injected, poison rows are quarantined and the other rows in the same batch are written normally; with the fake DB failing every flush, updates return `ErrBusy` once the oldest dirty row is older than `MaxDirtyAge`, and a poison row alone does not trigger it |
+| M7 | PostgreSQL adaptation (pgx, pgxpool, server-side timeouts), loading schema from the system catalog (including the refusal rules of 5.3), type mapping and validation, `IsAmbiguous` / `NotExecuted` / `IsCrossRow` classification, dedup table and owner-epoch SQL (8.3), startup session cleanup and `FenceSessions` with `pg_terminate_backend` (7.4, 7.8), timeline check, schema drift detection | Integration tests against real PG (PG 14 or later in docker, started with testcontainers-go or docker compose) pass; check the ratio of HOT updates; integration tests verify: duplicate INSERTs are blocked by the dedup table; after an old session is terminated its statements no longer execute; a write carrying an old epoch affects 0 rows; a table with a unique index, a foreign key or a trigger is refused without the option; an INSERT rejected by a unique index is classified as `IsCrossRow` and leaves no dedup record |
+| M8 | External protocol: .proto, TCP server (framing, multiplexing, backpressure, Status mapping), Go SDK (Describe cache, create/delete retry, timeout propagation) | End-to-end tests pass (SDK -> TCP -> Store -> PG); frame decoder fuzz tests pass; SDK behavior under random connection drops conforms to 7.10, including: a retry answered `DEADLINE_EXCEEDED`, `UNAVAILABLE` or `BUSY` after an ambiguous attempt never surfaces as that status (hole 7); load-test Update throughput and latency |
 
 ### 12.3 TLA+ model (M0)
 
@@ -1557,10 +1686,10 @@ The whole service is deployed as a single instance, and the deployment process g
 | `*.cfg` | The individual check scenarios (scale, which faults are enabled, whether the fixes are included) |
 | `run.sh` | Run: `./run.sh <scenario name>`; requires Java 11+ and `tla2tools.jar` (TLC 2.19, by default placed in `~/.local/share/tla/`) |
 | `live.cfg` | Liveness check under weak fairness (`FairSpec`) |
-| `suite.py` | The acceptance suites: `python3 suite.py holes|mutants|witnesses|liveness|all` (planted bugs must be caught, reachability witnesses must be violated) |
+| `suite.py` | The acceptance suites: `python3 suite.py quick|regress|holes|ext|mutants|witnesses|sim|liveness|all` (planted bugs must be caught, reachability witnesses must be violated). **`quick` is what to run after changing the model: about 13 minutes instead of hours** (see "Checking a change quickly" below). Holes 5-8 and the `ext` environments are generated by it; they are not `.cfg` files |
 | `trace.py` | Compresses a TLC counterexample into "what each step did and which variables changed": `./run.sh hole1 > out/hole1.out; python3 trace.py < out/hole1.out` |
 
-**Modeling scope**: one key; allocation and eviction of the entry in the shard map (dead protocol); the entry's snap / dirty / queued / dead / op; Get, Update, Create, Delete, plus runSync continuing in the background after the client gives up; the flusher; a DB that can execute late (statements may still execute after a timeout, responses may be lost, statements may be definitely rejected); the SDK retrying create with the same gen; process crash and restart. The critical sections of `mu`, `shard.mu` and `qmu` are each modeled as one atomic step, and every gap of section 10 is a separate step.
+**Modeling scope**: one key; allocation and eviction of the entry in the shard map (dead protocol); the entry's snap / dirty / queued / dead / op; Get, Update, Create, Delete, plus runSync continuing in the background after the client gives up; the flusher; a DB that can execute late (statements may still execute after a timeout, responses may be lost, statements may be definitely rejected); the SDK retrying create with the same gen, also while its first attempt is still running; a request timing out while queued for op; a cross-row constraint that starts or stops rejecting writes of the key; process crash and restart; a superseded instance that keeps sending statements. The critical sections of `mu`, `shard.mu` and `qmu` are each modeled as one atomic step, and every gap of section 10 is a separate step.
 
 **Properties checked**: the full list, with the reasons, the environment model, the mutation catalogue and the reachability witnesses, is in [correctness-properties.md](correctness-properties.md). In short: an abstract sequential state is maintained, and each operation modifies it at its linearization point from section 9.
 
@@ -1579,7 +1708,8 @@ The whole service is deployed as a single instance, and the deployment process g
 | `DbNotAhead` | The DB ver is never greater than the memory ver for the life memory holds |
 | `DbValsBelongToGen` | Every column value in the DB belongs to the life that owns the row |
 | `NoDirtyEviction` | An entry being evicted holds no dirty data (I10) |
-| `FencedRestart` | Once up, no statement of a previous process is in flight (I15) |
+| `FencedRestart` | Once up, no statement that a previous process sent before the fence is in flight (I15) |
+| `CreateFailureIsFinal` | A create whose call ended in "failed" is never inserted, before or after the answer |
 | `DbVerMonotonic` (action property) | Within one life the DB ver never decreases, and values never change without a larger ver |
 | `EventuallyResponds`, `BackgroundSettles`, `EventuallyFlushed`, `NoLockLeak` (liveness, `FairSpec`) | Every request is answered; every background create/delete settles; dirty data is eventually flushed; op is never held forever |
 
@@ -1606,15 +1736,56 @@ TLC also checks for deadlock: apart from "all operations are done", every state 
 | witnesses | 17 "this situation never happens" claims in the `fixed` environment (correctness-properties.md 8) | **All 17 violated**: every fault scenario, including each hole's precondition, is reachable |
 | liveness mutants | 2 planted bugs checked by liveness alone | **Both caught** |
 
-**Conclusion**: apart from the four holes of 13.2, within the above scales no other interleaving that violates an invariant or deadlocks was found. The fixes for the four holes have been written into the main body of the design (`FixDedup` corresponds to the dedup table and "create loads first" of 7.4 and 8.3, `FixFence` corresponds to the startup cleanup of 7.8, `FixUnsureRetry` corresponds to the two kinds of definite failure of 7.4, 7.5 and 8.4). When changing the design in the future, first change it in the model and run these scenarios, then change the code.
+Results after holes 5-8 were added to the model (2026-11-13; all from one `python3 suite.py quick`, 92 runs, 13 minutes):
+
+| Scenario | Content | Result |
+|---|---|---|
+| `hole5` | A create or delete: an ambiguous attempt, a retry rejected because of another row, then that row changes | Violates `QuiescentConsistent`; 13 states; matches hole 5 of 13.2 |
+| `hole6` | A create that succeeded after its client gave up; the row is deleted and created again; the SDK retries | Violates `CreateFailureIsFinal`; 27 states; matches hole 6 |
+| `hole7` | An SDK retry that times out while queued behind its own first attempt | Violates `CreateFailureIsFinal`; 11 states; matches hole 7 |
+| `hole8` | A superseded instance sends a statement after the new instance is up | Violates `NoViolation` (a state after restart that no operation of the new instance explains); 11 states; hole 8 |
+| `hole5-8_fixed` | Same as above, with the corresponding fix on | All pass |
+| `ext_crossrow`, `ext_sdk`, `ext_epoch` | Every earlier fault and every fix at the scale of `live`, plus the fault of hole 5 / holes 6-7 / hole 8 | **Pass**: 19.7 / 6.4 / 23.1 million distinct states |
+| `ext_all` | The same with the faults of holes 5-8 all enabled | **Pass**: 118 million distinct states, longest interleaving 54 steps, 12 minutes |
+| fix switches | Each fix of holes 5-8 switched off in its `ext` environment | **All 4 caught** |
+| witnesses | 9 situations of holes 5-8 in the `ext` environments, in addition to the 17 above | **All 26 violated** |
+| mutants | The 15 planted bugs, again | **All 15 caught** |
+| `regress` | The model before holes 5-8 against the changed model with their switches off, in 12 scenarios | **Same in all 12**: same violation in the 5 that fail, same state counts in the 7 that pass (`base_2col`: 39,658,214 distinct states in both) |
+| `sim` | Random simulation of `fixed_big`, now with the faults of holes 5-8, for 2 minutes | **No violation**: about 39 million states checked |
+| `live` | Liveness, with the fixes of holes 5-8 on (their faults off) | **Pass**: 9.94 million distinct states, all four liveness properties, 34 minutes; both liveness mutants caught again |
+| `fixed` | Full scale, with the fixes of holes 5-8 on | **Not re-run** (about 2 hours). With those switches off it is, by `regress`, the model of the 1.67-billion-state run above |
+
+**Checking a change quickly.** The two-hour `fixed` run is not needed after every change to the model. The method used for holes 5-8, described in full in [correctness-properties.md](correctness-properties.md) 9.1:
+
+1. **Every new fault and every new fix gets a switch**, and new variables stay out of the old variable groups. With the switches off the model must be the previous model.
+2. **`regress` checks exactly that**: it runs the previous model (from git) and the changed one on the same scenarios and compares state counts. Equal counts mean the earlier long runs still describe the changed model with its switches off, so they need not be repeated.
+3. **The new behavior is checked where it is cheap**: each hole in its minimal scenario (seconds), each new fault on top of all old ones at a small scale (`ext`, minutes, exhaustive), everything together at a large scale by random simulation (`sim`, time-boxed).
+4. **Small is enough to catch a wrong fix**: all eight holes have counterexamples of at most 27 states, each found within 2 seconds. The first fix written for hole 5 was wrong, and `ext_crossrow` showed it in 2 seconds.
+5. The full-scale exhaustive run stays as the last check before a release.
+
+**Conclusion**: apart from the eight holes of 13.2, within the above scales no other interleaving that violates an invariant or deadlocks was found. The fixes have been written into the main body of the design:
+
+| Switch in the model | In the design |
+|---|---|
+| `FixDedup` | The dedup table and "create loads first" (7.4, 8.3) |
+| `FixFence` | The startup cleanup (7.8) |
+| `FixUnsureRetry` | "Not executed" is not final after an ambiguous attempt (7.4, 7.5, 8.4) |
+| `FixCrossRow` | The session fence before trusting a rejection caused by another row; `unsure` and `inflight` kept apart (7.4, 7.5, 8.3, 8.4) |
+| `FixRetryAnswer` | The dedup lookup when a retry finds another life (7.4) |
+| `FixSdkRetry` | The SDK rule after an ambiguous attempt (7.10) |
+| `FixEpoch` | The owner epoch (I16; 5.1, 7.8, 8.3) |
+
+When changing the design in the future, first change it in the model and run `python3 suite.py quick`, then change the code.
 
 **What is not covered** (handled during implementation by the other techniques of section 12.1):
 
 - This is bounded exhaustive checking: all interleavings within the above scales have been checked, but it is not a proof for arbitrary scale.
 - Only one key is modeled. Different keys share only the shard's map and queue; those two locks are leaf locks and do not affect the correctness of a single key.
 - Increment is not modeled separately: it is done inside the same `mu` critical section as assignment, and the concurrency structure is exactly the same.
-- Not modeled: load failures and error caching, backpressure, the poison row quarantine, interactions between multiple rows in one batch, the external protocol (7.10), schema.
-- Liveness is checked only at the smaller scale of `live.cfg`, and under the assumption that every fault is finite (correctness-properties.md A7).
+- Not modeled: load failures and error caching, backpressure by count and by age (11.1), the poison row quarantine, interactions between multiple rows in one batch, the external protocol (7.10), schema.
+- Not modeled for holes 5-8: what a superseded instance answers to its own clients before it notices; a session fence that fails or cannot be confirmed; SDK retry of delete (the rule of 7.10 is the same as for create, but no property checks delete's answer); a DB that loses acknowledged writes; values PG normalizes (13.3).
+- The faults of holes 5-8 are checked exhaustively only at the scale of `live` (`ext_*`), and at a larger scale only by random simulation.
+- Liveness is checked only at the smaller scale of `live.cfg`, without the faults of holes 5-8, and under the assumption that every fault is finite (correctness-properties.md A7).
 
 ---
 
@@ -1657,9 +1828,18 @@ Answers to the second round of questions (2026-11-11):
 | 17 | Should TLA+ be written before implementation? | Yes. As M0, completed before implementation | 12 |
 | 18 | Are the fixes for the four holes of 13.2 adopted? | Adopted (confirmed after TLA+ verification passed): dedup table + create loads first, terminating old sessions at startup, distinguishing the two kinds of definite failure | 5.1, 7.4, 7.5, 7.8, 8.3, 8.4 |
 
+Decisions after the design review (2026-11-13):
+
+| # | Question | Conclusion | Related sections |
+|---|---|---|---|
+| 19 | The review found five gaps the model did not cover. Which are fixed? | All except value canonicalization. They are recorded as holes 5-8 of 13.2, together with the bound on the loss window (#20) and the PostgreSQL assumptions of section 2 | 2, 5.1, 5.3, 7.4-7.8, 7.10, 8.3, 8.4, 11 |
+| 20 | While the DB cannot be written, is the loss window bounded? | Yes: `MaxDirtyAge`. The default of 30 s is a proposal that has not been confirmed separately; 0 switches the limit off | 1, 11.1, 11.4 |
+| 21 | Values that PG stores differently from what the client sent (float4, numeric(p,s), char(n), timestamp(p), jsonb, NUL bytes) | Not fixed for now. Recorded in 13.3 | 13.3 |
+| 22 | Is the single-instance assumption still left to deployment alone? | No. This replaces the second half of #7: the owner epoch is implemented in v1 | 2, 7.8, 11.3 |
+
 ### 13.2 Design holes found (reproduced with TLA+; fixes confirmed and written into the main body of the design)
 
-All four holes violate the "intolerable" clauses of section 1. Holes 1-3 were found while re-examining the design; hole 4 was found by TLC while checking the rest. The M0 TLA+ model (`tla/`, see 12.3) reproduced all four against the current design, and none of them appears any more once the fixes are added.
+Holes 1-4 violate the "intolerable" clauses of section 1. Holes 1-3 were found while re-examining the design; hole 4 was found by TLC while checking the rest. The M0 TLA+ model (`tla/`, see 12.3) reproduced all four against the current design, and none of them appears any more once the fixes are added. Holes 5-8 were found in the design review of 2026-11-13; they sat outside what the model covered at the time, and are described after the first four.
 
 **Hole 1: a late INSERT resurrects a deleted row (within the same process).** I5 says late writes are blocked by gen/ver, but INSERT has no gen/ver condition and relies only on the primary key unique constraint:
 
@@ -1701,9 +1881,86 @@ Memory has 20, the DB has 10, and this will never be corrected afterwards (viola
 - Hole 3 (I15; 7.8): when the new process starts, it first terminates all sessions the old process left on PG (`pg_terminate_backend`), and only after confirming they have all exited does it load data and serve requests. Once the sessions are gone, SQL sent by the old process can no longer land. The precondition is that the DB account used by this service is not used by any other program (section 2).
 - Hole 4 (7.4, 7.5, 8.4): `insertUntilSure` / `deleteUntilSure` remember "whether an ambiguous attempt has occurred". Once one has occurred, the two kinds of definite failure must be distinguished:
   - **This attempt was not executed at all** (connection failure, `pgconn.SafeToRetry`, cancelled by statement_timeout / lock_timeout, serialization conflict): it says nothing about the earlier attempt's outcome; keep retrying with the same parameters until a certain outcome is obtained (insert succeeds, or after a conflict a SELECT sees a clear state).
-  - **PG executed it and explicitly rejected it based on the data** (violating NOT NULL, CHECK, foreign keys, type or length errors): the earlier attempt used exactly the same parameters, so it must have been rejected too, and failure can be returned. If the earlier attempt had actually succeeded, this attempt would first conflict on the primary key (or the dedup table) and never reach these checks.
+  - **PG executed it and explicitly rejected it based on the data of this row** (violating NOT NULL or CHECK, type or length errors): the earlier attempt used exactly the same parameters, so it must have been rejected too, and failure can be returned. If the earlier attempt had actually succeeded, this attempt would first conflict on the primary key (or the dedup table) and never reach these checks. (As first written, this kind also included foreign keys. A rejection that depends on other rows does not follow this argument; that is hole 5 below.)
 
   When no ambiguous attempt has occurred, a definite failure is returned as usual.
+
+**Holes 5-8** (design review of 2026-11-13). None of them was reachable in the model as it stood: the model had no rejection that depends on other rows, never retried while the first attempt was still running, checked no property on what create answers, and assumed a single instance. Each was added to the model as a fault with its own switch, reproduced, and then fixed (12.3).
+
+**Hole 5: a retry rejected because of another row is treated as a definite failure.** The fix for hole 4 says "rejected by the data means the earlier attempt was rejected too". That holds for constraints on the row itself. A unique index, a foreign key, an exclusion constraint or a trigger looks at other rows, and those change:
+
+```
+table users(id PRIMARY KEY, email UNIQUE)
+1. create 42 (email a@x, gen=100): INSERT A is stuck in the network, Go side times out -> ambiguous
+2. Retry INSERT B: row 7 holds a@x -> unique violation; the statement is rolled back, dedup record included
+   -> returned as "definite failure", memory keeps "42 does not exist"
+3. Row 7 changes its email
+4. A finally executes: nothing conflicts any more -> row 42 is inserted ✗
+```
+
+The client was told "failed", memory says the row does not exist, and the DB has it. `deleteUntilSure` has the same problem with a child row that references the row being deleted: once the child is gone, the late DELETE lands; the row stays in memory, every later flush affects 0 rows, and its updates are lost. There is also an everyday version that needs no fault: an ordinary "email already taken" was classified as a primary key conflict and reported as `INTERNAL` (a broken invariant).
+
+**Hole 6: a create retry is answered "already exists" although it took effect.**
+
+```
+1. Client A: create 42 (gen=100) -> OUTCOME_UNKNOWN; the INSERT then succeeds in the background
+2. Client B: delete 42; then create 42 again (gen=200)
+3. Client A's SDK retries with gen=100: memory holds gen=200 -> ALREADY_EXISTS, which means "did not take effect"
+```
+
+A's create did take effect at step 1. It needs the key to be deleted and created again within the retry window, so it matters only where primary keys are reused.
+
+**Hole 7: the SDK reports "this request was not executed" as the result of the call.**
+
+```
+1. create 42 (gen=100), the DB is slow -> OUTCOME_UNKNOWN; the first attempt keeps running in the background and holds op
+2. The SDK retries with gen=100; the retry queues for op behind its own first attempt
+3. The retry times out in the queue -> DEADLINE_EXCEEDED ("not executed") -> returned to the caller as a failure
+4. The first attempt's INSERT succeeds ✗
+```
+
+The retry meets the same slow DB that made the first attempt ambiguous, so this is the common path of an ambiguous create, not a corner. The same happens with `UNAVAILABLE` and `BUSY`, and for delete with gen. 7.10 was contradictory here: the Create paragraph said "return `ErrOutcomeUnknown` on expiry", the status table said "`DEADLINE_EXCEEDED`: no effect, returned to the caller".
+
+**Hole 8: a second instance.** v1 left "only one instance runs" to deployment. Nothing detected a violation:
+
+```
+DB: row 42 score=10, ver=5. Old instance A and new instance B have both loaded it.
+1. B starts and terminates A's sessions (startup fence); A's pool reconnects
+2. A client of B adds 1: B flushes -> DB score=11, ver=6
+3. A client still connected to A adds 5: A's memory score=15, ver=6
+4. A flushes UPDATE ... WHERE ver < 6 -> 0 rows, which is not an error -> A clears dirty ✗
+```
+
+The +5 was acknowledged and is lost without any crash; A answers 15 and B answers 11; A's next update (ver=7) overwrites B's value. The only trace is `flush_noop_rows`, which also grows in normal operation. A rolling deployment that starts the new instance first is enough to get here.
+
+**The fixes for holes 5-8** (verified with TLA+, adopted on 2026-11-13; details in the sections in parentheses):
+
+- Hole 5 (5.3, 7.4, 7.5, 8.3, 8.4):
+  - Tables with constraints that depend on other rows are refused when the schema is loaded, unless enabled per table.
+  - `23505` is classified by constraint name; "rejected because of another row" is a third kind of definite failure.
+  - After an ambiguous attempt, such a rejection is final only when no earlier attempt can still be in flight: `insertUntilSure` / `deleteUntilSure` remember the sessions of their ambiguous attempts, terminate them and confirm they are gone (`FenceSessions`), then try again.
+  - `unsure` stays set after the fence. The first version of this fix cleared it, and TLC found the counterexample: A ambiguous, B rejected because of another row, A lands, fence, C not executed, "failed" returned while the row exists.
+- Hole 6 (7.4, 8.3): when a create with a gen finds another life in memory, it looks its gen up in the dedup table before answering. Found: success with no row. Not found: `ALREADY_EXISTS`.
+- Hole 7 (7.10): one SDK rule. Once any attempt of a Create or Delete call was ambiguous, `DEADLINE_EXCEEDED`, `UNAVAILABLE` and `BUSY` are never the final answer: the SDK retries, and returns `ErrOutcomeUnknown` when the caller's ctx expires.
+- Hole 8 (I16; 5.1, 7.6, 7.8, 8.3, 11.3): an owner-epoch row. A starting instance adds 1 to it before its startup fence; every write carries `AND EXISTS (... epoch = mine)`; an instance that sees another epoch stops without flushing. A second instance then costs what a crash of the first one costs.
+
+### 13.3 Known and not fixed
+
+**Values that PostgreSQL stores differently from what the client sent** (decision #21: not fixed for now). Memory keeps the client's value, the DB keeps the value normalized to the column type, so the two differ after a flush, and a Get returns a different value once the entry has been evicted and reloaded, although nobody wrote in between:
+
+| Column type | Written | Get before reload | Get after eviction and reload |
+|---|---|---|---|
+| `real` (float4) | 0.1 | 0.1 | 0.10000000149011612 |
+| `numeric(10,2)` | "1.005" | "1.005" | "1.01" |
+| `timestamp(0)` | 12:00:00.6 | 12:00:00.6 | 12:00:01 |
+| `char(5)` | "ab" | "ab" | "ab   " |
+| `jsonb` | `{"b":1,"a":2}` | as written | `{"a": 2, "b": 1}` |
+
+No data is lost, but I4 ("the DB is consistent with memory") holds only up to this normalization, and a job that compares the service with the DB reports false differences. One case is of a different kind: a `text` value containing a NUL byte or invalid UTF-8 is accepted in memory and rejected by PG, so the acknowledged update becomes a poison row (7.9). The fix belongs in the API layer's validation (7.9 item 1): reject or normalize on input, per type. Until then: check which of these column types the onboarded tables use.
+
+**A superseded instance keeps answering for up to `EpochCheckInterval`** (7.8, 11.3): reads from its memory, and acknowledgements of updates that will be lost. Closing this window needs leases with a clock assumption, which is part of the multi-instance work.
+
+**A DB that goes back in time** (promotion of an asynchronous standby, restore) can lose confirmed creates and deletes. The service detects a changed timeline and stops (7.8), but it cannot bring the lost transactions back; section 2 states the deployment requirement.
 
 ---
 
@@ -1784,6 +2041,8 @@ All a lock can guarantee is the ordering within its own memory. Once you cross t
 
 Both paths have their uses: every everyday read and write takes path 2, which is cheap; a process restart happens only once, so it can afford the cost of path 1, which is why at startup `pg_terminate_backend` is used to terminate the previous process's sessions (7.8). This is because ver is only monotonic within one process, and path 2 cannot block the cross-process case (hole 3 of 13.2).
 
+Path 1 is also the only answer where no token can exist: a statement that another row rejected now and would accept later carries nothing the storage could compare (hole 5). There the sessions of the ambiguous attempts are terminated, per operation and only in that rare case (7.4). And path 2 has a second token besides gen/ver: the owner epoch (I16), which fences a whole instance instead of one row (hole 8).
+
 ### 14.9 How to make sure a concurrent program is written correctly
 
 - The role of locks is to **reduce interleavings**: you do not need to consider interleavings between every line of code, only the ordering between critical sections and the gaps after a lock is released.
@@ -1823,6 +2082,11 @@ Both paths have their uses: every everyday read and write takes path 2, which is
 | gen for Update/Delete | Optional, not checked by default | When omitted, in scenarios where primary keys are reused, an update may modify a new life | Zero cost for business clients that do not care; those that need it simply use the gen from the response |
 | Increment | Compute the new value inside `mu`; flush writes the absolute value | Increments within the window are lost on a crash; cannot be safely retried when the connection drops | Coalesced writes, rewrites on failure, and late execution are all naturally correct, with no need to record deltas separately |
 | SDK automatic retry | Only idempotent requests are retried automatically: Get, Create (same gen), Delete with gen | When update or delete without gen has an ambiguous outcome, the business side must handle it | An automatic retry must not let one call take effect twice; which life to delete is business semantics, and the SDK does not decide it for the business side |
+| Answer of a call after an ambiguous attempt | Only a status that judges the data, or `ErrOutcomeUnknown`; never "not executed" | More calls end in "unknown" while the DB is slow | "This request did nothing" says nothing about the earlier request, which is often still running (hole 7) |
+| Constraints that depend on other rows | Table refused by default; per-table option; with the option, terminate the sessions of ambiguous attempts before trusting such a rejection | Tables with a unique index or a foreign key need an explicit decision; a connection is terminated in a rare case | The same statement can be rejected now and accepted later, so no retry result settles it while an earlier attempt is in flight (hole 5); a flush that violates such a constraint is a poison row |
+| A second instance | Owner epoch in every write; the older instance stops | One more table; one more condition in every write; one query per second; a superseded instance still answers for up to `EpochCheckInterval` | Leaving it to deployment made the most common operational accident silent and unbounded (hole 8); with the epoch it costs what a crash costs |
+| Loss window while the DB cannot be written | `MaxDirtyAge`: beyond it every update gets `ErrBusy` | Updates become unavailable 30 s into a DB outage | `MaxDirty` bounds memory, not age; without an age limit the service acknowledges updates for as long as the outage lasts, and section 1 tolerates only a small loss |
+| Values PG normalizes (float4, numeric scale, char(n), timestamp precision, jsonb) | Not handled for now (13.3) | A Get can return a different value after eviction and reload | Deferred by decision #21; the fix is local to input validation |
 ---
 
 ## 16. References

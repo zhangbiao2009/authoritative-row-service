@@ -10,6 +10,9 @@
 \*     a statement may be definitely rejected (8.1, 8.4)
 \*   - clients giving up waiting; the SDK retries create with the same gen (7.10)
 \*   - service crash and restart (7.8)
+\*   - a cross-row constraint (unique index, foreign key) that starts or stops rejecting writes of this key (5.3, 8.4)
+\*   - a request timing out while still queued for op; the SDK retrying while its first attempt is still running (7.10)
+\*   - a superseded instance that keeps sending statements after a new instance has started (7.8, 11.3)
 \*
 \* Modeling granularity: the critical sections of mu, shard.mu and qmu do no IO and never block, so each is modeled
 \* as one atomic step; the gap "after releasing a lock and before acquiring it again" (Section 10) is split into
@@ -48,6 +51,14 @@ CONSTANTS
     FixDedup,           \* fix for holes 1, 2: gen dedup table + create loads first
     FixFence,           \* fix for hole 3: on restart, first clear the sessions the previous process left on PG
     FixUnsureRetry,     \* fix for hole 4: after any ambiguous attempt, a definite failure cannot be taken as the final result
+    MaxFlips,           \* max number of times a cross-row constraint starts or stops rejecting writes of this key (precondition of hole 5)
+    MaxQueueTimeouts,   \* max number of create/delete requests that time out while still queued for op (precondition of hole 7)
+    MaxZombieStmts,     \* max number of statements a superseded instance sends after it was superseded (precondition of hole 8)
+    RetryWhileBusy,     \* whether the SDK may retry a create while its first attempt is still running (precondition of hole 7)
+    FixCrossRow,        \* fix for hole 5: after an ambiguous attempt, a cross-row rejection is final only once the earlier attempts are fenced
+    FixRetryAnswer,     \* fix for hole 6: a create retry that finds another life consults the dedup table before answering "exists"
+    FixSdkRetry,        \* fix for hole 7: once an attempt was ambiguous, the SDK never reports "not executed" as the final answer
+    FixEpoch,           \* fix for hole 8: every write carries the owner epoch; a new instance bumps it before its startup fence
     Mut                 \* "none", or the name of one planted bug (see MutNames and correctness-properties.md section 6)
 
 \* Each mutation breaks exactly one rule of the design; with Mut = "none" the model is the design itself.
@@ -83,7 +94,10 @@ VARIABLES
     \* clients
     pc, cop, ce, cret, ops, lastSeen, unkGen, cwait,
     \* each client's runSync background goroutine
-    bpc, be, bop, bres, bgr, bamb,
+    \* bamb = an earlier attempt of this create/delete had an ambiguous outcome: it may have executed ("unsure" in 7.4)
+    \* bfl  = such an attempt may still be in flight: set with bamb, cleared when the attempts are fenced ("inflight" in 7.4).
+    \*        Without a fence it always equals bamb.
+    bpc, be, bop, bres, bgr, bamb, bfl,
     \* flusher and flush queue
     fpc, fbatch, fretry, fitem, queue,
     \* evictor
@@ -95,20 +109,33 @@ VARIABLES
     \* counters for the various limits
     stmtTO, drops, cto, crashes, nextGen, nextVal,
     \* ghost variables for checking correctness
-    abs, absKnown, preCrash, deletedGens, insSent, delSent, violation, seen
+    abs, absKnown, preCrash, deletedGens, insSent, delSent, violation, seen,
+    \* added for holes 5-8 (kept in a group of their own, see extV):
+    \*   dbEpoch     the owner epoch row in the DB
+    \*   blocked     whether a cross-row constraint currently rejects an INSERT / DELETE of this key
+    \*   flips, qto, zsent   counters for MaxFlips, MaxQueueTimeouts, MaxZombieStmts
+    \*   retry       whether the client's current operation is an SDK retry of an ambiguous create
+    \*   failedGens  ghost: the creates (by gen) whose final answer to the caller was "failed"
+    dbEpoch, blocked, flips, qto, zsent, retry, failedGens
 
 sysV == <<up, epoch>>
 mapV == <<mapE, nextEntry, eEp>>
 entV == <<snap, dirty, queued, dead, opH>>
 cliV == <<pc, cop, ce, cret, ops, lastSeen, unkGen, cwait>>
-bgV  == <<bpc, be, bop, bres, bgr, bamb>>
+bgV  == <<bpc, be, bop, bres, bgr, bamb, bfl>>
 flV  == <<fpc, fbatch, fretry, fitem, queue>>
 evV  == <<vpc, ve>>
 dbV  == <<db, dedup>>
 netV == <<net, wait, resp>>
 budV == <<stmtTO, drops, cto, crashes, nextGen, nextVal>>
 ghV  == <<abs, absKnown, preCrash, deletedGens, insSent, delSent, violation, seen>>
-vars == <<sysV, mapV, entV, cliV, bgV, flV, evV, dbV, netV, budV, ghV>>
+extV == <<dbEpoch, blocked, flips, qto, zsent, retry, failedGens>>
+vars == <<sysV, mapV, entV, cliV, bgV, flV, evV, dbV, netV, budV, ghV, extV>>
+
+\* The variables the model had before holes 5-8 were added. With the faults and fixes of holes 5-8 switched off, no action
+\* reads extV, so the model projected onto OldVars must be, state for state, the model before the change. "suite.py regress"
+\* checks this by using OldVars as the VIEW and comparing state counts with the previous version of this file.
+OldVars == <<sysV, mapV, entV, cliV, bgV, flV, evV, dbV, netV, budV, ghV>>
 
 -----------------------------------------------------------------------------
 \* values and records
@@ -138,6 +165,7 @@ CL(c) == <<"cl", c>>     \* the client itself (load)
 BG(c) == <<"bg", c>>     \* the client's runSync background goroutine (create/delete)
 FL    == <<"fl">>        \* the flusher
 EV    == <<"ev">>        \* the evictor
+ZB    == <<"zombie">>    \* a superseded instance (only ever the sender of a statement; never waits for a result)
 DBProcs == {BG(c) : c \in Clients} \cup {FL}   \* executors that send write statements to the DB
 
 AnyCol == CHOOSE col \in Cols : TRUE
@@ -169,6 +197,7 @@ Init ==
     /\ bres = [c \in Clients |-> "none"]
     /\ bgr = [c \in Clients |-> 0]
     /\ bamb = [c \in Clients |-> FALSE]
+    /\ bfl = [c \in Clients |-> FALSE]
     /\ fpc = "F_take" /\ fbatch = {} /\ fretry = {} /\ fitem = NoItem /\ queue = {}
     /\ vpc = "V_pick" /\ ve = 0
     /\ db = DbAbsent /\ dedup = {}
@@ -180,6 +209,10 @@ Init ==
     /\ deletedGens = {} /\ insSent = {} /\ delSent = {}
     /\ violation = "none"
     /\ seen = [c \in Clients |-> {}]
+    /\ dbEpoch = 1 /\ blocked = FALSE
+    /\ flips = 0 /\ qto = 0 /\ zsent = 0
+    /\ retry = [c \in Clients |-> FALSE]
+    /\ failedGens = {}
 
 -----------------------------------------------------------------------------
 \* helper definitions
@@ -233,9 +266,21 @@ Observe(obs) ==
 
 \* Executor p sends a write statement to the DB, then waits for the result. live = the sender is still waiting for this statement's result.
 \* (Statements are unnumbered: at any moment each executor has at most one live statement.)
+\* ep = the sender's epoch. pre = the statement was already in flight when a newer instance bumped the owner epoch (see Bump).
+Stmt(p, kind, g, ver, vl, m) ==
+    [kind |-> kind, gen |-> g, ver |-> ver, val |-> vl, mask |-> m,
+     src |-> p, ep |-> epoch, live |-> TRUE, pre |-> FALSE]
+
 SendStmt(p, kind, g, ver, vl, m) ==
-    /\ net' = net \cup {[kind |-> kind, gen |-> g, ver |-> ver, val |-> vl, mask |-> m,
-                         src |-> p, ep |-> epoch, live |-> TRUE]}
+    /\ net' = net \cup {Stmt(p, kind, g, ver, vl, m)}
+    /\ wait' = [wait EXCEPT ![p] = TRUE]
+
+\* The fix for hole 5 (7.4): terminate the sessions of this operation's earlier attempts and confirm they are gone, so their
+\* statements that have not executed yet never will; then send one more attempt. All attempts of one create / delete carry
+\* the same kind and gen, which is how the model identifies them. Statements that executed before the fence finished are
+\* covered by the interleavings in which DbExec comes before this step.
+FenceAndSend(p, kind, g, vl) ==
+    /\ net' = {s \in net : ~(s.src = p /\ s.kind = kind /\ s.gen = g)} \cup {Stmt(p, kind, g, 0, vl, {})}
     /\ wait' = [wait EXCEPT ![p] = TRUE]
 
 \* runSync's fn ends: release op; if the client is still waiting, hand it the result
@@ -248,6 +293,7 @@ FinishOp(c, res, rel) ==
     /\ be' = [be EXCEPT ![c] = 0]
     /\ bgr' = [bgr EXCEPT ![c] = 0]
     /\ bamb' = [bamb EXCEPT ![c] = FALSE]
+    /\ bfl' = [bfl EXCEPT ![c] = FALSE]
 
 Finish(c, res) == FinishOp(c, res, TRUE)
 
@@ -285,8 +331,9 @@ ClientStart(c) ==
           /\ cop' = [cop EXCEPT ![c] = [NoOp EXCEPT !.t = "create", !.gen = nextGen + 1]]
           /\ pc' = [pc EXCEPT ![c] = "X_goc"]
           /\ UNCHANGED <<unkGen, nextVal, seen>>
-       \/ \* the SDK retries an ambiguous create (same gen)
-          /\ RetryCreate /\ bpc[c] = "idle" /\ unkGen[c] # 0
+       \/ \* the SDK retries an ambiguous create (same gen). With RetryWhileBusy it does not wait for the first attempt's
+          \* background task: the retry then queues for op behind it (X_lock).
+          /\ RetryCreate /\ (bpc[c] = "idle" \/ RetryWhileBusy) /\ unkGen[c] # 0
           /\ cop' = [cop EXCEPT ![c] = [NoOp EXCEPT !.t = "create", !.gen = unkGen[c]]]
           /\ unkGen' = [unkGen EXCEPT ![c] = 0]
           /\ pc' = [pc EXCEPT ![c] = "X_goc"]
@@ -297,9 +344,12 @@ ClientStart(c) ==
              /\ cop' = [cop EXCEPT ![c] = [NoOp EXCEPT !.t = "delete", !.egen = eg]]
              /\ pc' = [pc EXCEPT ![c] = "X_goc"]
              /\ UNCHANGED <<unkGen, nextGen, nextVal, seen>>
+    \* a create that reuses the gen of an ambiguous attempt is an SDK retry (a first create always draws a new gen)
+    /\ retry' = [retry EXCEPT ![c] = cop'[c].t = "create" /\ cop'[c].gen = unkGen[c]]
     /\ UNCHANGED <<sysV, mapV, entV, ce, cret, lastSeen, cwait, bgV, flV, evV, dbV, netV,
                    stmtTO, drops, cto, crashes,
-                   abs, absKnown, preCrash, deletedGens, insSent, delSent, violation>>
+                   abs, absKnown, preCrash, deletedGens, insSent, delSent, violation,
+                   dbEpoch, blocked, flips, qto, zsent, failedGens>>
 
 \* first step of each operation: getOrCreate
 GocNext(x) == CASE x = "G_goc" -> "G_read"
@@ -311,7 +361,7 @@ Goc(c) ==
     /\ GetOrCreate(c)
     /\ pc' = [pc EXCEPT ![c] = GocNext(pc[c])]
     /\ UNCHANGED <<sysV, entV, cop, cret, ops, lastSeen, unkGen, cwait,
-                   bgV, flV, evV, dbV, netV, budV, ghV>>
+                   bgV, flV, evV, dbV, netV, budV, ghV, extV>>
 
 -----------------------------------------------------------------------------
 \* Get (7.2): lock-free read of snap; if not loaded, load, then start over
@@ -330,7 +380,7 @@ G_read(c) ==
                             THEN "GetNotLinearizable" ELSE violation
             /\ seen' = [seen EXCEPT ![c] = {}]
     /\ UNCHANGED <<sysV, mapV, entV, ops, unkGen, cwait, bgV, flV, evV, dbV, netV, budV,
-                   abs, absKnown, preCrash, deletedGens, insSent, delSent>>
+                   abs, absKnown, preCrash, deletedGens, insSent, delSent, extV>>
 
 \* load: queue up to acquire op (equivalent to singleflight)
 L_lock(c) ==
@@ -339,7 +389,7 @@ L_lock(c) ==
     /\ pc' = [pc EXCEPT ![c] = "L_load"]
     /\ UNCHANGED <<sysV, mapV, snap, dirty, queued, dead,
                    cop, ce, cret, ops, lastSeen, unkGen, cwait,
-                   bgV, flV, evV, dbV, netV, budV, ghV>>
+                   bgV, flV, evV, dbV, netV, budV, ghV, extV>>
 
 \* load: check dead, re-check snap, then SELECT and write into snap
 L_load(c) ==
@@ -353,7 +403,7 @@ L_load(c) ==
     /\ pc' = [pc EXCEPT ![c] = cret[c]]
     /\ UNCHANGED <<sysV, mapV, dirty, queued, dead,
                    cop, ce, cret, ops, lastSeen, unkGen, cwait,
-                   bgV, flV, evV, dbV, netV, budV, preCrash, deletedGens, insSent, delSent>>
+                   bgV, flV, evV, dbV, netV, budV, preCrash, deletedGens, insSent, delSent, extV>>
 
 -----------------------------------------------------------------------------
 \* Update (7.3): takes only mu; the read-modify-write happens entirely within one critical section
@@ -392,20 +442,22 @@ U_mu(c) ==
                     /\ UNCHANGED <<cop, ce, cret>>
     /\ UNCHANGED <<sysV, mapV, dead, opH, ops, unkGen, cwait,
                    bgV, flV, evV, dbV, netV, budV,
-                   absKnown, preCrash, deletedGens, insSent, delSent, violation>>
+                   absKnown, preCrash, deletedGens, insSent, delSent, violation, extV>>
 
 U_enq(c) ==
     /\ up /\ pc[c] = "U_enq"
     /\ queue' = queue \cup {ce[c]}
     /\ EndOp(c)
     /\ UNCHANGED <<sysV, mapV, entV, ops, lastSeen, unkGen, cwait,
-                   bgV, fpc, fbatch, fretry, fitem, evV, dbV, netV, budV, ghV>>
+                   bgV, fpc, fbatch, fretry, fitem, evV, dbV, netV, budV, ghV, extV>>
 
 -----------------------------------------------------------------------------
 \* client part of Create / Delete (7.4, 7.5): lockOpLive, then hand off to runSync
 
 X_lock(c) ==
-    /\ up /\ pc[c] = "X_lock" /\ opH[ce[c]] = FREE
+    \* bpc[c] = "idle" always holds here: the client's own background task holds op for as long as it runs. The model
+    \* has one background slot per client, so the guard makes that explicit for a retry issued under RetryWhileBusy.
+    /\ up /\ pc[c] = "X_lock" /\ opH[ce[c]] = FREE /\ bpc[c] = "idle"
     /\ LET e == ce[c] IN
        IF dead[e]
        THEN \* found dead after acquiring op: release it, look up the map again
@@ -417,10 +469,22 @@ X_lock(c) ==
             /\ bop' = [bop EXCEPT ![c] = cop[c]]
             /\ cwait' = [cwait EXCEPT ![c] = TRUE]
             /\ pc' = [pc EXCEPT ![c] = "X_wait"]
-            /\ UNCHANGED <<bres, bgr, bamb>>
+            /\ UNCHANGED <<bres, bgr, bamb, bfl>>
     /\ UNCHANGED <<sysV, mapV, snap, dirty, queued, dead,
                    cop, ce, cret, ops, lastSeen, unkGen,
-                   flV, evV, dbV, netV, budV, ghV>>
+                   flV, evV, dbV, netV, budV, ghV, extV>>
+
+\* What the SDK tells its caller about a create (7.10). "exists" and "rejected" are verdicts on the data. "fail" (the DB did
+\* not execute the statement) and "deadline" (the request timed out while queued) only say that THIS attempt did nothing.
+\* The fix for hole 7: when an earlier attempt of the same call was ambiguous (this request is a retry), such an answer
+\* is not final: the outcome stays unknown, and the SDK may retry again.
+NotFinal(c, res) == FixSdkRetry /\ retry[c] /\ res \in {"fail", "deadline"}
+SdkAnswer(c, isCreate, g, res) ==
+    /\ failedGens' = IF isCreate /\ res \in {"exists", "rejected", "fail", "deadline"} /\ ~NotFinal(c, res)
+                     THEN failedGens \cup {g} ELSE failedGens
+    /\ unkGen' = IF isCreate /\ NotFinal(c, res) /\ RetryCreate
+                 THEN [unkGen EXCEPT ![c] = g] ELSE unkGen
+    /\ retry' = [retry EXCEPT ![c] = FALSE]
 
 \* wait for the background result; or the client's ctx expires first (ErrOutcomeUnknown) and the background continues
 X_wait(c) ==
@@ -433,14 +497,26 @@ X_wait(c) ==
           /\ bres' = [bres EXCEPT ![c] = "none"]
           /\ lastSeen' = [lastSeen EXCEPT ![c] =
                             IF bop[c].t = "create" /\ bres[c] = "ok" THEN bop[c].gen ELSE @]
-          /\ UNCHANGED <<unkGen, cto>>
+          /\ SdkAnswer(c, bop[c].t = "create", bop[c].gen, bres[c])
+          /\ UNCHANGED cto
        \/ /\ bpc[c] # "B_done" /\ cto < MaxClientTimeouts
           /\ cto' = cto + 1
           /\ unkGen' = [unkGen EXCEPT ![c] = IF RetryCreate /\ cop[c].t = "create"
                                              THEN cop[c].gen ELSE @]
-          /\ UNCHANGED <<bpc, bop, bres, lastSeen>>
-    /\ UNCHANGED <<sysV, mapV, entV, ops, be, bgr, bamb,
-                   flV, evV, dbV, netV, stmtTO, drops, crashes, nextGen, nextVal, ghV>>
+          /\ retry' = [retry EXCEPT ![c] = FALSE]
+          /\ UNCHANGED <<bpc, bop, bres, lastSeen, failedGens>>
+    /\ UNCHANGED <<sysV, mapV, entV, ops, be, bgr, bamb, bfl,
+                   flV, evV, dbV, netV, stmtTO, drops, crashes, nextGen, nextVal, ghV,
+                   dbEpoch, blocked, flips, qto, zsent>>
+
+\* The request times out while it is still queued for op: DEADLINE_EXCEEDED, "this request was not executed" (7.10).
+X_qtimeout(c) ==
+    /\ up /\ pc[c] = "X_lock" /\ opH[ce[c]] # FREE /\ qto < MaxQueueTimeouts
+    /\ qto' = qto + 1
+    /\ EndOp(c)
+    /\ SdkAnswer(c, cop[c].t = "create", cop[c].gen, "deadline")
+    /\ UNCHANGED <<sysV, mapV, entV, ops, lastSeen, cwait, bgV, flV, evV, dbV, netV, budV, ghV,
+                   dbEpoch, blocked, flips, zsent>>
 
 -----------------------------------------------------------------------------
 \* runSync background: createLocked + insertUntilSure (7.4)
@@ -457,17 +533,19 @@ B_c1(c) ==
             /\ Observe(DbProj)
             /\ UNCHANGED <<opH, bgV, net, wait, insSent>>
        ELSE IF cur.k = "row" THEN
-            \* already exists: the same gen means a client retry whose earlier attempt already succeeded (idempotent)
-            /\ Finish(c, IF cur.gen = g THEN "ok" ELSE "exists")
+            \* already exists: the same gen means a client retry whose earlier attempt already succeeded (idempotent).
+            \* The fix for hole 6: another life is there, but if the dedup table holds this gen, the create took effect
+            \* earlier and that life was deleted since; answer success, as B_c2 does for "claimed".
+            /\ Finish(c, IF cur.gen = g \/ (FixRetryAnswer /\ g \in dedup) THEN "ok" ELSE "exists")
             /\ UNCHANGED <<snap, net, wait, insSent, abs, absKnown, seen, violation>>
        ELSE
             /\ SendStmt(BG(c), IF FixDedup THEN "insd" ELSE "ins", g, 0, InitVal(g), {})
             /\ insSent' = insSent \cup {g}
             /\ bpc' = [bpc EXCEPT ![c] = "B_c2"]
-            /\ UNCHANGED <<snap, opH, be, bop, bres, bgr, bamb,
+            /\ UNCHANGED <<snap, opH, be, bop, bres, bgr, bamb, bfl,
                            abs, absKnown, seen, violation>>
     /\ UNCHANGED <<sysV, mapV, dirty, queued, dead, cliV, flV, evV, dbV, resp, budV,
-                   preCrash, deletedGens, delSent>>
+                   preCrash, deletedGens, delSent, extV>>
 
 B_c2(c) ==
     /\ up /\ bpc[c] = "B_c2" /\ ~wait[BG(c)]
@@ -516,6 +594,20 @@ B_c2(c) ==
             /\ violation' = "DedupConflict"
             /\ Finish(c, "exists")
             /\ UNCHANGED <<snap, dirty, net, wait, abs, absKnown, seen>>
+       ELSE IF r = "rej" /\ ~(FixCrossRow /\ bfl[c]) THEN
+            \* rejected by a cross-row constraint while nothing of this create can still be in flight: the verdict is
+            \* final. Had an earlier attempt succeeded, this one would have been answered "claimed" instead.
+            \* (The current design also takes this branch while an earlier attempt may be in flight.)
+            /\ Finish(c, "rejected")
+            /\ UNCHANGED <<snap, dirty, net, wait, abs, absKnown, seen, violation>>
+       ELSE IF r = "rej" THEN
+            \* the fix for hole 5: an earlier attempt may still land once the other row changes. Fence the earlier
+            \* attempts, then try again. bamb stays set: an earlier attempt may have executed before the fence
+            \* finished, so "not executed" is still not a final answer (hole 4).
+            /\ FenceAndSend(BG(c), kind, g, InitVal(g))
+            /\ bfl' = [bfl EXCEPT ![c] = FALSE]
+            /\ UNCHANGED <<snap, dirty, opH, bpc, be, bop, bres, bgr, bamb,
+                           abs, absKnown, seen, violation>>
        ELSE IF r = "fail" /\ ~(FixUnsureRetry /\ bamb[c]) THEN
             \* definite failure: memory unchanged (the current design: regardless of whether there were earlier ambiguous attempts)
             /\ Finish(c, "fail")
@@ -525,10 +617,11 @@ B_c2(c) ==
             \* or (the fix) there was an earlier ambiguous attempt and this one definitely failed: retry with the same gen
             /\ SendStmt(BG(c), kind, g, 0, InitVal(g), {})
             /\ bamb' = [bamb EXCEPT ![c] = @ \/ r = "amb"]
+            /\ bfl' = [bfl EXCEPT ![c] = @ \/ r = "amb"]
             /\ UNCHANGED <<snap, dirty, opH, bpc, be, bop, bres, bgr,
                            abs, absKnown, seen, violation>>
     /\ UNCHANGED <<sysV, mapV, queued, dead, cliV, flV, evV, dbV, budV,
-                   preCrash, deletedGens, insSent, delSent>>
+                   preCrash, deletedGens, insSent, delSent, extV>>
 
 -----------------------------------------------------------------------------
 \* runSync background: deleteLocked + deleteUntilSure (7.5)
@@ -553,9 +646,9 @@ B_d1(c) ==
             /\ SendStmt(BG(c), "del", r.gen, 0, Val0, {})
             /\ delSent' = delSent \cup {r.gen}
             /\ bpc' = [bpc EXCEPT ![c] = "B_d2"]
-            /\ UNCHANGED <<snap, opH, be, bop, bres, bamb, abs, absKnown, seen, violation>>
+            /\ UNCHANGED <<snap, opH, be, bop, bres, bamb, bfl, abs, absKnown, seen, violation>>
     /\ UNCHANGED <<sysV, mapV, dirty, queued, dead, cliV, flV, evV, dbV, resp, budV,
-                   preCrash, deletedGens, insSent>>
+                   preCrash, deletedGens, insSent, extV>>
 
 B_d2(c) ==
     /\ up /\ bpc[c] = "B_d2" /\ ~wait[BG(c)]
@@ -576,6 +669,16 @@ B_d2(c) ==
             \* mutation: give up (ReleaseOnAmbiguous), or one SELECT still sees the row so it is taken as failed (SelectConfirms)
             /\ Finish(c, IF Mut = "ReleaseOnAmbiguous" THEN "unknown" ELSE "fail")
             /\ UNCHANGED <<snap, dirty, abs, seen, deletedGens, net, wait>>
+       ELSE IF r = "rej" /\ ~(FixCrossRow /\ bfl[c]) THEN
+            \* rejected by a cross-row constraint (a child row references this one): final when nothing can be in flight.
+            \* Had an earlier attempt deleted the row, this one would have affected 0 rows and counted as success.
+            /\ Finish(c, "rejected")
+            /\ UNCHANGED <<snap, dirty, abs, seen, deletedGens, net, wait>>
+       ELSE IF r = "rej" THEN
+            \* the fix for hole 5, as in B_c2: fence the earlier attempts, then try again; bamb stays set
+            /\ FenceAndSend(BG(c), "del", bgr[c], Val0)
+            /\ bfl' = [bfl EXCEPT ![c] = FALSE]
+            /\ UNCHANGED <<snap, dirty, opH, bpc, be, bop, bres, bgr, bamb, abs, seen, deletedGens>>
        ELSE IF r = "fail" /\ ~(FixUnsureRetry /\ bamb[c]) THEN
             \* definite failure: the row is still there, dirty is kept (the current design: regardless of whether there were earlier ambiguous attempts)
             /\ Finish(c, "fail")
@@ -584,9 +687,10 @@ B_d2(c) ==
             \* ambiguous outcome; or (the fix) there was an earlier ambiguous attempt and this one definitely failed: retry with the same gen
             /\ SendStmt(BG(c), "del", bgr[c], 0, Val0, {})
             /\ bamb' = [bamb EXCEPT ![c] = @ \/ r = "amb"]
+            /\ bfl' = [bfl EXCEPT ![c] = @ \/ r = "amb"]
             /\ UNCHANGED <<snap, dirty, opH, bpc, be, bop, bres, bgr, abs, seen, deletedGens>>
     /\ UNCHANGED <<sysV, mapV, queued, dead, cliV, flV, evV, dbV, budV,
-                   absKnown, preCrash, insSent, delSent, violation>>
+                   absKnown, preCrash, insSent, delSent, violation, extV>>
 
 -----------------------------------------------------------------------------
 \* flusher (7.6)
@@ -597,7 +701,7 @@ F_take ==
     /\ fbatch' = queue
     /\ queue' = {}
     /\ fpc' = "F_scan"
-    /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, fretry, fitem, evV, dbV, netV, budV, ghV>>
+    /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, fretry, fitem, evV, dbV, netV, budV, ghV, extV>>
 
 \* per entry: tryLockOp, then take a snapshot and clear dirty inside mu
 F_scan ==
@@ -618,7 +722,7 @@ F_scan ==
                /\ dirty' = [dirty EXCEPT ![e] = {}]
                /\ queued' = [queued EXCEPT ![e] = FALSE]
                /\ UNCHANGED fretry
-    /\ UNCHANGED <<sysV, mapV, snap, dead, cliV, bgV, fpc, queue, evV, dbV, netV, budV, ghV>>
+    /\ UNCHANGED <<sysV, mapV, snap, dead, cliV, bgV, fpc, queue, evV, dbV, netV, budV, ghV, extV>>
 
 \* requeueAll(retry), then send UPDATE ... SET <columns in mask>, ver WHERE id AND gen AND ver < ?
 F_send ==
@@ -630,7 +734,7 @@ F_send ==
             /\ UNCHANGED <<net, wait>>
        ELSE /\ fpc' = "F_wait"
             /\ SendStmt(FL, "upd", fitem.r.gen, fitem.r.ver, fitem.r.val, fitem.m)
-    /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, fbatch, fitem, evV, dbV, resp, budV, ghV>>
+    /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, fbatch, fitem, evV, dbV, resp, budV, ghV, extV>>
 
 \* write done: on success release op; on failure or ambiguous outcome, merge the mask back and re-enqueue
 F_done ==
@@ -646,7 +750,7 @@ F_done ==
     /\ fitem' = NoItem
     /\ fpc' = "F_take"
     /\ UNCHANGED <<sysV, mapV, snap, dead, cliV, bgV, fbatch, fretry, evV, dbV,
-                   net, wait, budV, ghV>>
+                   net, wait, budV, ghV, extV>>
 
 -----------------------------------------------------------------------------
 \* evictor (7.7, dead protocol). Idle TTL and whether capacity is exceeded are matters of time and policy;
@@ -661,7 +765,7 @@ V_evict ==
        /\ opH' = [opH EXCEPT ![e] = EV]
        /\ ve' = e
        /\ vpc' = "V_rm"
-    /\ UNCHANGED <<sysV, mapV, snap, dirty, queued, cliV, bgV, flV, dbV, netV, budV, ghV>>
+    /\ UNCHANGED <<sysV, mapV, snap, dirty, queued, cliV, bgV, flV, dbV, netV, budV, ghV, extV>>
 
 \* after releasing mu (the gap), remove it from the map inside shard.mu, then release op.
 \* Once nobody holds a pointer to it, clear its snap (only to reduce the state count; nobody can see it again).
@@ -673,15 +777,33 @@ V_remove ==
     /\ vpc' = "V_pick"
     /\ ve' = 0
     /\ UNCHANGED <<sysV, nextEntry, eEp, dirty, queued, dead,
-                   cliV, bgV, flV, dbV, netV, budV, ghV>>
+                   cliV, bgV, flV, dbV, netV, budV, ghV, extV>>
 
 -----------------------------------------------------------------------------
 \* DB (PostgreSQL). All writes are conditional writes (I6).
 
 NewRow(s) == [ex |-> TRUE, gen |-> s.gen, ver |-> 0, val |-> s.val]
 
-\* new DB state after a statement executes
-ExecDb(s) ==
+\* The owner-epoch condition of the fix for hole 8 (8.3): a write takes effect only while the epoch row holds its sender's
+\* epoch. A statement that was in flight when a newer instance bumped the epoch (pre) may have read the epoch row before
+\* the bump, so it passes: the worst case. Those statements are what the startup fence, run after the bump, removes.
+EpochOk(s) == ~FixEpoch \/ s.ep = dbEpoch \/ s.pre
+
+\* Whether a cross-row constraint rejects the statement now: only an INSERT or DELETE that would otherwise change the row.
+\* The whole statement is rolled back, including the dedup record of an "insd". (A cross-row rejection of a flush UPDATE
+\* is a poison row, design.md 7.9, and is not modeled.)
+Rejected(s) ==
+    /\ blocked
+    /\ CASE s.kind = "ins"  -> ~db.ex
+         [] s.kind = "insd" -> s.gen \notin dedup /\ ~db.ex
+         [] s.kind = "del"  -> db.ex /\ (db.gen = s.gen \/ Mut = "NoGenCheck")
+         [] OTHER           -> FALSE
+
+\* the statement writes something (the business row or the dedup record), or at least is evaluated against the data
+Applies(s) == EpochOk(s) /\ ~Rejected(s)
+
+\* new DB state after a statement that applies executes
+Effect(s) ==
     CASE s.kind = "ins"  -> IF db.ex THEN db ELSE NewRow(s)          \* ON CONFLICT DO NOTHING
       [] s.kind = "insd" -> IF s.gen \notin dedup /\ ~db.ex THEN NewRow(s) ELSE db
       [] s.kind = "upd"  -> IF db.ex /\ (db.gen = s.gen \/ Mut = "NoGenCheck")
@@ -695,19 +817,25 @@ ExecDb(s) ==
                             ELSE db
       [] s.kind = "del"  -> IF db.ex /\ (db.gen = s.gen \/ Mut = "NoGenCheck") THEN DbAbsent ELSE db
 
-\* result of executing a statement (an UPDATE/DELETE affecting 0 rows also counts as success)
+\* new DB state after a statement executes
+ExecDb(s) == IF Applies(s) THEN Effect(s) ELSE db
+
+\* result of executing a statement (an UPDATE/DELETE affecting 0 rows also counts as success, which is also all that a
+\* statement with a stale owner epoch reports)
 ExecResult(s) ==
-    CASE s.kind = "ins"  -> IF db.ex THEN "dup" ELSE "ok"
-      [] s.kind = "insd" -> IF s.gen \in dedup THEN "claimed"
-                            ELSE IF db.ex THEN "conflict" ELSE "ok"
-      [] OTHER           -> "ok"
+    IF ~EpochOk(s) THEN "ok"
+    ELSE IF Rejected(s) THEN "rej"
+    ELSE CASE s.kind = "ins"  -> IF db.ex THEN "dup" ELSE "ok"
+           [] s.kind = "insd" -> IF s.gen \in dedup THEN "claimed"
+                                 ELSE IF db.ex THEN "conflict" ELSE "ok"
+           [] OTHER           -> "ok"
 
 \* execute one statement (possibly a late execution). If the sender is still waiting, hand it the result; the response may also be lost.
 DbExec ==
     /\ \E s \in net :
          /\ db' = ExecDb(s)
-         /\ dedup' = CASE s.kind = "insd" -> dedup \cup {s.gen}
-                       [] s.kind = "del" /\ Mut = "DedupDeletedWithRow" /\ db.ex /\ db.gen = s.gen
+         /\ dedup' = CASE s.kind = "insd" /\ Applies(s) -> dedup \cup {s.gen}
+                       [] s.kind = "del" /\ Mut = "DedupDeletedWithRow" /\ db.ex /\ db.gen = s.gen /\ Applies(s)
                                          -> dedup \ {s.gen}
                        [] OTHER -> dedup
          /\ net' = net \ {s}
@@ -720,7 +848,7 @@ DbExec ==
                        /\ resp' = [resp EXCEPT ![s.src] = "amb"]
             ELSE UNCHANGED <<resp, wait, stmtTO>>
     /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, flV, evV,
-                   drops, cto, crashes, nextGen, nextVal, ghV>>
+                   drops, cto, crashes, nextGen, nextVal, ghV, extV>>
 
 \* Go-side ctx timeout: the sender stops waiting and treats it as an ambiguous outcome; the statement is still in flight and may execute later
 DbTimeout ==
@@ -733,7 +861,7 @@ DbTimeout ==
          /\ resp' = [resp EXCEPT ![s.src] = "amb"]
     /\ stmtTO' = stmtTO + 1
     /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, flV, evV, dbV,
-                   drops, cto, crashes, nextGen, nextVal, ghV>>
+                   drops, cto, crashes, nextGen, nextVal, ghV, extV>>
 
 \* statement definitely rejected (statement_timeout, connection failure, etc.; not executed), or never reaches the DB
 DbDrop ==
@@ -746,12 +874,23 @@ DbDrop ==
             ELSE UNCHANGED <<resp, wait>>
     /\ drops' = drops + 1
     /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, flV, evV, dbV,
-                   stmtTO, cto, crashes, nextGen, nextVal, ghV>>
+                   stmtTO, cto, crashes, nextGen, nextVal, ghV, extV>>
+
+\* Another row changes, so that a cross-row constraint on this table (a unique index other than the primary key, a foreign
+\* key in either direction, an exclusion constraint) starts or stops rejecting an INSERT / DELETE of this key (5.3, 8.4).
+EnvFlip ==
+    /\ flips < MaxFlips
+    /\ flips' = flips + 1
+    /\ blocked' = ~blocked
+    /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, flV, evV, dbV, netV, budV, ghV,
+                   dbEpoch, qto, zsent, retry, failedGens>>
 
 -----------------------------------------------------------------------------
 \* crash and restart (7.8)
 
-\* process crash: all memory is lost and all goroutines vanish; statements already sent are still in flight, but nobody is waiting for them anymore.
+\* The process crashes, or is superseded: a newer instance starts while this one is still running (11.3). Either way the
+\* memory of this process stops being the authority, and from here on the model follows the newer instance.
+\* All memory is lost and all goroutines vanish; statements already sent are still in flight, but nobody is waiting for them anymore.
 \* a client with a create in progress sees the connection drop; the outcome is ambiguous.
 Crash ==
     /\ up /\ crashes < MaxCrashes /\ nextEntry <= MaxEntry
@@ -779,6 +918,7 @@ Crash ==
     /\ bres' = [c \in Clients |-> "none"]
     /\ bgr' = [c \in Clients |-> 0]
     /\ bamb' = [c \in Clients |-> FALSE]
+    /\ bfl' = [c \in Clients |-> FALSE]
     /\ fpc' = "F_take" /\ fbatch' = {} /\ fretry' = {} /\ fitem' = NoItem /\ queue' = {}
     /\ vpc' = "V_pick" /\ ve' = 0
     /\ net' = {[s EXCEPT !.live = FALSE] : s \in net}
@@ -787,22 +927,55 @@ Crash ==
     /\ preCrash' = IF absKnown THEN abs ELSE preCrash
     /\ absKnown' = FALSE
     /\ seen' = [c \in Clients |-> {}]
+    /\ retry' = [c \in Clients |-> FALSE]
     /\ UNCHANGED <<nextEntry, ops, lastSeen, dbV,
                    stmtTO, drops, cto, nextGen, nextVal,
-                   abs, deletedGens, insSent, delSent, violation>>
+                   abs, deletedGens, insSent, delSent, violation,
+                   dbEpoch, blocked, flips, qto, zsent, failedGens>>
+
+\* A superseded instance does not know it was superseded: it reconnects after the new instance's fence and keeps writing
+\* from its own stale memory. The model does not keep that memory; it lets the old instance send the statements that do
+\* the most damage if they take effect: a flush with a ver above anything the new instance uses and a value only the old
+\* instance ever held, an INSERT, or a DELETE, for any gen handed out so far. These are not recorded in insSent / delSent:
+\* no client of the new instance asked for them. ep = 0 never matches the epoch row.
+\* Only statements sent after the new instance is up are modeled here. Until the new instance takes over, the old one is
+\* still the authority and its writes are legitimate; what it has in flight at that moment is already in net (Crash keeps
+\* it), and FenceDrop removes it like any other old statement.
+ZVal(g) == [col \in Cols |-> <<g, MaxVal + 1>>]
+ZombieSend ==
+    /\ up /\ crashes > 0 /\ zsent < MaxZombieStmts
+    /\ zsent' = zsent + 1
+    /\ \E g \in 1..nextGen, kind \in {"upd", "del", IF FixDedup THEN "insd" ELSE "ins"} :
+         net' = net \cup {[kind |-> kind, gen |-> g,
+                           ver |-> IF kind = "upd" THEN MaxVal + 1 ELSE 0,
+                           val |-> CASE kind = "upd" -> ZVal(g) [] kind = "del" -> Val0 [] OTHER -> InitVal(g),
+                           mask |-> IF kind = "upd" THEN Cols ELSE {},
+                           src |-> ZB, ep |-> 0, live |-> FALSE, pre |-> FALSE]}
+    /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, flV, evV, dbV, wait, resp, budV, ghV,
+                   dbEpoch, blocked, flips, qto, retry, failedGens>>
+
+\* The fix for hole 8, first step of startup (7.8): take over the owner epoch row. From now on a statement that starts
+\* with an older epoch changes nothing. A statement of the previous owner that is already in flight may have read the
+\* epoch row before this bump and found its own epoch there: mark it (see EpochOk).
+Bump ==
+    /\ FixEpoch /\ ~up /\ dbEpoch # epoch
+    /\ dbEpoch' = epoch
+    /\ net' = {[s EXCEPT !.pre = @ \/ s.ep = dbEpoch] : s \in net}
+    /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, flV, evV, dbV, wait, resp, budV, ghV,
+                   blocked, flips, qto, zsent, retry, failedGens>>
 
 \* the fix: on restart, pg_terminate_backend the previous process's sessions. With the sessions gone,
 \* statements sent by the previous process and not yet executed will never execute.
 FenceDrop ==
-    /\ FixFence /\ ~up
+    /\ FixFence /\ ~up /\ (FixEpoch => dbEpoch = epoch)
     /\ \E s \in net : s.ep < epoch /\ net' = net \ {s}
-    /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, flV, evV, dbV, wait, resp, budV, ghV>>
+    /\ UNCHANGED <<sysV, mapV, entV, cliV, bgV, flV, evV, dbV, wait, resp, budV, ghV, extV>>
 
 Restart ==
-    /\ ~up
+    /\ ~up /\ (FixEpoch => dbEpoch = epoch)
     /\ FixFence => ~(\E s \in net : s.ep < epoch)
     /\ up' = TRUE
-    /\ UNCHANGED <<epoch, mapV, entV, cliV, bgV, flV, evV, dbV, netV, budV, ghV>>
+    /\ UNCHANGED <<epoch, mapV, entV, cliV, bgV, flV, evV, dbV, netV, budV, ghV, extV>>
 
 -----------------------------------------------------------------------------
 \* all client operations are done and background tasks are idle: allowed to stop here (not a deadlock)
@@ -815,12 +988,12 @@ Done ==
 Next ==
     \/ \E c \in Clients :
          \/ ClientStart(c) \/ Goc(c) \/ G_read(c) \/ L_lock(c) \/ L_load(c)
-         \/ U_mu(c) \/ U_enq(c) \/ X_lock(c) \/ X_wait(c)
+         \/ U_mu(c) \/ U_enq(c) \/ X_lock(c) \/ X_wait(c) \/ X_qtimeout(c)
          \/ B_c1(c) \/ B_c2(c) \/ B_d1(c) \/ B_d2(c)
     \/ F_take \/ F_scan \/ F_send \/ F_done
     \/ V_evict \/ V_remove
-    \/ DbExec \/ DbTimeout \/ DbDrop
-    \/ Crash \/ FenceDrop \/ Restart
+    \/ DbExec \/ DbTimeout \/ DbDrop \/ EnvFlip
+    \/ Crash \/ ZombieSend \/ Bump \/ FenceDrop \/ Restart
     \/ Done
 
 Spec == Init /\ [][Next]_vars
@@ -891,8 +1064,14 @@ DbNotAhead ==
 CleanIsDurable ==
     (LiveLoaded /\ dirty[mapE] = {} /\ opH[mapE] = FREE) => DbRow = snap[mapE]
 
-\* I15: once the service is up, no statement from a previous process is still in flight
-FencedRestart == (FixFence /\ up) => \A s \in net : s.ep = epoch
+\* I15: once the service is up, no statement that a previous process sent before the fence is still in flight.
+\* (What a superseded instance sends after the fence is stopped by the owner epoch instead: I16, checked by the
+\* invariants above, which a zombie statement that took effect would violate.)
+FencedRestart == (FixFence /\ up) => \A s \in net : s.ep = epoch \/ s.src = ZB
+
+\* C2 for create: a create whose final answer was "failed" did not take effect and never will. Both sets only grow,
+\* so this covers an INSERT that landed before the answer as well as one that lands after it.
+CreateFailureIsFinal == FixDedup => failedGens \cap dedup = {}
 
 \* action property: within one life, the DB ver never goes back, and a value never changes without a larger ver
 \* (a violation means a stale UPDATE overwrote a newer one, 8.2 example 1)
@@ -916,7 +1095,7 @@ Fairness ==
          /\ WF_vars(B_c1(c)) /\ WF_vars(B_c2(c)) /\ WF_vars(B_d1(c)) /\ WF_vars(B_d2(c))
     /\ WF_vars(F_take) /\ WF_vars(F_scan) /\ WF_vars(F_send) /\ WF_vars(F_done)
     /\ WF_vars(V_remove)
-    /\ WF_vars(DbExec) /\ WF_vars(FenceDrop) /\ WF_vars(Restart)
+    /\ WF_vars(DbExec) /\ WF_vars(Bump) /\ WF_vars(FenceDrop) /\ WF_vars(Restart)
 
 FairSpec == Spec /\ Fairness
 
@@ -955,6 +1134,19 @@ W_FlushFailed          == ~(fpc = "F_wait" /\ ~wait[FL] /\ resp[FL] \in {"amb", 
 W_UpdateDuringFlush    == ~(fitem # NoItem /\ dirty[fitem.e] # {})
 W_UpdateDuringDelete   == ~(\E c \in Clients : bpc[c] = "B_d2" /\ dirty[be[c]] # {})
 W_ClientGaveUp         == cto = 0
+
+\* the situations of holes 5-8 (checked in the "ext" environment of suite.py, where their faults are enabled)
+W_CrossRowAfterAmb     == ~(\E c \in Clients : bfl[c] /\ ~wait[BG(c)] /\ resp[BG(c)] = "rej")
+W_FencedAttempt        == ~(\E c \in Clients : bfl[c] /\ ~wait[BG(c)] /\ resp[BG(c)] = "rej"
+                                               /\ \E s \in net : s.src = BG(c) /\ Effect(s) # db)
+W_NotExecutedAfterFence == ~(\E c \in Clients : bamb[c] /\ ~bfl[c] /\ ~wait[BG(c)] /\ resp[BG(c)] = "fail")
+W_RetryFindsOtherLife  == ~(\E c \in Clients : bpc[c] = "B_c1" /\ snap[be[c]].k = "row"
+                                               /\ snap[be[c]].gen # bop[c].gen /\ bop[c].gen \in dedup)
+W_RetryQueuedBehindSelf == ~(\E c \in Clients : retry[c] /\ pc[c] = "X_lock" /\ opH[ce[c]] = BG(c))
+W_RetryNotExecuted     == ~(\E c \in Clients : retry[c] /\ bpc[c] = "B_done" /\ bres[c] = "fail")
+W_QueueTimeout         == qto = 0
+W_ZombieStmt           == ~(up /\ \E s \in net : s.src = ZB)
+W_ZombieStoppedByEpoch == ~(up /\ \E s \in net : s.src = ZB /\ ~EpochOk(s) /\ Effect(s) # db)
 
 -----------------------------------------------------------------------------
 \* state constraint used only by hole3.cfg: old statements still in flight at crash time may only be UPDATEs,
