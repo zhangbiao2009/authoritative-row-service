@@ -90,7 +90,11 @@ func TestLinearizable(t *testing.T) {
 	total := 0
 	for i := range rounds {
 		h := &history{}
-		t.Run(fmt.Sprint("round ", i), func(t *testing.T) { linearizableRound(t, h) })
+		t.Run(fmt.Sprint("round ", i), func(t *testing.T) {
+			evictions, reloads := linearizableRound(t, h)
+			counters["evictions"] += evictions
+			counters["reloads after eviction"] += reloads
+		})
 		witnesses(counters, h.ops)
 		total += len(h.ops)
 		checkLinearizable(t, h.ops, 30*time.Second)
@@ -132,11 +136,12 @@ func witnesses(counters map[string]int64, ops []porcupine.Operation) {
 	}
 }
 
-// linearizableRound runs one round of TestLinearizable, recording its history in h.
-func linearizableRound(t *testing.T, h *history) {
+// linearizableRound runs one round of TestLinearizable, recording its history in h. Eviction interleaves with
+// every operation, so loads read the DB, and the check covers "a clean row in memory equals the DB" (I4).
+func linearizableRound(t *testing.T, h *history) (evictions, reloads int64) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
-		s := newTestStore(t, d)
+		s := newTestStore(t, d, evictHard)
 		ks := make([]schema.Key, linKeys)
 		for i := range linKeys {
 			ks[i] = key(t, s, int64(i+1))
@@ -150,6 +155,9 @@ func linearizableRound(t *testing.T, h *history) {
 		}
 		stop := startFlusher(s)
 		f := startFaults(d, ks)
+		ev := watchEvictions(s, f)
+		stopEvictor := runEvictor(s)
+		defer func() { evictions, reloads = ev.Load(), f.reloads.Load() }()
 		var gens atomic.Int64
 		gens.Store(1000)
 
@@ -184,6 +192,7 @@ func linearizableRound(t *testing.T, h *history) {
 					return seen[i]
 				}
 				for range linOps {
+					think()
 					i := rand.IntN(linKeys)
 					k := ks[i]
 					var in opInput
@@ -228,9 +237,11 @@ func linearizableRound(t *testing.T, h *history) {
 		f.stop()
 		s.inflight.Wait() // L2: the unknown outcomes settle
 		stop()
+		stopEvictor()
 		drain(t, s)
 		checkInvariants(t, s, d)
 	})
+	return evictions, reloads
 }
 
 // Review Focus 4: only Ok passes.

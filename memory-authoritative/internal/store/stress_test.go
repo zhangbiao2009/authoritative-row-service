@@ -174,7 +174,7 @@ func TestStressCreateDelete(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const keys, workers, ops = 4, 64, 300
 		d := fakedb.New()
-		s := newTestStore(t, d)
+		s := newTestStore(t, d, evictHard)
 		ks := make([]schema.Key, keys)
 		for i := range keys {
 			ks[i] = key(t, s, int64(i))
@@ -188,6 +188,8 @@ func TestStressCreateDelete(t *testing.T) {
 		}
 
 		f := startFaults(d, ks)
+		evictions := watchEvictions(s, f)
+		stopEvictor := runEvictor(s)
 
 		// History, recorded by the driver.
 		var seq atomic.Int64 // counts successful deletes
@@ -228,6 +230,7 @@ func TestStressCreateDelete(t *testing.T) {
 			wg.Go(func() {
 				seen := [keys]int64{} // the gen this worker last saw per key; 0 if none
 				for range ops {
+					think()
 					i := rand.IntN(keys)
 					k := ks[i]
 					get := func() {
@@ -327,6 +330,7 @@ func TestStressCreateDelete(t *testing.T) {
 		f.stop()
 		s.inflight.Wait() // L2 BackgroundSettles
 		stop()
+		stopEvictor()
 		drain(t, s)
 		checkInvariants(t, s, d)
 		for _, k := range ks { // DbMatchesAbsWhenIdle
@@ -368,6 +372,7 @@ func TestStressCreateDelete(t *testing.T) {
 			"queue timeouts": queueTimeouts.Load(), "not executed after ambiguous": f.ambThenNotExecuted.Load(),
 			"not executed after a fence": f.notExecutedAfterFence.Load(), "late inserts of a deleted gen": f.lateInsertOfDeleted.Load(),
 			"retries finding the gen claimed": f.retryFindsOtherLife.Load(),
+			"evictions":                       evictions.Load(), "reloads after eviction": f.reloads.Load(),
 		}
 		nonVacuous(t, counters)
 	})
