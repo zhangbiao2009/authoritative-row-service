@@ -25,6 +25,11 @@ func newTestStore(t *testing.T, d *fakedb.DB) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := d.Violation(); err != nil {
+			t.Error(err)
+		}
+	})
 	return s
 }
 
