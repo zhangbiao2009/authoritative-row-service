@@ -13,8 +13,6 @@ import (
 	"rowsvc/internal/schema"
 )
 
-func always(*entry) bool { return true }
-
 // evict runs the dead protocol on k's entry, with no policy condition.
 func evict(t *testing.T, s *Store, k schema.Key) bool {
 	t.Helper()
@@ -110,9 +108,7 @@ func TestUpdateDuringEvictionIsKept(t *testing.T) {
 		t.Fatalf("Get after the update = %+v, want name x: the update was lost", g)
 	}
 	flushAll(s)
-	if r := d.Row(k); r.Vals[1] != "x" {
-		t.Fatalf("DB row %+v, want name x", r)
-	}
+	memMatchesDB(t, s, d, k)
 	checkInvariants(t, s, d)
 }
 
@@ -195,23 +191,15 @@ func TestLoadOfDeadEntryStartsOver(t *testing.T) {
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
-		e := s.getOrCreate(k) // snap nil
-		if err := e.lockOp(context.Background()); err != nil {
-			t.Fatal(err)
-		}
+		s.getOrCreate(k) // an entry with snap nil
 		got := make(chan *schema.Row, 1)
-		go func() { r, _ := s.Get(context.Background(), k); got <- r }()
-		synctest.Wait() // the Get queues on op
-		// remove e as tryEvict does, while holding its op
-		e.mu.Lock()
-		e.dead = true
-		e.mu.Unlock()
-		sh := s.shardFor(k)
-		sh.mu.Lock()
-		delete(sh.m, k)
-		s.entryCount.Add(-1)
-		sh.mu.Unlock()
-		e.unlockOp()
+		at(s, "evict-dead", func(*entry) {
+			go func() { r, _ := s.Get(context.Background(), k); got <- r }()
+			synctest.Wait() // the Get finds snap nil and queues on op, which tryEvict holds
+		})
+		if !evict(t, s, k) {
+			t.Fatal("not evicted")
+		}
 		if r := <-got; r == nil || r.Gen != 101 {
 			t.Fatalf("Get = %+v, want the row", r)
 		}
@@ -243,15 +231,18 @@ func TestFlushDropsDeadEntry(t *testing.T) {
 
 // ttls sets the eviction config of a test Store.
 func ttls(idle, negative time.Duration) func(*Config) {
-	return func(c *Config) { c.IdleTTL, c.NegativeIdleTTL, c.EvictInterval = idle, negative, time.Second }
+	return func(c *Config) { c.IdleTTL, c.NegativeIdleTTL = idle, negative }
 }
 
 // runEvictor starts RunEvictor; the returned func stops it and waits for it.
 func runEvictor(s *Store) (stop func()) {
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { defer close(done); s.RunEvictor(ctx) }()
-	return func() { cancel(); <-done }
+	var wg sync.WaitGroup
+	wg.Go(func() { s.RunEvictor(ctx) })
+	return func() {
+		cancel()
+		wg.Wait()
+	}
 }
 
 func TestIdleEntryEvicted(t *testing.T) {

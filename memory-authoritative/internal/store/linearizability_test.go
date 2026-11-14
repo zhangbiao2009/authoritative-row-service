@@ -155,9 +155,8 @@ func linearizableRound(t *testing.T, h *history) (evictions, reloads int64) {
 		}
 		stop := startFlusher(s)
 		f := startFaults(d, ks)
-		ev := watchEvictions(s, f)
+		watchEvictions(s, f)
 		stopEvictor := runEvictor(s)
-		defer func() { evictions, reloads = ev.Load(), f.reloads.Load() }()
 		var gens atomic.Int64
 		gens.Store(1000)
 
@@ -240,6 +239,7 @@ func linearizableRound(t *testing.T, h *history) (evictions, reloads int64) {
 		stopEvictor()
 		drain(t, s)
 		checkInvariants(t, s, d)
+		evictions, reloads = f.evictions.Load(), f.reloads.Load()
 	})
 	return evictions, reloads
 }

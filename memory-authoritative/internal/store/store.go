@@ -5,11 +5,11 @@
 //     flush, eviction). The root lock.
 //   - entry.mu: leaf lock; guards writes of snap (I3), dirty and queued.
 //   - shard.mu: leaf lock; guards the shard's map. Taken with op held (eviction), never with mu held.
+//   - shard.qmu: leaf lock; guards the shard's flush queue.
 //
 // The dead protocol (design.md 7.7): the remover holds op and mu, finds dirty == 0, sets dead, then deletes
 // the entry from the map. Whoever takes op or mu checks dead first and, if it is set, looks the key up
 // again. Lock-free readers (Get) do not check it: they read the value the entry had when it was removed.
-//   - shard.qmu: leaf lock; guards the shard's flush queue.
 //
 // While holding a leaf lock: take no other lock, do no channel operation, no IO, no logging.
 // snap is read without any lock: a published Row is never modified (I2).

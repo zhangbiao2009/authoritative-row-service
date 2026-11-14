@@ -1,6 +1,7 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"slices"
 	"time"
@@ -22,6 +23,7 @@ func (s *Store) RunEvictor(ctx context.Context) {
 		case <-clock.C:
 			s.nowSec.Store(time.Now().Unix())
 		case <-sweep.C:
+			s.nowSec.Store(time.Now().Unix()) // the sweep judges idleness by the current second
 			s.evictOnce()
 		}
 	}
@@ -65,7 +67,7 @@ func (s *Store) idleSweepShard(sh *shard) {
 		for _, e := range cands {
 			s.tryEvict(sh, e, expired)
 		}
-		if len(cands)*4 <= sampled {
+		if len(cands)*4 <= sampled || sampled < sampleK { // a smaller sample was the whole shard: nothing new to find
 			return
 		}
 	}
@@ -84,34 +86,40 @@ func (s *Store) idleExpired(e *entry, now int64) bool {
 // capacityEvictShard removes up to quota of the shard's least recently accessed entries, from samples. A
 // sample that yields nothing (every entry dirty or busy) ends it: backpressure is what limits growth then.
 func (s *Store) capacityEvictShard(sh *shard, quota int) {
+	type cand struct {
+		e  *entry
+		at int64 // lastAccess when sampled, so that the order holds while touches go on
+	}
 	for range s.cfg.MaxSweepRounds {
-		if quota <= 0 {
-			return
-		}
-		cands := make([]*entry, 0, sampleK)
+		cands := make([]cand, 0, sampleK)
 		sh.mu.RLock()
 		for _, e := range sh.m {
-			if cands = append(cands, e); len(cands) == sampleK {
+			if cands = append(cands, cand{e, e.lastAccess.Load()}); len(cands) == sampleK {
 				break
 			}
 		}
 		sh.mu.RUnlock()
-		slices.SortFunc(cands, func(a, b *entry) int { return int(a.lastAccess.Load() - b.lastAccess.Load()) })
+		if quota < len(cands) { // otherwise every candidate is tried and the order does not matter
+			slices.SortFunc(cands, func(a, b cand) int { return cmp.Compare(a.at, b.at) })
+		}
 		evicted := 0
-		for _, e := range cands {
+		for _, c := range cands {
 			if evicted == quota {
 				break
 			}
-			if s.tryEvict(sh, e, func(*entry) bool { return true }) {
+			if s.tryEvict(sh, c.e, always) {
 				evicted++
 			}
 		}
-		if evicted == 0 {
+		quota -= evicted
+		if quota <= 0 || evicted == 0 || len(cands) < sampleK { // done; nothing evictable; or that was the whole shard
 			return
 		}
-		quota -= evicted
 	}
 }
+
+// always is the eligible condition of capacity eviction: any clean, idle-or-not entry.
+func always(*entry) bool { return true }
 
 // tryEvict removes e from memory by the dead protocol (design.md 7.7). It gives up if e's op is busy (a DB
 // operation in progress), and re-checks eligible under mu: e may have been accessed since it was chosen.

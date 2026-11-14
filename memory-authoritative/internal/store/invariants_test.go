@@ -23,9 +23,9 @@ func checkInvariants(t *testing.T, s *Store, d *fakedb.DB) {
 			inQueue[e] = true
 		}
 		sh.mu.RLock()
-		entries := slices.Collect(maps.Values(sh.m))
 		inMap := maps.Clone(sh.m)
 		sh.mu.RUnlock()
+		entries := slices.Collect(maps.Values(inMap))
 		for _, e := range queue { // a dead entry may still be queued: the flusher drops it
 			e.mu.Lock()
 			dead, dirty := e.dead, e.dirty

@@ -188,7 +188,7 @@ func TestStressCreateDelete(t *testing.T) {
 		}
 
 		f := startFaults(d, ks)
-		evictions := watchEvictions(s, f)
+		watchEvictions(s, f)
 		stopEvictor := runEvictor(s)
 
 		// History, recorded by the driver.
@@ -375,7 +375,7 @@ func TestStressCreateDelete(t *testing.T) {
 			"queue timeouts": queueTimeouts.Load(), "not executed after ambiguous": f.ambThenNotExecuted.Load(),
 			"not executed after a fence": f.notExecutedAfterFence.Load(), "late inserts of a deleted gen": f.lateInsertOfDeleted.Load(),
 			"retries finding the gen claimed": f.retryFindsOtherLife.Load(),
-			"evictions":                       evictions.Load(), "reloads after eviction": f.reloads.Load(),
+			"evictions":                       f.evictions.Load(), "reloads after eviction": f.reloads.Load(),
 		}
 		nonVacuous(t, counters)
 	})

@@ -31,6 +31,7 @@ type faults struct {
 	notExecutedAfterFence atomic.Int64 // the same, after one of its sessions was fenced
 	lateInsertOfDeleted   atomic.Int64 // a late INSERT arriving after its life was deleted
 	retryFindsOtherLife   atomic.Int64 // a GenClaimed lookup that found the gen claimed
+	evictions             atomic.Int64 // entries evicted (W_Evict), counted by watchEvictions
 	reloads               atomic.Int64 // a Select of a key after it was evicted (W_Reload)
 
 	mu        sync.Mutex
@@ -119,19 +120,17 @@ func evictHard(c *Config) {
 // think waits 0-20ms of virtual time, so that many second boundaries pass during a run.
 func think() { time.Sleep(time.Duration(rand.IntN(20)) * time.Millisecond) }
 
-// watchEvictions counts s's evictions (W_Evict) through the "evict-dead" failpoint and tells f which keys
-// were evicted, so that f counts their reloads. Call it before RunEvictor starts.
-func watchEvictions(s *Store, f *faults) *atomic.Int64 {
-	var n atomic.Int64
+// watchEvictions counts s's evictions (W_Evict) in f through the "evict-dead" failpoint, and tells f which
+// keys were evicted, so that f counts their reloads. Call it before RunEvictor starts.
+func watchEvictions(s *Store, f *faults) {
 	s.failpoint = func(at string, e *entry) {
 		if at == "evict-dead" {
-			n.Add(1)
+			f.evictions.Add(1)
 			f.mu.Lock()
 			f.evicted[e.id] = true
 			f.mu.Unlock()
 		}
 	}
-	return &n
 }
 
 func (f *faults) hook(_ context.Context, st *fakedb.Stmt) error {
