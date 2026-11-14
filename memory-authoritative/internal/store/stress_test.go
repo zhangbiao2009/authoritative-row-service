@@ -147,6 +147,26 @@ func TestStressUpdates(t *testing.T) {
 	t.Logf("%d flushes, %d failed, %d late", d.Updates(), failed.Load(), late.Load())
 }
 
+// opCtx is a client's ctx: 5ms for shortPercent of the calls, to get unknown outcomes and timeouts while
+// queued, else 5s (L1 EventuallyResponds).
+func opCtx(shortPercent int) (context.Context, context.CancelFunc) {
+	if rand.IntN(100) < shortPercent {
+		return context.WithTimeout(context.Background(), 5*time.Millisecond)
+	}
+	return context.WithTimeout(context.Background(), 5*time.Second)
+}
+
+// nonVacuous fails t for every counter that is 0: the test did not reach that case (tla-mapping.md section 8).
+func nonVacuous(t *testing.T, counters map[string]int64) {
+	t.Helper()
+	for name, n := range counters {
+		if n == 0 {
+			t.Errorf("non-vacuity: no %s", name)
+		}
+	}
+	t.Logf("%v", counters)
+}
+
 // Acceptance (design.md 12.2 M3): a stress test with fault injection. Afterwards memory and the DB match row
 // for row, and the history checks of tla-mapping.md section 5 hold. synctest: the backoffs and timeouts run
 // on virtual time; the goroutines still run concurrently.
@@ -167,106 +187,7 @@ func TestStressCreateDelete(t *testing.T) {
 			return nil
 		}
 
-		// Faults, on while faults is true.
-		var faults atomic.Bool
-		faults.Store(true)
-		type stmtOf struct { // the Inserts, or the Deletes, of one life
-			kind fakedb.Kind
-			key  schema.Key
-			gen  int64
-		}
-		var mu sync.Mutex
-		ambiguous := map[stmtOf]bool{}         // answered "ambiguous" at least once
-		sessionOf := map[db.SessionID]stmtOf{} // the sessions of those answers
-		fenced := map[stmtOf]bool{}            // one of those sessions was fenced
-		var ambThenNotExecuted, notExecutedAfterFence, lateInsertOfDeleted, retryFindsOtherLife atomic.Int64
-		var lateExecs sync.WaitGroup
-		d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
-			if st.Kind == fakedb.GenClaimed {
-				if faults.Load() && rand.IntN(100) < 5 {
-					return fail(db.ErrNotExecuted)(st)
-				}
-				st.Exec()
-				if d.Claimed(st.Key, st.Gen) { // W_RetryFindsOtherLife: a retry of a create met another life
-					retryFindsOtherLife.Add(1)
-				}
-				return nil
-			}
-			if !faults.Load() {
-				return nil
-			}
-			time.Sleep(time.Duration(rand.IntN(500)) * time.Microsecond)
-			switch st.Kind {
-			case fakedb.Fence:
-				mu.Lock()
-				for _, id := range st.Sessions {
-					fenced[sessionOf[id]] = true
-				}
-				mu.Unlock()
-				return nil
-			case fakedb.Select:
-				if rand.IntN(100) < 5 {
-					return fail(db.ErrNotExecuted)(st)
-				}
-				return nil
-			}
-			l, write := stmtOf{st.Kind, st.Key, st.Gen}, st.Kind == fakedb.Insert || st.Kind == fakedb.Delete
-			markAmbiguous := func() {
-				if write {
-					mu.Lock()
-					ambiguous[l] = true
-					sessionOf[st.Session] = l
-					mu.Unlock()
-				}
-			}
-			switch n := rand.IntN(100); {
-			case n < 55:
-				return nil
-			case n < 65:
-				markAmbiguous()
-				return lost(st)
-			case n < 75:
-				markAmbiguous()
-				exec := st.Exec
-				lateExecs.Go(func() {
-					// Virtual time: a window much wider than the backoff, so a late statement can land after
-					// later attempts and later operations, not only before the next attempt.
-					time.Sleep(time.Duration(rand.IntN(100_000)) * time.Microsecond)
-					if l.kind == fakedb.Insert && d.Deleted(l.key, l.gen) { // W_LateInsertOfDeletedGen
-						lateInsertOfDeleted.Add(1)
-					}
-					exec()
-				})
-				return fakedb.Ambiguous(st, context.DeadlineExceeded)
-			case n < 85:
-				markAmbiguous()
-				return fakedb.Ambiguous(st, context.DeadlineExceeded) // never executes
-			default:
-				mu.Lock()
-				if write && ambiguous[l] {
-					ambThenNotExecuted.Add(1)
-				}
-				if write && fenced[l] {
-					notExecutedAfterFence.Add(1)
-				}
-				mu.Unlock()
-				return fail(db.ErrNotExecuted)(st)
-			}
-		}
-		flipping, flipped := make(chan struct{}), make(chan struct{})
-		go func() {
-			defer close(flipped)
-			tick := time.NewTicker(time.Millisecond)
-			defer tick.Stop()
-			for {
-				select {
-				case <-flipping:
-					return
-				case <-tick.C:
-					d.SetCrossRow(ks[rand.IntN(keys)], rand.IntN(2) == 0)
-				}
-			}
-		}()
+		f := startFaults(d, ks)
 
 		// History, recorded by the driver.
 		var seq atomic.Int64 // counts successful deletes
@@ -285,28 +206,20 @@ func TestStressCreateDelete(t *testing.T) {
 
 		allowed := func(op string, err error) bool {
 			switch {
-			case err == nil, errors.Is(err, ErrNotFound), errors.Is(err, ErrAlreadyExists), db.NotExecuted(err), db.IsCrossRow(err):
-				return true
+			case classify(err) == unexpected:
+				t.Errorf("%s: unexpected error %v", op, err)
+				return false
 			case errors.Is(err, ErrOutcomeUnknown):
 				outcomeUnknown.Add(1)
-				return true
-			case !db.IsAmbiguous(err) && errors.Is(err, context.DeadlineExceeded):
+			case errors.Is(err, context.DeadlineExceeded):
 				queueTimeouts.Add(1)
-				return true
 			}
-			t.Errorf("%s: unexpected error %v", op, err)
-			return false
+			return true
 		}
 		noResurrection := func(op string, r *schema.Row, start int64) {
 			if v, ok := deleted.Load(r.Gen); ok && v.(int64) <= start {
 				t.Errorf("%s returned gen %d, deleted before it started (NoResurrection)", op, r.Gen)
 			}
-		}
-		opCtx := func(shortPercent int) (context.Context, context.CancelFunc) {
-			if rand.IntN(100) < shortPercent {
-				return context.WithTimeout(context.Background(), 5*time.Millisecond)
-			}
-			return context.WithTimeout(context.Background(), 5*time.Second) // L1 EventuallyResponds
 		}
 
 		stop := startFlusher(s)
@@ -411,14 +324,8 @@ func TestStressCreateDelete(t *testing.T) {
 		wg.Wait()
 
 		// Faults stop: everything must settle.
-		faults.Store(false)
-		close(flipping)
-		<-flipped
-		for _, k := range ks {
-			d.SetCrossRow(k, false)
-		}
+		f.stop()
 		s.inflight.Wait() // L2 BackgroundSettles
-		lateExecs.Wait()
 		stop()
 		drain(t, s)
 		checkInvariants(t, s, d)
@@ -458,15 +365,10 @@ func TestStressCreateDelete(t *testing.T) {
 			"late statements": int64(st.Late), "effective late statements": int64(st.LateEffective),
 			"gen claimed": int64(st.GenClaimed), "cross-row rejections": int64(st.CrossRow), "fenced sessions": int64(st.Fenced),
 			"deletes": seq.Load(), "re-creates": recreates.Load(), "unknown outcomes": outcomeUnknown.Load(),
-			"queue timeouts": queueTimeouts.Load(), "not executed after ambiguous": ambThenNotExecuted.Load(),
-			"not executed after a fence": notExecutedAfterFence.Load(), "late inserts of a deleted gen": lateInsertOfDeleted.Load(),
-			"retries finding the gen claimed": retryFindsOtherLife.Load(),
+			"queue timeouts": queueTimeouts.Load(), "not executed after ambiguous": f.ambThenNotExecuted.Load(),
+			"not executed after a fence": f.notExecutedAfterFence.Load(), "late inserts of a deleted gen": f.lateInsertOfDeleted.Load(),
+			"retries finding the gen claimed": f.retryFindsOtherLife.Load(),
 		}
-		for name, n := range counters {
-			if n == 0 {
-				t.Errorf("non-vacuity: no %s", name)
-			}
-		}
-		t.Logf("%+v", counters)
+		nonVacuous(t, counters)
 	})
 }
