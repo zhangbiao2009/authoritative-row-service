@@ -18,9 +18,9 @@ func TestSelect(t *testing.T) {
 	if _, err := d.Select(ctx, "k"); !errors.Is(err, db.ErrNoRows) {
 		t.Fatalf("Select of missing key: err = %v, want ErrNoRows", err)
 	}
-	d.Put(&schema.Row{Key: "k", Gen: 5, Ver: 2, Vals: []any{int64(1), "a"}})
-	r, err := d.Select(ctx, "k")
 	want := &schema.Row{Key: "k", Gen: 5, Ver: 2, Vals: []any{int64(1), "a"}}
+	d.Put(want)
+	r, err := d.Select(ctx, "k")
 	if err != nil || !reflect.DeepEqual(r, want) {
 		t.Fatalf("Select = %+v, %v; want %+v", r, err, want)
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -22,23 +21,17 @@ func TestConcurrentMissesSelectOnce(t *testing.T) {
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
-		errs := make(chan error, 32)
 		var wg sync.WaitGroup
 		for range 32 {
 			wg.Go(func() {
-				_, err := s.Get(context.Background(), k)
-				errs <- err
+				if _, err := s.Get(context.Background(), k); err != nil {
+					t.Error(err)
+				}
 			})
 		}
 		synctest.Wait() // one Get is inside Select, the rest wait for op
 		close(release)
 		wg.Wait()
-		close(errs)
-		for err := range errs {
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
 		if n := d.Selects(); n != 1 {
 			t.Fatalf("Selects = %d, want 1", n)
 		}
@@ -49,21 +42,14 @@ func TestLoadErrorIsCachedForLoadErrTTL(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
 		boom := errors.New("boom")
-		var fail atomic.Bool
-		fail.Store(true)
-		d.SelectHook = func(context.Context, schema.Key) error {
-			if fail.Load() {
-				return boom
-			}
-			return nil
-		}
+		d.SelectHook = func(context.Context, schema.Key) error { return boom }
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
 		if _, err := s.Get(context.Background(), k); !errors.Is(err, boom) {
 			t.Fatalf("first Get: err = %v, want boom", err)
 		}
-		fail.Store(false)
+		d.SelectHook = nil // the DB is fine again; a second Get must still get the cached error
 		if _, err := s.Get(context.Background(), k); !errors.Is(err, boom) {
 			t.Fatalf("Get within LoadErrTTL: err = %v, want the cached boom", err)
 		}
@@ -87,15 +73,8 @@ func TestCancelledLoadIsNotCached(t *testing.T) {
 	k := key(t, s, 1)
 	d.Put(testRow(k, 1))
 	ctx, cancel := context.WithCancel(context.Background())
-	var first atomic.Bool
-	first.Store(true)
-	d.SelectHook = func(ctx context.Context, _ schema.Key) error {
-		if first.Swap(false) {
-			cancel()
-			return ctx.Err()
-		}
-		return nil
-	}
+	// The caller gives up while Select runs; Select then returns the context error.
+	d.SelectHook = func(context.Context, schema.Key) error { cancel(); return nil }
 	if _, err := s.Get(ctx, k); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}

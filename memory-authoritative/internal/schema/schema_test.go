@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -76,15 +77,15 @@ func TestEncodeKeyRejects(t *testing.T) {
 		"int4 overflow":  {int64(1) << 31},
 		"int4 underflow": {-(int64(1) << 31) - 1},
 	} {
-		if k, err := s.EncodeKey(pk); err == nil {
-			t.Errorf("%s: EncodeKey(%v) = %q, want error", name, pk, k)
+		if k, err := s.EncodeKey(pk); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: EncodeKey(%v) = %q, %v; want ErrInvalid", name, pk, k, err)
 		}
 	}
-	if k, err := oneCol(t, Int2).EncodeKey([]any{int64(32768)}); err == nil {
-		t.Errorf("int2 overflow: got %q, want error", k)
+	if k, err := oneCol(t, Int2).EncodeKey([]any{int64(32768)}); !errors.Is(err, ErrInvalid) {
+		t.Errorf("int2 overflow: got %q, %v; want ErrInvalid", k, err)
 	}
-	if k, err := oneCol(t, UUID).EncodeKey([]any{[]byte("0123456789abcdef")}); err == nil {
-		t.Errorf("uuid as []byte: got %q, want error", k)
+	if k, err := oneCol(t, UUID).EncodeKey([]any{[]byte("0123456789abcdef")}); !errors.Is(err, ErrInvalid) {
+		t.Errorf("uuid as []byte: got %q, %v; want ErrInvalid", k, err)
 	}
 }
 

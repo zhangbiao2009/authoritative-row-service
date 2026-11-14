@@ -4,10 +4,15 @@ package schema
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"slices"
 )
+
+// ErrInvalid wraps every error about a value supplied by a caller (design.md 5.2). It lives here
+// rather than in store because store imports schema.
+var ErrInvalid = errors.New("invalid argument")
 
 // Key is the canonical encoding of a primary key. It is the map key and the shard hash input, and it
 // is stored in the dedup table (5.1), so the encoding must never change once live.
@@ -71,7 +76,7 @@ func New(table string, cols []Column, pk []int) (*Schema, error) {
 // big-endian uint32, so that bytes cannot shift from one column to the next.
 func (s *Schema) EncodeKey(pk []any) (Key, error) {
 	if len(pk) != len(s.PK) {
-		return "", fmt.Errorf("table %s: %d primary key values, want %d", s.Table, len(pk), len(s.PK))
+		return "", fmt.Errorf("%w: table %s: %d primary key values, want %d", ErrInvalid, s.Table, len(pk), len(s.PK))
 	}
 	if len(pk) == 1 {
 		b, err := s.encodeCol(nil, s.PK[0], pk[0])
@@ -91,20 +96,18 @@ func (s *Schema) EncodeKey(pk []any) (Key, error) {
 }
 
 // encodeCol appends the encoding of value v of column col to b: integers as 8-byte big-endian, text
-// as its UTF-8 bytes, a UUID as its 16 bytes.
+// as its UTF-8 bytes, a UUID as its 16 bytes. New has already refused any other column type.
 func (s *Schema) encodeCol(b []byte, col int, v any) ([]byte, error) {
 	c := s.Cols[col]
 	switch c.Type {
 	case Int2, Int4, Int8:
-		n, ok := v.(int64)
-		if !ok {
-			break
+		if n, ok := v.(int64); ok {
+			if c.Type == Int2 && (n < math.MinInt16 || n > math.MaxInt16) ||
+				c.Type == Int4 && (n < math.MinInt32 || n > math.MaxInt32) {
+				return nil, fmt.Errorf("%w: table %s: column %s: %d out of range", ErrInvalid, s.Table, c.Name, n)
+			}
+			return binary.BigEndian.AppendUint64(b, uint64(n)), nil
 		}
-		if c.Type == Int2 && (n < math.MinInt16 || n > math.MaxInt16) ||
-			c.Type == Int4 && (n < math.MinInt32 || n > math.MaxInt32) {
-			return nil, fmt.Errorf("table %s: column %s: %d out of range", s.Table, c.Name, n)
-		}
-		return binary.BigEndian.AppendUint64(b, uint64(n)), nil
 	case Text:
 		if str, ok := v.(string); ok {
 			return append(b, str...), nil
@@ -113,8 +116,6 @@ func (s *Schema) encodeCol(b []byte, col int, v any) ([]byte, error) {
 		if u, ok := v.([16]byte); ok {
 			return append(b, u[:]...), nil
 		}
-	default:
-		return nil, fmt.Errorf("table %s: column %s: type %d cannot be a primary key", s.Table, c.Name, c.Type)
 	}
-	return nil, fmt.Errorf("table %s: column %s: unexpected Go type %T", s.Table, c.Name, v)
+	return nil, fmt.Errorf("%w: table %s: column %s: unexpected Go type %T", ErrInvalid, s.Table, c.Name, v)
 }
