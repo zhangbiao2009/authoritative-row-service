@@ -28,7 +28,8 @@ type Row struct {
 	Vals []any
 }
 
-// Type is a column type. Go values: Int2, Int4, Int8 hold int64; Text holds string; UUID holds [16]byte.
+// Type is a column type. Go values: Int2, Int4, Int8 hold int64; Text holds string; UUID holds [16]byte;
+// Float4, Float8 hold float64.
 type Type uint8
 
 const (
@@ -37,7 +38,18 @@ const (
 	Int8
 	Text
 	UUID
+	Float4
+	Float8
 )
+
+// ColBit returns column i's bit in a dirty-column mask (design.md 5.2): bit i for i < 63, and bit 63 for
+// every column from 63 on, so a table may have any number of columns; a flush then writes all of those.
+func ColBit(i int) uint64 {
+	if i >= 63 {
+		return 1 << 63
+	}
+	return 1 << uint(i)
+}
 
 type Column struct {
 	Name string
@@ -118,4 +130,44 @@ func (s *Schema) encodeCol(b []byte, col int, v any) ([]byte, error) {
 		}
 	}
 	return nil, fmt.Errorf("%w: table %s: column %s: unexpected Go type %T", ErrInvalid, s.Table, c.Name, v)
+}
+
+// Add returns old + delta for column col: an increment (design.md 7.3). Integer columns take an int64
+// delta, float columns a float64 delta. A NULL old value, a column type without increment, a delta of the
+// wrong Go type, or a result out of the column type's range is ErrInvalid. A Float4 result is rounded to
+// float32 precision, the value PG stores. Pure computation: it is called with mu held (design.md 6.4).
+func (s *Schema) Add(col int, old, delta any) (any, error) {
+	c := s.Cols[col]
+	switch c.Type {
+	case Int2, Int4, Int8:
+		o, ok1 := old.(int64)
+		d, ok2 := delta.(int64)
+		if ok1 && ok2 {
+			hi := int64(math.MaxInt64)
+			switch c.Type {
+			case Int2:
+				hi = math.MaxInt16
+			case Int4:
+				hi = math.MaxInt32
+			}
+			if d > 0 && o > hi-d || d < 0 && o < -hi-1-d {
+				return nil, fmt.Errorf("%w: table %s: column %s: %d + %d out of range", ErrInvalid, s.Table, c.Name, o, d)
+			}
+			return o + d, nil
+		}
+	case Float4, Float8:
+		o, ok1 := old.(float64)
+		d, ok2 := delta.(float64)
+		if ok1 && ok2 {
+			v := o + d
+			if math.IsInf(v, 0) || math.IsNaN(v) || c.Type == Float4 && math.Abs(v) > math.MaxFloat32 {
+				return nil, fmt.Errorf("%w: table %s: column %s: %g + %g out of range", ErrInvalid, s.Table, c.Name, o, d)
+			}
+			if c.Type == Float4 {
+				v = float64(float32(v))
+			}
+			return v, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: table %s: column %s: cannot add %T to %#v", ErrInvalid, s.Table, c.Name, delta, old)
 }

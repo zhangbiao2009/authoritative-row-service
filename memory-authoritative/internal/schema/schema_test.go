@@ -2,6 +2,7 @@ package schema
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"testing"
 )
@@ -104,5 +105,100 @@ func TestNewRejects(t *testing.T) {
 	// design.md 5.3: a table whose primary key type is not supported is refused when it is loaded.
 	if _, err := New("t", []Column{{Name: "id"}}, []int{0}); err == nil {
 		t.Error("New accepted a primary key column of type 0")
+	}
+	if _, err := New("t", []Column{{Name: "f", Type: Float8}}, []int{0}); err == nil {
+		t.Error("New accepted a float primary key column")
+	}
+}
+
+// floatCol returns a schema whose column 0 is a column of type typ; column 1 is the primary key.
+func floatCol(t *testing.T, typ Type) *Schema {
+	t.Helper()
+	s, err := New("t", []Column{{Name: "f", Type: typ}, {Name: "id", Type: Int8}}, []int{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestColBit(t *testing.T) {
+	for i, want := range map[int]uint64{0: 1, 1: 2, 62: 1 << 62, 63: 1 << 63, 64: 1 << 63, 200: 1 << 63} {
+		if got := ColBit(i); got != want {
+			t.Errorf("ColBit(%d) = %#x, want %#x", i, got, want)
+		}
+	}
+}
+
+func TestAddInt(t *testing.T) {
+	cases := []struct {
+		typ        Type
+		old, delta int64
+		want       int64
+		ok         bool
+	}{
+		{Int8, 10, 5, 15, true},
+		{Int8, 10, -15, -5, true},
+		{Int8, math.MaxInt64, 1, 0, false},
+		{Int8, math.MinInt64, -1, 0, false},
+		{Int4, math.MaxInt32 - 1, 1, math.MaxInt32, true},
+		{Int4, math.MaxInt32, 1, 0, false},
+		{Int4, math.MinInt32, -1, 0, false},
+		{Int2, math.MaxInt16, 1, 0, false},
+		{Int2, math.MinInt16, -1, 0, false},
+	}
+	for _, c := range cases {
+		got, err := oneCol(t, c.typ).Add(0, c.old, c.delta)
+		if c.ok && (err != nil || got != c.want) {
+			t.Errorf("type %d: Add(%d, %d) = %v, %v; want %d", c.typ, c.old, c.delta, got, err, c.want)
+		}
+		if !c.ok && !errors.Is(err, ErrInvalid) {
+			t.Errorf("type %d: Add(%d, %d) = %v, %v; want ErrInvalid", c.typ, c.old, c.delta, got, err)
+		}
+	}
+}
+
+func TestAddFloat(t *testing.T) {
+	if got, err := floatCol(t, Float8).Add(0, 1.5, 0.25); err != nil || got != 1.75 {
+		t.Errorf("float8 Add = %v, %v; want 1.75", got, err)
+	}
+	// float4 rounds to float32 precision, as PG stores it
+	got, err := floatCol(t, Float4).Add(0, 0.0, 0.1)
+	if want := float64(float32(0.1)); err != nil || got != want {
+		t.Errorf("float4 Add = %v, %v; want %v", got, err, want)
+	}
+	for name, c := range map[string]struct {
+		typ        Type
+		old, delta float64
+	}{
+		"float8 overflow": {Float8, math.MaxFloat64, math.MaxFloat64},
+		"float8 NaN":      {Float8, 1, math.NaN()},
+		"float4 overflow": {Float4, math.MaxFloat32, math.MaxFloat32},
+	} {
+		if got, err := floatCol(t, c.typ).Add(0, c.old, c.delta); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: Add = %v, %v; want ErrInvalid", name, got, err)
+		}
+	}
+}
+
+func TestAddRejects(t *testing.T) {
+	// columns: 0 id int8 (pk), 1 n int4, 2 f float8, 3 s text
+	s, err := New("t", []Column{{"id", Int8}, {"n", Int4}, {"f", Float8}, {"s", Text}}, []int{0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]struct {
+		col        int
+		old, delta any
+	}{
+		"old NULL":             {1, nil, int64(1)},
+		"text column":          {3, "a", int64(1)},
+		"float delta on int":   {1, int64(1), 1.0},
+		"int delta on float":   {2, 1.0, int64(1)},
+		"go int delta":         {1, int64(1), 1},
+		"old of wrong Go type": {1, "1", int64(1)},
+	} {
+		if got, err := s.Add(c.col, c.old, c.delta); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: Add = %v, %v; want ErrInvalid", name, got, err)
+		}
 	}
 }
