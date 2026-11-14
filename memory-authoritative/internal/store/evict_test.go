@@ -270,9 +270,9 @@ func TestIdleEntryEvicted(t *testing.T) {
 		if entryOf(s, k) == nil {
 			t.Fatal("evicted 9s after its last access")
 		}
-		time.Sleep(3 * time.Second)
+		time.Sleep(5 * time.Second) // seconds granularity, up to 1s of clock lag, and one EvictInterval
 		if entryOf(s, k) != nil {
-			t.Fatal("not evicted 12s after its last access")
+			t.Fatal("not evicted 14s after its last access")
 		}
 		loaded(t, s, d, k) // a miss reloads it
 	})
@@ -355,24 +355,23 @@ func TestDirtyEntryNotEvicted(t *testing.T) {
 
 // The eligible re-check (gap evict-sample): an entry accessed after the sweep chose it is kept.
 func TestSampledEntryAccessedAgainIsKept(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		d := fakedb.New()
-		s := newTestStore(t, d, ttls(time.Second, time.Second))
-		k := key(t, s, 1)
-		loaded(t, s, d, k)
-		fired := make(chan struct{})
-		at(s, "evict-sample", func(*entry) {
-			s.Get(context.Background(), k) // the access comes between the sample and tryEvict
-			close(fired)
-		})
-		time.Sleep(5 * time.Second) // idle long enough to be chosen
-		defer runEvictor(s)()
-		<-fired
-		synctest.Wait() // that round is over
-		if entryOf(s, k) == nil {
-			t.Fatal("evicted although it was accessed after the sweep chose it")
-		}
+	d := fakedb.New()
+	s := newTestStore(t, d, ttls(time.Second, time.Second))
+	k := key(t, s, 1)
+	loaded(t, s, d, k)
+	s.nowSec.Add(5) // idle long enough to be chosen
+	fired := false
+	at(s, "evict-sample", func(*entry) {
+		s.Get(context.Background(), k) // the access comes between the sample and tryEvict
+		fired = true
 	})
+	s.idleSweepShard(s.shardFor(k))
+	if !fired {
+		t.Fatal("the sweep did not reach evict-sample")
+	}
+	if entryOf(s, k) == nil {
+		t.Fatal("evicted although it was accessed after the sweep chose it")
+	}
 }
 
 func TestCapacityEvictsOldestFirst(t *testing.T) {

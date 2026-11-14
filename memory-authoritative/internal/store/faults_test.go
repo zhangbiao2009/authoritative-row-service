@@ -110,9 +110,11 @@ func (f *faults) stop() {
 	f.late.Wait()
 }
 
-// evictHard makes eviction interleave with everything: every entry not accessed during the current second
-// is evicted, checked every 1ms (M5 plan, decision 7).
-func evictHard(c *Config) { c.IdleTTL, c.NegativeIdleTTL, c.EvictInterval = 0, 0, time.Millisecond }
+// evictHard makes eviction interleave with everything, every 1ms: the idle sweep evicts every entry not
+// accessed during the current second, and capacity eviction keeps at most 2 entries (M5 plan, decision 7).
+func evictHard(c *Config) {
+	c.IdleTTL, c.NegativeIdleTTL, c.EvictInterval, c.MaxEntries = 0, 0, time.Millisecond, 2
+}
 
 // think waits 0-20ms of virtual time, so that many second boundaries pass during a run.
 func think() { time.Sleep(time.Duration(rand.IntN(20)) * time.Millisecond) }

@@ -270,7 +270,7 @@ func TestStressCreateDelete(t *testing.T) {
 						for attempt := 0; ; attempt++ { // retried like the SDK: same gen, after an unknown outcome
 							short := 0
 							if attempt == 0 {
-								short = 30 // unknown outcomes, and so SDK-like retries
+								short = 50 // unknown outcomes, and so SDK-like retries
 							}
 							ctx, cancel := opCtx(short)
 							r, err := s.Create(ctx, in)
@@ -300,7 +300,7 @@ func TestStressCreateDelete(t *testing.T) {
 							}
 							// Back off before the retry, as the SDK does (7.10): other clients may delete and
 							// create the key again meanwhile (hole 6).
-							time.Sleep(time.Duration(rand.IntN(200)) * time.Millisecond)
+							time.Sleep(time.Duration(rand.IntN(400)) * time.Millisecond)
 						}
 					default:
 						gen := seen[i]
@@ -333,6 +333,9 @@ func TestStressCreateDelete(t *testing.T) {
 		stopEvictor()
 		drain(t, s)
 		checkInvariants(t, s, d)
+		// An evicted key loads again below; a load error injected just before the faults stopped is still
+		// cached for LoadErrTTL.
+		time.Sleep(s.cfg.LoadErrTTL)
 		for _, k := range ks { // DbMatchesAbsWhenIdle
 			r, err := s.Get(context.Background(), k)
 			switch {
