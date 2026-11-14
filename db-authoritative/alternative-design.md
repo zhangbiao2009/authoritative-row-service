@@ -11,6 +11,8 @@ created: 2026-11-13
 >
 > **Where things are.** Each design has its own directory, so that both can be implemented and compared: this one is `db-authoritative/`; the other is [`memory-authoritative/`](../memory-authoritative/), which holds `design.md`, `correctness-properties.md` and the TLA+ model in `tla/`. Section, invariant and hole numbers below refer to those documents.
 >
+> **Implementation design.** This sketch has been turned into [design.md](design.md), which is the document to implement from and which records the decisions taken on 2026-11-14 (its 13.1). Where the two differ, design.md wins.
+>
 > **Status of the alternative: a sketch with a checked model.** Its concurrency protocol is modeled in TLA+ and checked with TLC (`tla/`, section 11); writing the model settled several points the first sketch left open, and they are now in section 3.2. It has no benchmark: every throughput or latency figure below is an estimate to be replaced by the measurement in section 8.
 
 ---
