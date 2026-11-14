@@ -73,10 +73,12 @@ func TestStressUpdates(t *testing.T) {
 	var sums [keys]atomic.Int64 // acknowledged increments per key
 	var failed, late atomic.Int64
 	var lateExecs sync.WaitGroup
-	d.UpdateHook = func(_ context.Context, _ schema.Key, exec func()) error {
+	d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
+		if st.Kind != fakedb.Update {
+			return nil
+		}
 		switch n := rand.IntN(10); {
 		case n < 7:
-			exec()
 			return nil
 		case n < 9:
 			failed.Add(1)
@@ -85,9 +87,9 @@ func TestStressUpdates(t *testing.T) {
 			late.Add(1)
 			lateExecs.Go(func() {
 				time.Sleep(time.Duration(rand.IntN(2000)) * time.Microsecond)
-				exec()
+				st.Exec()
 			})
-			return context.DeadlineExceeded
+			return fakedb.Ambiguous(st, context.DeadlineExceeded)
 		}
 	}
 	stop := startFlusher(s)
@@ -120,7 +122,7 @@ func TestStressUpdates(t *testing.T) {
 	wg.Wait()
 	stop()
 	lateExecs.Wait()
-	d.UpdateHook = nil
+	d.Hook = nil
 	drain(t, s)
 	checkInvariants(t, s, d)
 	for i, k := range ks {

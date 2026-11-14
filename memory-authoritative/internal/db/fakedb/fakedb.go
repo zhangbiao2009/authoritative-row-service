@@ -1,5 +1,5 @@
-// Package fakedb is an in-memory db.DB for tests (design.md 12.1). UpdateHook injects failed and late
-// writes; the rest of fault injection comes in M3.
+// Package fakedb is an in-memory db.DB for tests (design.md 12.1). Hook sees every statement and injects
+// faults: a statement can execute now, later or never, and its caller can be told anything.
 package fakedb
 
 import (
@@ -13,19 +13,42 @@ import (
 	"rowsvc/internal/schema"
 )
 
+type Kind uint8
+
+const (
+	Select Kind = iota
+	Insert
+	Update
+	Delete
+	GenClaimed
+	Fence
+)
+
+// Stmt is one statement, as the hook sees it.
+type Stmt struct {
+	Kind     Kind
+	Key      schema.Key     // not set for Fence
+	Gen, Ver int64          // Gen: Insert, Update, Delete, GenClaimed; Ver: Update
+	Session  db.SessionID   // a new session per statement
+	Sessions []db.SessionID // Fence: the sessions to terminate
+	Exec     func()         // executes the statement; at most once (a second call does nothing)
+}
+
+// Ambiguous returns the error of a statement whose outcome the caller cannot know.
+func Ambiguous(st *Stmt, err error) error { return &db.AmbiguousError{Session: st.Session, Err: err} }
+
 type DB struct {
-	// SelectHook, if set, runs at the start of every Select, without the DB's lock held. A non-nil
-	// result is returned instead of reading. Set it before concurrent use.
-	SelectHook func(ctx context.Context, key schema.Key) error
+	// Hook, if set, runs for every statement before it executes, without the DB's lock held.
+	//   - nil: the statement executes (Exec is called now unless the hook already called it) and its own
+	//     result is returned.
+	//   - an error: that error is returned. The statement executes only if and when the hook calls Exec:
+	//     now (executed, response lost), later from any goroutine (late), or never.
+	// Set it before concurrent use.
+	Hook func(ctx context.Context, st *Stmt) error
 
-	// UpdateHook, if set, decides what happens to each Update. exec applies the statement to the stored
-	// rows; call it at most once, at any time, from any goroutine. Calling it after returning is a late
-	// statement: one that timed out for the caller and executed afterwards. Update returns what the hook
-	// returns. It runs without the DB's lock held. Set it before concurrent use.
-	UpdateHook func(ctx context.Context, key schema.Key, exec func()) error
-
-	selects atomic.Int64
-	updates atomic.Int64
+	selects  atomic.Int64
+	updates  atomic.Int64
+	sessions atomic.Uint64
 
 	mu        sync.Mutex
 	rows      map[schema.Key]*schema.Row
@@ -76,24 +99,45 @@ func (d *DB) violateLocked(format string, args ...any) {
 	}
 }
 
+// run sends st: it gives it a session and an Exec that runs execLocked once, with d.mu held, and then
+// lets the hook decide. Without a hook, a statement whose ctx is done is not executed.
+func (d *DB) run(ctx context.Context, st *Stmt, execLocked func()) error {
+	st.Session = db.SessionID(d.sessions.Add(1))
+	var once sync.Once
+	st.Exec = func() {
+		once.Do(func() {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			execLocked()
+		})
+	}
+	if d.Hook != nil {
+		if err := d.Hook(ctx, st); err != nil {
+			return err
+		}
+	} else if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %w", db.ErrNotExecuted, err)
+	}
+	st.Exec()
+	return nil
+}
+
 // Select returns a copy of the stored row, so neither side can change the other's.
 func (d *DB) Select(ctx context.Context, key schema.Key) (*schema.Row, error) {
 	d.selects.Add(1)
-	if d.SelectHook != nil {
-		if err := d.SelectHook(ctx, key); err != nil {
-			return nil, err
+	var r *schema.Row
+	err := d.run(ctx, &Stmt{Kind: Select, Key: key}, func() {
+		if cur, ok := d.rows[key]; ok {
+			r = clone(cur)
 		}
-	}
-	if err := ctx.Err(); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	r, ok := d.rows[key]
-	if !ok {
+	if r == nil {
 		return nil, db.ErrNoRows
 	}
-	return clone(r), nil
+	return r, nil
 }
 
 func (d *DB) Update(ctx context.Context, r *schema.Row, mask uint64) error {
@@ -108,21 +152,12 @@ func (d *DB) Update(ctx context.Context, r *schema.Row, mask uint64) error {
 		d.writing[r.Key]--
 		d.mu.Unlock()
 	}()
-	exec := func() { d.apply(r, mask) }
-	if d.UpdateHook != nil {
-		return d.UpdateHook(ctx, r.Key, exec)
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	exec()
-	return nil
+	return d.run(ctx, &Stmt{Kind: Update, Key: r.Key, Gen: r.Gen, Ver: r.Ver}, func() { d.applyLocked(r, mask) })
 }
 
-// apply executes UPDATE SET <columns in mask>, ver = r.Ver WHERE key = r.Key AND gen = r.Gen AND ver < r.Ver.
-func (d *DB) apply(r *schema.Row, mask uint64) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+// applyLocked executes UPDATE SET <columns in mask>, ver = r.Ver WHERE key = r.Key AND gen = r.Gen AND
+// ver < r.Ver.
+func (d *DB) applyLocked(r *schema.Row, mask uint64) {
 	cur, ok := d.rows[r.Key]
 	if !ok || cur.Gen != r.Gen || cur.Ver >= r.Ver {
 		return // 0 rows

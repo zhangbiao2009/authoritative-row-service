@@ -3,6 +3,7 @@ package fakedb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -38,12 +39,58 @@ func TestSelectHook(t *testing.T) {
 	d := New()
 	d.Put(&schema.Row{Key: "k", Gen: 1})
 	boom := errors.New("boom")
-	d.SelectHook = func(context.Context, schema.Key) error { return boom }
+	d.Hook = func(context.Context, *Stmt) error { return boom }
 	if _, err := d.Select(context.Background(), "k"); !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want boom", err)
 	}
 	if n := d.Selects(); n != 1 {
 		t.Fatalf("Selects = %d, want 1", n)
+	}
+}
+
+func TestHookSeesEveryStatement(t *testing.T) {
+	d := New()
+	d.Put(&schema.Row{Key: "k", Gen: 5, Ver: 2, Vals: []any{int64(0)}})
+	var seen []Stmt
+	d.Hook = func(_ context.Context, st *Stmt) error {
+		seen = append(seen, Stmt{Kind: st.Kind, Key: st.Key, Gen: st.Gen, Ver: st.Ver, Session: st.Session})
+		return nil
+	}
+	ctx := context.Background()
+	if r, err := d.Select(ctx, "k"); err != nil || r.Ver != 2 {
+		t.Fatalf("Select = %+v, %v", r, err)
+	}
+	if err := d.Update(ctx, &schema.Row{Key: "k", Gen: 5, Ver: 3, Vals: []any{int64(9)}}, 1); err != nil || d.Row("k").Ver != 3 {
+		t.Fatalf("Update: err %v, row %+v", err, d.Row("k"))
+	}
+	if len(seen) != 2 {
+		t.Fatalf("seen %+v, want 2 statements", seen)
+	}
+	s1, s2 := seen[0].Session, seen[1].Session
+	want := []Stmt{{Kind: Select, Key: "k", Session: s1}, {Kind: Update, Key: "k", Gen: 5, Ver: 3, Session: s2}}
+	if !reflect.DeepEqual(seen, want) || s1 == 0 || s2 == 0 || s1 == s2 {
+		t.Fatalf("seen %+v, want %+v with distinct non-zero sessions", seen, want)
+	}
+}
+
+func TestHookErrorWithoutExecDoesNotExecute(t *testing.T) {
+	d := New()
+	d.Put(&schema.Row{Key: "k", Gen: 1, Ver: 1, Vals: []any{int64(0)}})
+	d.Hook = func(context.Context, *Stmt) error { return fmt.Errorf("%w", db.ErrNotExecuted) }
+	err := d.Update(context.Background(), &schema.Row{Key: "k", Gen: 1, Ver: 2, Vals: []any{int64(7)}}, 1)
+	if !errors.Is(err, db.ErrNotExecuted) || d.Row("k").Ver != 1 {
+		t.Fatalf("err %v, row %+v; want ErrNotExecuted and the row unchanged", err, d.Row("k"))
+	}
+}
+
+func TestNoHookCancelledCtxIsNotExecuted(t *testing.T) {
+	d := New()
+	d.Put(&schema.Row{Key: "k", Gen: 1, Ver: 1, Vals: []any{int64(0)}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := d.Update(ctx, &schema.Row{Key: "k", Gen: 1, Ver: 2, Vals: []any{int64(7)}}, 1)
+	if !db.NotExecuted(err) || !errors.Is(err, context.Canceled) || d.Row("k").Ver != 1 {
+		t.Fatalf("err %v, row %+v; want not executed, Canceled, the row unchanged", err, d.Row("k"))
 	}
 }
 
@@ -83,13 +130,13 @@ func TestUpdateHookLateExec(t *testing.T) {
 	d := New()
 	d.Put(&schema.Row{Key: "k", Gen: 1, Ver: 1, Vals: []any{int64(0)}})
 	var late func()
-	d.UpdateHook = func(_ context.Context, _ schema.Key, exec func()) error {
-		late = exec
-		return context.DeadlineExceeded
+	d.Hook = func(_ context.Context, st *Stmt) error {
+		late = st.Exec
+		return Ambiguous(st, context.DeadlineExceeded)
 	}
 	err := d.Update(context.Background(), &schema.Row{Key: "k", Gen: 1, Ver: 2, Vals: []any{int64(7)}}, 1)
-	if !errors.Is(err, context.DeadlineExceeded) || d.Row("k").Ver != 1 {
-		t.Fatalf("err %v, ver %d; want DeadlineExceeded and the row unchanged", err, d.Row("k").Ver)
+	if !db.IsAmbiguous(err) || !errors.Is(err, context.DeadlineExceeded) || d.Row("k").Ver != 1 {
+		t.Fatalf("err %v, ver %d; want an ambiguous DeadlineExceeded and the row unchanged", err, d.Row("k").Ver)
 	}
 	late()
 	if r := d.Row("k"); r.Ver != 2 || r.Vals[0] != int64(7) {
@@ -101,10 +148,10 @@ func TestOneWriterPerKeyIsAsserted(t *testing.T) {
 	d := New()
 	d.Put(&schema.Row{Key: "k", Gen: 1, Ver: 1, Vals: []any{int64(0)}})
 	entered, release := make(chan struct{}), make(chan struct{})
-	d.UpdateHook = func(_ context.Context, _ schema.Key, exec func()) error {
+	d.Hook = func(_ context.Context, st *Stmt) error {
 		entered <- struct{}{}
 		<-release
-		exec()
+		st.Exec()
 		return nil
 	}
 	var wg sync.WaitGroup

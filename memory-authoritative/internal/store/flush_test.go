@@ -53,13 +53,13 @@ func TestFlushFailureKeepsColumnsDirty(t *testing.T) {
 	d.Put(testRow(k, 1))
 	update(t, s, k, incr(2, 5))
 	boom := errors.New("boom")
-	d.UpdateHook = func(context.Context, schema.Key, func()) error { return boom }
+	d.Hook = func(context.Context, *fakedb.Stmt) error { return boom }
 	flushAll(s)
 	if got, want := bookkeeping(s, k), "dirty 0x4 queued true queue 1 dirtyCount 1"; got != want {
 		t.Fatalf("after a failed flush: %s, want %s", got, want)
 	}
 	dbMatches(t, d, testRow(k, 1))
-	d.UpdateHook = nil
+	d.Hook = nil
 	r := update(t, s, k, set(1, "b"))
 	flushAll(s)
 	dbMatches(t, d, r) // name "b" and score 15
@@ -95,12 +95,12 @@ func TestLateFlushDoesNotOverwriteNewer(t *testing.T) {
 	d.Put(testRow(k, 1))
 	update(t, s, k, incr(2, 1)) // Ver 4
 	var late func()
-	d.UpdateHook = func(_ context.Context, _ schema.Key, exec func()) error {
-		late = exec
-		return context.DeadlineExceeded
+	d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
+		late = st.Exec
+		return fakedb.Ambiguous(st, context.DeadlineExceeded)
 	}
 	flushAll(s)
-	d.UpdateHook = nil
+	d.Hook = nil
 	r := update(t, s, k, incr(2, 1)) // Ver 5, score 12
 	flushAll(s)
 	dbMatches(t, d, r)
@@ -117,7 +117,7 @@ func TestUpdateNotBlockedByHangingFlush(t *testing.T) {
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
 		update(t, s, k, incr(2, 1))
-		d.UpdateHook = hang
+		d.Hook = hang
 		var wg sync.WaitGroup
 		wg.Go(func() { flushAll(s) })
 		synctest.Wait() // the flush holds op and waits for the DB
@@ -133,7 +133,7 @@ func TestUpdateNotBlockedByHangingFlush(t *testing.T) {
 		if got, want := bookkeeping(s, k), "dirty 0x4 queued true queue 1 dirtyCount 1"; got != want {
 			t.Fatalf("after a timed-out flush: %s, want %s", got, want)
 		}
-		d.UpdateHook = nil
+		d.Hook = nil
 		flushAll(s)
 		dbMatches(t, d, r)
 		checkInvariants(t, s, d)
@@ -149,7 +149,7 @@ func TestSecondFlushWaitsForFirstWrite(t *testing.T) {
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
 		update(t, s, k, incr(2, 1))
-		d.UpdateHook = hang
+		d.Hook = hang
 		var wg sync.WaitGroup
 		wg.Go(func() { flushAll(s) })
 		synctest.Wait()                  // the first write is in progress
@@ -163,7 +163,7 @@ func TestSecondFlushWaitsForFirstWrite(t *testing.T) {
 		if got, want := bookkeeping(s, k), "dirty 0x4 queued true queue 1 dirtyCount 1"; got != want {
 			t.Fatalf("after both rounds: %s, want %s", got, want)
 		}
-		d.UpdateHook = nil
+		d.Hook = nil
 		flushAll(s)
 		dbMatches(t, d, r)
 		checkInvariants(t, s, d)
@@ -179,9 +179,8 @@ func TestUpdateDuringFlushIsWrittenNext(t *testing.T) {
 		d.Put(testRow(k, 1))
 		update(t, s, k, set(1, "x"))
 		release := make(chan struct{})
-		d.UpdateHook = func(_ context.Context, _ schema.Key, exec func()) error {
+		d.Hook = func(context.Context, *fakedb.Stmt) error {
 			<-release
-			exec()
 			return nil
 		}
 		var wg sync.WaitGroup
@@ -193,7 +192,7 @@ func TestUpdateDuringFlushIsWrittenNext(t *testing.T) {
 		}
 		close(release)
 		wg.Wait()
-		d.UpdateHook = nil
+		d.Hook = nil
 		flushAll(s)
 		dbMatches(t, d, r)
 		checkInvariants(t, s, d)

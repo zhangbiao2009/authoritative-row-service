@@ -64,10 +64,13 @@ func dbMatches(t *testing.T, d *fakedb.DB, want *schema.Row) {
 	}
 }
 
-// hang is an UpdateHook for a DB that never answers.
-func hang(ctx context.Context, _ schema.Key, _ func()) error {
+// hang is a Hook for a DB that never answers an Update.
+func hang(ctx context.Context, st *fakedb.Stmt) error {
+	if st.Kind != fakedb.Update {
+		return nil
+	}
 	<-ctx.Done()
-	return ctx.Err()
+	return fakedb.Ambiguous(st, ctx.Err())
 }
 
 func TestUpdateSetAndIncr(t *testing.T) {
@@ -129,7 +132,7 @@ func TestUpdateLoadErrorHasNoEffect(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
 		boom := errors.New("boom")
-		d.SelectHook = func(context.Context, schema.Key) error { return boom }
+		d.Hook = func(context.Context, *fakedb.Stmt) error { return boom }
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
@@ -140,7 +143,7 @@ func TestUpdateLoadErrorHasNoEffect(t *testing.T) {
 		if snap, got := entryOf(s, k).snap.Load(), bookkeeping(s, k); snap != nil || got != clean {
 			t.Fatalf("after a failed load: snap %v, %s; want nil, %s", snap, got, clean)
 		}
-		d.SelectHook = nil
+		d.Hook = nil
 		time.Sleep(s.cfg.LoadErrTTL)
 		if r, err := s.Update(context.Background(), k, ch); err != nil || r.Vals[2] != int64(11) {
 			t.Fatalf("Update after the DB recovered = %+v, %v", r, err)
