@@ -65,11 +65,11 @@ func verdict(res porcupine.CheckResult) error {
 func checkLinearizable(t *testing.T, ops []porcupine.Operation, timeout time.Duration) {
 	t.Helper()
 	model := rowModel.ToModel()
-	res, info := porcupine.CheckOperationsVerbose(model, ops, timeout)
-	err := verdict(res)
+	err := verdict(porcupine.CheckOperationsTimeout(model, ops, timeout))
 	if err == nil {
 		return
 	}
+	_, info := porcupine.CheckOperationsVerbose(model, ops, timeout) // again, only for the visualization
 	f, ferr := os.CreateTemp("", "rowsvc-linearizability-*.html")
 	if ferr == nil {
 		ferr = porcupine.Visualize(model, info, f)
@@ -83,15 +83,19 @@ func checkLinearizable(t *testing.T, ops []porcupine.Operation, timeout time.Dur
 }
 
 // Acceptance (design.md 12.2 M4): random concurrent operations under injected DB faults are linearizable
-// per key (correctness-properties.md C1, S1, S2). Each round runs on a fresh Store, in synctest; its history
-// is checked after it, on real time, so the check's timeout works. Several short histories rather than one
-// long one: the cost of the check grows much faster than the length of a history.
+// per key (correctness-properties.md C1, S1, S2). Each round runs on a fresh Store, in synctest, as a subtest;
+// its history is checked after it, whatever the subtest found, and on real time, so the check's timeout
+// works. Many short histories rather than a few long ones: the cost of the check grows much faster than the
+// length of a history, and two workers per key keep the operations of a key concurrent.
 func TestLinearizable(t *testing.T) {
-	const rounds, keys, workers, ops = 6, 16, 32, 50
+	const rounds, keys, workers, ops = 12, 16, 32, 25
 	var unknown, getRow, getNotFound, updateGenNotFound, created, deletedOK atomic.Int64
 	overlaps, total := 0, 0 // overlapping pairs: operations on one key whose intervals overlap, the cases with a choice of order
-	for range rounds {
-		h := linearizableRound(t, keys, workers, ops, &unknown, &getRow, &getNotFound, &updateGenNotFound, &created, &deletedOK)
+	for i := range rounds {
+		h := &history{}
+		t.Run(fmt.Sprint("round ", i), func(t *testing.T) {
+			linearizableRound(t, h, keys, workers, ops, &unknown, &getRow, &getNotFound, &updateGenNotFound, &created, &deletedOK)
+		})
 		for _, part := range rowModel.Partition(h.ops) {
 			for i, a := range part {
 				for _, b := range part[i+1:] {
@@ -117,9 +121,8 @@ func TestLinearizable(t *testing.T) {
 	t.Logf("%d operations in %d rounds; %v", total, rounds, counters)
 }
 
-// linearizableRound runs one round of TestLinearizable and returns its history.
-func linearizableRound(t *testing.T, keys, workers, ops int, unknown, getRow, getNotFound, updateGenNotFound, created, deletedOK *atomic.Int64) *history {
-	h := &history{}
+// linearizableRound runs one round of TestLinearizable, recording its history in h.
+func linearizableRound(t *testing.T, h *history, keys, workers, ops int, unknown, getRow, getNotFound, updateGenNotFound, created, deletedOK *atomic.Int64) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
 		s := newTestStore(t, d)
@@ -247,7 +250,6 @@ func linearizableRound(t *testing.T, keys, workers, ops int, unknown, getRow, ge
 		checkInvariants(t, s, d)
 	})
 
-	return h
 }
 
 // Review Focus 4: only Ok passes.
