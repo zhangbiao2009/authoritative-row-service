@@ -24,11 +24,12 @@ type ColChange struct {
 // Change is one Update: the columns it sets or increments.
 type Change struct {
 	Cols []ColChange
+	Gen  int64 // 0: no check; else ErrNotFound unless the row has this gen: an update for one life never changes another (7.3)
 }
 
 // Update applies ch to the row in memory and returns the new row, which is shared and immutable (I2). It
-// does no DB IO: the flusher writes the row later. ErrNotFound if the row does not exist; ErrInvalid if ch
-// is malformed or an increment fails, in which case nothing changes.
+// does no DB IO: the flusher writes the row later. ErrNotFound if the row does not exist, or is not the
+// life ch.Gen names; ErrInvalid if ch is malformed or an increment fails, in which case nothing changes.
 func (s *Store) Update(ctx context.Context, key schema.Key, ch Change) (*schema.Row, error) {
 	mask, err := s.changeMask(ch)
 	if err != nil {
@@ -47,7 +48,7 @@ func (s *Store) Update(ctx context.Context, key schema.Key, ch Change) (*schema.
 			}
 			continue
 		}
-		if old == absent {
+		if old == absent || (ch.Gen != 0 && old.Gen != ch.Gen) {
 			e.mu.Unlock()
 			return nil, ErrNotFound
 		}

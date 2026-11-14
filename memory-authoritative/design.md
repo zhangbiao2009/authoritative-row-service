@@ -662,9 +662,14 @@ func runSync[T any](ctx context.Context, s *Store, e *entry, fn func(*entry) (T,
 	s.inflight.Add(1)
 	go func() {
 		defer s.inflight.Done()
-		defer e.unlockOp()
-		v, err := fn(e)
-		done <- result{v, err}
+		var r result
+		// Release op first, then answer: a caller that has its answer always finds op free
+		// (the order of the model's FinishOp). Deferred, so it happens on every path.
+		defer func() {
+			e.unlockOp()
+			done <- r
+		}()
+		r.v, r.err = fn(e)
 	}()
 	select {
 	case r := <-done:

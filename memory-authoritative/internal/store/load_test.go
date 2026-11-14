@@ -17,7 +17,7 @@ func TestConcurrentMissesSelectOnce(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
 		release := make(chan struct{})
-		d.SelectHook = func(context.Context, schema.Key) error { <-release; return nil }
+		script(d, map[fakedb.Kind][]step{fakedb.Select: {blockOn(release)}})
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
@@ -42,14 +42,14 @@ func TestLoadErrorIsCachedForLoadErrTTL(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
 		boom := errors.New("boom")
-		d.SelectHook = func(context.Context, schema.Key) error { return boom }
+		d.Hook = func(context.Context, *fakedb.Stmt) error { return boom }
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
 		if _, err := s.Get(context.Background(), k); !errors.Is(err, boom) {
 			t.Fatalf("first Get: err = %v, want boom", err)
 		}
-		d.SelectHook = nil // the DB is fine again; a second Get must still get the cached error
+		d.Hook = nil // the DB is fine again; a second Get must still get the cached error
 		if _, err := s.Get(context.Background(), k); !errors.Is(err, boom) {
 			t.Fatalf("Get within LoadErrTTL: err = %v, want the cached boom", err)
 		}
@@ -74,7 +74,7 @@ func TestCancelledLoadIsNotCached(t *testing.T) {
 	d.Put(testRow(k, 1))
 	ctx, cancel := context.WithCancel(context.Background())
 	// The caller gives up while Select runs; Select then returns the context error.
-	d.SelectHook = func(context.Context, schema.Key) error { cancel(); return nil }
+	d.Hook = func(context.Context, *fakedb.Stmt) error { cancel(); return nil }
 	if _, err := s.Get(ctx, k); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
@@ -106,7 +106,7 @@ func TestGetTimesOutWhileQueuedForOp(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
 		release := make(chan struct{})
-		d.SelectHook = func(context.Context, schema.Key) error { <-release; return nil }
+		script(d, map[fakedb.Kind][]step{fakedb.Select: {blockOn(release)}})
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))

@@ -110,13 +110,14 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, change := range map[string]func(*Config){
-		"NumShards 0":     func(c *Config) { c.NumShards = 0 },
-		"NumShards -4":    func(c *Config) { c.NumShards = -4 },
-		"NumShards 3":     func(c *Config) { c.NumShards = 3 },
-		"NumShards 6":     func(c *Config) { c.NumShards = 6 },
-		"FlushInterval 0": func(c *Config) { c.FlushInterval = 0 },
-		"DBTimeout 0":     func(c *Config) { c.DBTimeout = 0 },
-		"DBTimeout < 0":   func(c *Config) { c.DBTimeout = -time.Second },
+		"NumShards 0":      func(c *Config) { c.NumShards = 0 },
+		"NumShards -4":     func(c *Config) { c.NumShards = -4 },
+		"NumShards 3":      func(c *Config) { c.NumShards = 3 },
+		"NumShards 6":      func(c *Config) { c.NumShards = 6 },
+		"FlushInterval 0":  func(c *Config) { c.FlushInterval = 0 },
+		"DBTimeout 0":      func(c *Config) { c.DBTimeout = 0 },
+		"DBTimeout < 0":    func(c *Config) { c.DBTimeout = -time.Second },
+		"OpFenceTimeout 0": func(c *Config) { c.OpFenceTimeout = 0 },
 	} {
 		cfg := DefaultConfig()
 		change(&cfg)

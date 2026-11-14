@@ -77,7 +77,7 @@ the model to match the code, without asking.
 | `net` | statements sent and not yet executed: `fakedb`'s pending (possibly late) statements | `live = FALSE`: the caller has stopped waiting; `pre`: was in flight when the epoch was bumped |
 | `wait[p]` | a `db.DB` call is in progress for executor `p` | |
 | `resp[p]` | the `db.DB` call's return value, see section 4 | |
-| `blocked` | `fakedb`'s cross-row-constraint switch, flipped by the test | |
+| `blocked` | `fakedb.SetCrossRow`, flipped by the test | checked when a statement executes, on time or late, and only by one that would change the row |
 | `up` | the Store is running | `Crash` = the test discards the Store |
 | `stmtTO`, `drops`, `cto`, `crashes`, `flips`, `qto`, `zsent`, `nextGen`, `nextVal`, `ops` | fault budgets and workload: `fakedb` fault settings and the test driver | |
 
@@ -105,10 +105,10 @@ Each row is one atomic step of the model. In Go a step is a stretch of one funct
 | `L_load` | `load` → `ensureLoadedLocked` (7.2) | `dead` check; re-check `snap`; `db.Select`; `snap.Store` under `mu`; `unlockOp` |
 | `U_mu` | `Update` (7.3) | the whole `mu` critical section: `dead` → `Gosched`, retry; `nil` → unlock `mu`, `load`; absent or gen mismatch → `ErrNotFound`; else build the new Row, `snap.Store` (linearization point), `markDirtyLocked`, set `queued` |
 | `U_enq` | `Update` → `enqueue` (7.1) | after `mu.Unlock` |
-| `X_lock` | `Create` / `Delete` → `lockOpLive` (7.1), then `runSync` starts the goroutine (7.4) | |
+| `X_lock` | `Create` / `Delete` → `lockOpLive` (7.1), then `runSync` starts the goroutine (7.4) | until M5 (no `dead`): `getOrCreate` + `lockOp` |
 | `X_qtimeout` | `lockOpLive` returns `ctx.Err()` | timed out while queued for `op`: definitely not executed |
 | `X_wait` | `runSync`'s `select` | `done` → result; `ctx.Done()` → `ErrOutcomeUnknown`, the goroutine keeps running |
-| `FinishOp` | `runSync` goroutine | `defer e.unlockOp()`; `done <- result` |
+| `FinishOp` | `runSync` goroutine | `e.unlockOp()` once `fn` has returned, then `done <- result`: `op` is free by the time the caller has its answer |
 | `B_c1` | `createLocked` (7.4) | `ensureLoadedLocked`; a row is there → same gen: return it; `db.GenClaimed` → `(nil, nil)`; else `ErrAlreadyExists`. Absent → first `db.InsertDedup` |
 | `B_c2` | `insertUntilSure` loop body, then the end of `createLocked` (7.4) | classify the result (section 4); success → under `mu`: `snap.Store(got)`, `clearDirtyLocked` (linearization point) |
 | `B_d1` | `deleteLocked` (7.5) | `ensureLoadedLocked`; absent or gen mismatch → `ErrNotFound`; else first `db.Delete` |
@@ -131,7 +131,9 @@ Each row is one atomic step of the model. In Go a step is a stretch of one funct
 ### 3.1 Gaps: where failpoints go
 
 A gap is the space between two steps of one goroutine, where another goroutine can run (design.md section 10). Each
-gap below is a separate step boundary in the model. Failpoint hooks are nil in production.
+gap below is a separate step boundary in the model. Failpoint hooks are nil in production. The gaps that sit at a DB
+call (delete-db-done, flush-snapshot, flush-late) are reached through `fakedb.Hook`: the hook of that statement runs the
+inserted operation, before or after calling `Exec`. The others need a hook in `store` (from M5).
 
 | Gap | Between | What the failpoint test inserts | Exercises |
 |---|---|---|---|
@@ -168,7 +170,7 @@ quiescent point (no flush round running), takes each entry's locks, and compares
 | `NoViolation`: Get not linearizable | Porcupine | M4 |
 | `NoViolation`: post-crash state implausible | crash-recovery test: the reloaded state satisfies `Plausible` (correctness-properties.md) | M6 |
 | `NoViolation`: dedup conflict | no test may ever see `ErrInternal` | M3 |
-| `NoResurrection` | history: once a delete of gen g returned success, g never appears again in `fakedb` or in a Get | M3 |
+| `NoResurrection` | history: once a delete of gen g returned success, g never appears again in `fakedb` or in a Get; `fakedb` asserts no row is inserted for a (key, gen) whose row was deleted | M3 |
 | `MemMatchesAbs` | Porcupine (Get and Update results) | M4 |
 | `QuiescentConsistent`, `CleanIsDurable` | `checkInvariants`: entry free (`tryLockOp` succeeds), loaded, `dirty == 0` → equal to the `fakedb` row, including gen and ver | M2 |
 | `DbMatchesAbsWhenIdle` | end of every stress test: graceful shutdown, then memory equals the DB for every key | M2 |
@@ -177,7 +179,7 @@ quiescent point (no flush round running), takes each entry's locks, and compares
 | `DirtyImpliesQueued`, `QueuedIsTracked` | `checkInvariants`: `dirty != 0` → `queued`; `queued` → in `shard.queue` | M2 |
 | `LiveEntryInMap` (I1) | `checkInvariants`: entries in the map are not dead; queued entries that are not dead are the map's entry for their key | M5 |
 | `NoDirtyEviction` (I10) | `checkInvariants`: a dead entry has `dirty == 0` | M5 |
-| `DbValsBelongToGen` | stress updates carry `Change.Gen` and write values tagged with that gen; `fakedb` asserts every applied write keeps tags equal to the row's gen | M3 |
+| `DbValsBelongToGen` | stress updates carry `Change.Gen` and write values tagged with that gen; `fakedb.RowCheck` asserts every applied write keeps tags equal to the row's gen | M3 |
 | `DbNotAhead` | `checkInvariants`: same gen → DB ver ≤ memory ver | M2 |
 | `FencedRestart` (I15) | crash-recovery test: after the new Store's startup returns, no pending statement of an old session can still apply | M6 |
 | `CreateFailureIsFinal` | history: a create answered with a failure never has its gen in `fakedb`'s dedup table, checked after all late statements have drained | M3 |

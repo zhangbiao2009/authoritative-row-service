@@ -25,24 +25,29 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("not found")
-	ErrInvalid  = schema.ErrInvalid // the same value, so errors.Is works whichever package wrapped it
+	ErrNotFound       = errors.New("not found")
+	ErrAlreadyExists  = errors.New("already exists")
+	ErrOutcomeUnknown = errors.New("outcome unknown") // the caller's ctx expired; the create or delete goes on (7.4)
+	ErrInvalid        = schema.ErrInvalid             // the same value, so errors.Is works whichever package wrapped it
+	ErrInternal       = errors.New("internal")        // an invariant is broken
 )
 
 type Config struct {
-	NumShards     int           // power of 2
-	LoadErrTTL    time.Duration // after a load failure, how long the same error is returned directly
-	FlushInterval time.Duration // how often RunFlusher writes dirty rows back
-	DBTimeout     time.Duration // timeout for DB calls on the Go side (design.md 11.4); in M2, each flush write
+	NumShards      int           // power of 2
+	LoadErrTTL     time.Duration // after a load failure, how long the same error is returned directly
+	FlushInterval  time.Duration // how often RunFlusher writes dirty rows back
+	DBTimeout      time.Duration // timeout for each DB call on the Go side (design.md 11.4)
+	OpFenceTimeout time.Duration // how long one FenceSessions call may wait for the sessions to exit (7.4)
 }
 
 // DefaultConfig returns the reference values of design.md 11.4.
 func DefaultConfig() Config {
 	return Config{
-		NumShards:     256,
-		LoadErrTTL:    100 * time.Millisecond,
-		FlushInterval: 200 * time.Millisecond,
-		DBTimeout:     3 * time.Second,
+		NumShards:      256,
+		LoadErrTTL:     100 * time.Millisecond,
+		FlushInterval:  200 * time.Millisecond,
+		DBTimeout:      3 * time.Second,
+		OpFenceTimeout: 10 * time.Second,
 	}
 }
 
@@ -54,15 +59,17 @@ type Store struct {
 	cfg    Config
 	seed   maphash.Seed
 
-	dirtyCount atomic.Int64 // entries with dirty != 0; changed only with that entry's mu held
+	dirtyCount atomic.Int64   // entries with dirty != 0; changed only with that entry's mu held
+	inflight   sync.WaitGroup // runSync goroutines: creates and deletes still running
 }
 
 func New(sch *schema.Schema, d db.DB, cfg Config) (*Store, error) {
 	if cfg.NumShards <= 0 || cfg.NumShards&(cfg.NumShards-1) != 0 {
 		return nil, fmt.Errorf("NumShards %d is not a positive power of 2", cfg.NumShards)
 	}
-	if cfg.FlushInterval <= 0 || cfg.DBTimeout <= 0 {
-		return nil, fmt.Errorf("FlushInterval %v and DBTimeout %v must be positive", cfg.FlushInterval, cfg.DBTimeout)
+	if cfg.FlushInterval <= 0 || cfg.DBTimeout <= 0 || cfg.OpFenceTimeout <= 0 {
+		return nil, fmt.Errorf("FlushInterval %v, DBTimeout %v and OpFenceTimeout %v must be positive",
+			cfg.FlushInterval, cfg.DBTimeout, cfg.OpFenceTimeout)
 	}
 	s := &Store{schema: sch, db: d, cfg: cfg, seed: maphash.MakeSeed(), shards: make([]*shard, cfg.NumShards)}
 	for i := range s.shards {
@@ -170,4 +177,28 @@ func (s *Store) enqueue(e *entry) {
 	sh.qmu.Lock()
 	sh.queue = append(sh.queue, e)
 	sh.qmu.Unlock()
+}
+
+// dbCtx bounds one DB call made by background work, which has no caller's ctx (decision 5 of the M3 plan;
+// the service-lifetime ctx comes in M6).
+func (s *Store) dbCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), s.cfg.DBTimeout)
+}
+
+const (
+	backoffMin = 10 * time.Millisecond
+	backoffMax = time.Second
+)
+
+// backoff waits before the next attempt of an until-sure loop: backoffMin doubled per attempt, at most
+// backoffMax.
+func backoff(attempt int) {
+	d := backoffMin
+	for range attempt {
+		if d >= backoffMax {
+			break
+		}
+		d *= 2
+	}
+	time.Sleep(min(d, backoffMax))
 }
