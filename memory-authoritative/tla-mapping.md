@@ -85,7 +85,7 @@ the model to match the code, without asking.
 
 | TLA | Go |
 |---|---|
-| `abs`, `absKnown`, `seen` | Porcupine's sequential model and the recorded history (M4) |
+| `abs`, `absKnown`, `seen` | Porcupine's sequential model (`rowModel`, `model_test.go`) and the recorded history (`history`, `linearizability_test.go`) |
 | `deletedGens`, `insSent`, `delSent`, `failedGens`, `preCrash` | history recorded by the test from operation results and `fakedb`'s statement log |
 | `violation` | `t.Fatal` in tests; `ErrInternal` in the service |
 
@@ -167,11 +167,11 @@ quiescent point (no flush round running), takes each entry's locks, and compares
 
 | TLA property | Go check | From |
 |---|---|---|
-| `NoViolation`: Get not linearizable | Porcupine | M4 |
+| `NoViolation`: Get not linearizable | Porcupine: `TestLinearizable` (`linearizability_test.go`) against the row model in `model_test.go` | M4 |
 | `NoViolation`: post-crash state implausible | crash-recovery test: the reloaded state satisfies `Plausible` (correctness-properties.md) | M6 |
 | `NoViolation`: dedup conflict | no test may ever see `ErrInternal` | M3 |
 | `NoResurrection` | history: once a delete of gen g returned success, g never appears again in `fakedb` or in a Get; `fakedb` asserts no row is inserted for a (key, gen) whose row was deleted | M3 |
-| `MemMatchesAbs` | Porcupine (Get and Update results) | M4 |
+| `MemMatchesAbs` | Porcupine: `TestLinearizable`, on the rows Get, Update and Create answer | M4 |
 | `QuiescentConsistent`, `CleanIsDurable` | `checkInvariants`: entry free (`tryLockOp` succeeds), loaded, `dirty == 0` → equal to the `fakedb` row, including gen and ver | M2 |
 | `DbMatchesAbsWhenIdle` | end of every stress test: graceful shutdown, then memory equals the DB for every key | M2 |
 | `CreateDurable` | crash-recovery test: a confirmed create still exists unless its delete was sent | M6 |

@@ -74,7 +74,9 @@ func startFaults(d *fakedb.DB, keys []schema.Key) *faults {
 // stop turns the faults off, stops the flipper, clears every cross-row switch and waits for the late
 // statements to run. The hook stays installed, answering normally.
 func (f *faults) stop() {
+	f.mu.Lock() // a late Exec is added under mu while on, so none is added after late.Wait below
 	f.on.Store(false)
+	f.mu.Unlock()
 	close(f.flipping)
 	<-f.flipped
 	for _, k := range f.keys {
@@ -128,9 +130,17 @@ func (f *faults) hook(_ context.Context, st *fakedb.Stmt) error {
 		markAmbiguous()
 		return lost(st)
 	case n < 75:
+		f.mu.Lock()
+		if !f.on.Load() { // stopped while this hook slept: run normally
+			f.mu.Unlock()
+			return nil
+		}
+		f.late.Add(1)
+		f.mu.Unlock()
 		markAmbiguous()
 		exec := st.Exec
-		f.late.Go(func() {
+		go func() {
+			defer f.late.Done()
 			// Virtual time: a window much wider than the backoff, so a late statement can land after later
 			// attempts and later operations, not only before the next attempt.
 			time.Sleep(time.Duration(rand.IntN(100_000)) * time.Microsecond)
@@ -138,7 +148,7 @@ func (f *faults) hook(_ context.Context, st *fakedb.Stmt) error {
 				f.lateInsertOfDeleted.Add(1)
 			}
 			exec()
-		})
+		}()
 		return fakedb.Ambiguous(st, context.DeadlineExceeded)
 	case n < 85:
 		markAmbiguous()
