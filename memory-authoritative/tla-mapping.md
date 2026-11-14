@@ -108,7 +108,7 @@ Each row is one atomic step of the model. In Go a step is a stretch of one funct
 | `X_lock` | `Create` / `Delete` → `lockOpLive` (7.1), then `runSync` starts the goroutine (7.4) | until M5 (no `dead`): `getOrCreate` + `lockOp` |
 | `X_qtimeout` | `lockOpLive` returns `ctx.Err()` | timed out while queued for `op`: definitely not executed |
 | `X_wait` | `runSync`'s `select` | `done` → result; `ctx.Done()` → `ErrOutcomeUnknown`, the goroutine keeps running |
-| `FinishOp` | `runSync` goroutine | `defer e.unlockOp()`; `done <- result` |
+| `FinishOp` | `runSync` goroutine | `e.unlockOp()` once `fn` has returned, then `done <- result`: `op` is free by the time the caller has its answer |
 | `B_c1` | `createLocked` (7.4) | `ensureLoadedLocked`; a row is there → same gen: return it; `db.GenClaimed` → `(nil, nil)`; else `ErrAlreadyExists`. Absent → first `db.InsertDedup` |
 | `B_c2` | `insertUntilSure` loop body, then the end of `createLocked` (7.4) | classify the result (section 4); success → under `mu`: `snap.Store(got)`, `clearDirtyLocked` (linearization point) |
 | `B_d1` | `deleteLocked` (7.5) | `ensureLoadedLocked`; absent or gen mismatch → `ErrNotFound`; else first `db.Delete` |

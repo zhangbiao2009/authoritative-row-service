@@ -350,3 +350,51 @@ func TestLateFlushAfterDeleteDoesNotResurrect(t *testing.T) {
 	}
 	notFound(t, s, k)
 }
+
+// The delete side of TestFenceKeepsUnsure: A ambiguous, B rejected because of another row, A lands just
+// before the fence, C not executed. A deleted the row, so "failed" would leave it in memory only.
+func TestDeleteFenceKeepsUnsure(t *testing.T) {
+	d := fakedb.New()
+	s := newTestStore(t, d)
+	k := key(t, s, 1)
+	loaded(t, s, d, k)
+	d.SetCrossRow(k, true)
+	var late func()
+	var session db.SessionID
+	landBeforeFence := func(*fakedb.Stmt) error {
+		d.SetCrossRow(k, false)
+		late() // A deletes the row just before its session is terminated
+		return nil
+	}
+	script(d, map[fakedb.Kind][]step{
+		fakedb.Delete: {amb(&late, &session), nil, fail(db.ErrNotExecuted)},
+		fakedb.Fence:  {landBeforeFence},
+	})
+	if err := s.Delete(context.Background(), k, 0); err != nil {
+		t.Fatalf("Delete: %v; want nil, the row is gone from the DB", err)
+	}
+	notFound(t, s, k)
+	checkInvariants(t, s, d)
+}
+
+// Review Focus 2, the delete side.
+func TestDeleteLoadErrorHasNoEffect(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1)) // not loaded
+		rec := script(d, map[fakedb.Kind][]step{fakedb.Select: {fail(db.ErrNotExecuted)}})
+		if err := s.Delete(context.Background(), k, 0); !errors.Is(err, db.ErrNotExecuted) {
+			t.Fatalf("Delete: %v; want the load error", err)
+		}
+		if n := len(rec.of(fakedb.Delete)); n != 0 || d.Row(k) == nil {
+			t.Fatalf("Delete statements %d, DB row %+v; want none sent, the row kept", n, d.Row(k))
+		}
+		checkInvariants(t, s, d)
+		d.Hook = nil
+		time.Sleep(s.cfg.LoadErrTTL)
+		del(t, s, k, 0)
+		notFound(t, s, k)
+	})
+}

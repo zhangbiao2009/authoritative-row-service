@@ -73,13 +73,20 @@ func TestStressUpdates(t *testing.T) {
 		d.Put(testRow(ks[i], int64(i))) // score 10
 	}
 	var sums [keys]atomic.Int64 // acknowledged increments per key
-	var failed, late atomic.Int64
+	var writes, failed, late atomic.Int64
 	var lateExecs sync.WaitGroup
 	d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
 		if st.Kind != fakedb.Update {
 			return nil
 		}
-		switch n := rand.IntN(10); {
+		n := rand.IntN(10)
+		switch writes.Add(1) { // the first two writes fail and are late, so both faults happen in every run
+		case 1:
+			n = 7
+		case 2:
+			n = 9
+		}
+		switch {
 		case n < 7:
 			return nil
 		case n < 9:
@@ -163,33 +170,55 @@ func TestStressCreateDelete(t *testing.T) {
 		// Faults, on while faults is true.
 		var faults atomic.Bool
 		faults.Store(true)
-		type life struct {
-			key schema.Key
-			gen int64
+		type stmtOf struct { // the Inserts, or the Deletes, of one life
+			kind fakedb.Kind
+			key  schema.Key
+			gen  int64
 		}
 		var mu sync.Mutex
-		ambiguous := map[life]bool{} // lives an Insert or Delete of which was answered "ambiguous"
-		var ambThenNotExecuted atomic.Int64
+		ambiguous := map[stmtOf]bool{}         // answered "ambiguous" at least once
+		sessionOf := map[db.SessionID]stmtOf{} // the sessions of those answers
+		fenced := map[stmtOf]bool{}            // one of those sessions was fenced
+		var ambThenNotExecuted, notExecutedAfterFence, lateInsertOfDeleted, retryFindsOtherLife atomic.Int64
 		var lateExecs sync.WaitGroup
 		d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
+			if st.Kind == fakedb.GenClaimed && !faults.Load() {
+				st.Exec()
+				if d.Claimed(st.Key, st.Gen) { // W_RetryFindsOtherLife
+					retryFindsOtherLife.Add(1)
+				}
+				return nil
+			}
 			if !faults.Load() {
 				return nil
 			}
 			time.Sleep(time.Duration(rand.IntN(500)) * time.Microsecond)
 			switch st.Kind {
 			case fakedb.Fence:
+				mu.Lock()
+				for _, id := range st.Sessions {
+					fenced[sessionOf[id]] = true
+				}
+				mu.Unlock()
 				return nil
 			case fakedb.Select, fakedb.GenClaimed:
 				if rand.IntN(100) < 5 {
 					return fmt.Errorf("%w: injected", db.ErrNotExecuted)
 				}
+				if st.Kind == fakedb.GenClaimed {
+					st.Exec()
+					if d.Claimed(st.Key, st.Gen) {
+						retryFindsOtherLife.Add(1)
+					}
+				}
 				return nil
 			}
-			l, write := life{st.Key, st.Gen}, st.Kind == fakedb.Insert || st.Kind == fakedb.Delete
+			l, write := stmtOf{st.Kind, st.Key, st.Gen}, st.Kind == fakedb.Insert || st.Kind == fakedb.Delete
 			markAmbiguous := func() {
 				if write {
 					mu.Lock()
 					ambiguous[l] = true
+					sessionOf[st.Session] = l
 					mu.Unlock()
 				}
 			}
@@ -203,7 +232,12 @@ func TestStressCreateDelete(t *testing.T) {
 				markAmbiguous()
 				exec := st.Exec
 				lateExecs.Go(func() {
-					time.Sleep(time.Duration(rand.IntN(3000)) * time.Microsecond)
+					// Virtual time: a window much wider than the backoff, so a late statement can land after
+					// later attempts and later operations, not only before the next attempt.
+					time.Sleep(time.Duration(rand.IntN(100_000)) * time.Microsecond)
+					if l.kind == fakedb.Insert && d.Deleted(l.key, l.gen) { // W_LateInsertOfDeletedGen
+						lateInsertOfDeleted.Add(1)
+					}
 					exec()
 				})
 				return fakedb.Ambiguous(st, context.DeadlineExceeded)
@@ -214,6 +248,9 @@ func TestStressCreateDelete(t *testing.T) {
 				mu.Lock()
 				if write && ambiguous[l] {
 					ambThenNotExecuted.Add(1)
+				}
+				if write && fenced[l] {
+					notExecutedAfterFence.Add(1)
 				}
 				mu.Unlock()
 				return fmt.Errorf("%w: injected", db.ErrNotExecuted)
@@ -235,12 +272,13 @@ func TestStressCreateDelete(t *testing.T) {
 		// History, recorded by the driver.
 		var seq atomic.Int64 // counts successful deletes of a known gen
 		var deleted sync.Map // gen -> seq of its delete
-		type creates struct {
-			key                      schema.Key
-			unknown, success, failed bool
+		type calls struct {  // the answers to the Create, and to the Delete, calls of one gen
+			key                               schema.Key
+			unknown, success, failed, refused bool // refused: ErrAlreadyExists or a cross-row rejection
+			deleteUnknown, deleteSuccess      bool
 		}
 		var hmu sync.Mutex
-		history := map[int64]*creates{}
+		history := map[int64]*calls{}
 		var gens atomic.Int64
 		gens.Store(1000)
 		var deletesOK, recreates, outcomeUnknown, queueTimeouts atomic.Int64
@@ -265,8 +303,8 @@ func TestStressCreateDelete(t *testing.T) {
 				t.Errorf("%s returned gen %d, deleted before it started (NoResurrection)", op, r.Gen)
 			}
 		}
-		opCtx := func(short bool) (context.Context, context.CancelFunc) {
-			if short && rand.IntN(10) == 0 {
+		opCtx := func(shortPercent int) (context.Context, context.CancelFunc) {
+			if rand.IntN(100) < shortPercent {
 				return context.WithTimeout(context.Background(), 5*time.Millisecond)
 			}
 			return context.WithTimeout(context.Background(), 5*time.Second) // L1 EventuallyResponds
@@ -280,39 +318,46 @@ func TestStressCreateDelete(t *testing.T) {
 				for range ops {
 					i := rand.IntN(keys)
 					k := ks[i]
-					switch rand.IntN(4) {
-					case 0:
+					get := func() {
 						start := seq.Load()
-						ctx, cancel := opCtx(false)
+						ctx, cancel := opCtx(0)
 						r, err := s.Get(ctx, k)
 						cancel()
 						if allowed("Get", err) && r != nil {
 							noResurrection("Get", r, start)
 							seen[i] = r.Gen
 						}
-					case 1:
+					}
+					switch op := rand.IntN(4); {
+					case op == 0, op == 3 && seen[i] == 0: // a Delete always names its gen
+						get()
+					case op == 1:
 						ch := Change{Gen: seen[i], Cols: []ColChange{incr(2, int64(rand.IntN(11)-5))}}
 						if seen[i] != 0 && rand.IntN(2) == 0 {
 							ch.Cols = []ColChange{set(1, tag(seen[i]))}
 						}
 						start := seq.Load()
-						ctx, cancel := opCtx(false)
+						ctx, cancel := opCtx(0)
 						r, err := s.Update(ctx, k, ch)
 						cancel()
 						if allowed("Update", err) && r != nil {
 							noResurrection("Update", r, start)
 							seen[i] = r.Gen
 						}
-					case 2:
+					case op == 2:
 						gen := gens.Add(1)
 						in := newRow(k, int64(i), gen)
 						in.Vals[1] = tag(gen)
-						h := &creates{key: k}
+						h := &calls{key: k}
 						hmu.Lock()
 						history[gen] = h
 						hmu.Unlock()
 						for attempt := 0; ; attempt++ { // retried like the SDK: same gen, after an unknown outcome
-							ctx, cancel := opCtx(attempt == 0)
+							short := 0
+							if attempt == 0 {
+								short = 30 // unknown outcomes, and so SDK-like retries
+							}
+							ctx, cancel := opCtx(short)
 							r, err := s.Create(ctx, in)
 							cancel()
 							if !allowed("Create", err) {
@@ -326,6 +371,7 @@ func TestStressCreateDelete(t *testing.T) {
 								h.unknown = true
 							default:
 								h.failed = true
+								h.refused = h.refused || errors.Is(err, ErrAlreadyExists) || db.IsCrossRow(err)
 							}
 							hmu.Unlock()
 							if err == nil && r != nil {
@@ -337,18 +383,27 @@ func TestStressCreateDelete(t *testing.T) {
 							if !errors.Is(err, ErrOutcomeUnknown) || attempt == 3 {
 								break
 							}
+							// Back off before the retry, as the SDK does (7.10): other clients may delete and
+							// create the key again meanwhile (hole 6).
+							time.Sleep(time.Duration(rand.IntN(200)) * time.Millisecond)
 						}
-					case 3:
+					default:
 						gen := seen[i]
-						ctx, cancel := opCtx(true)
+						ctx, cancel := opCtx(10)
 						err := s.Delete(ctx, k, gen)
 						cancel()
-						if allowed("Delete", err) && err == nil {
+						if !allowed("Delete", err) {
+							break
+						}
+						hmu.Lock()
+						h := history[gen]
+						h.deleteSuccess = h.deleteSuccess || err == nil
+						h.deleteUnknown = h.deleteUnknown || errors.Is(err, ErrOutcomeUnknown)
+						hmu.Unlock()
+						if err == nil {
 							deletesOK.Add(1)
 							deletedOnce[i].Store(true)
-							if gen != 0 {
-								deleted.Store(gen, seq.Add(1))
-							}
+							deleted.Store(gen, seq.Add(1))
 							seen[i] = 0
 						}
 					}
@@ -385,9 +440,17 @@ func TestStressCreateDelete(t *testing.T) {
 				}
 			}
 		}
-		for gen, h := range history { // CreateFailureIsFinal
-			if h.failed && !h.unknown && !h.success && d.Claimed(h.key, gen) {
-				t.Errorf("gen %d: every create of it failed, yet it is in the dedup table (CreateFailureIsFinal)", gen)
+		for gen, h := range history {
+			claimed := d.Claimed(h.key, gen)
+			// CreateFailureIsFinal. "Already exists" and a cross-row rejection are final even after an earlier
+			// unknown answer: op serializes the calls of a gen, so the earlier one had settled (hole 6).
+			if claimed && (h.refused || h.failed && !h.unknown && !h.success) {
+				t.Errorf("gen %d: its creates were answered failed (refused %v), yet it is in the dedup table (CreateFailureIsFinal)", gen, h.refused)
+			}
+			// The delete side: a row is deleted only by a Delete call that was answered success or unknown, and
+			// a success means the row is gone (hole 4).
+			if dl := d.Deleted(h.key, gen); dl && !h.deleteSuccess && !h.deleteUnknown || !dl && h.deleteSuccess {
+				t.Errorf("gen %d: deleted in the DB %v, but its Delete calls were answered success %v, unknown %v", gen, dl, h.deleteSuccess, h.deleteUnknown)
 			}
 		}
 
@@ -397,6 +460,8 @@ func TestStressCreateDelete(t *testing.T) {
 			"gen claimed": int64(st.GenClaimed), "cross-row rejections": int64(st.CrossRow), "fenced sessions": int64(st.Fenced),
 			"deletes": deletesOK.Load(), "re-creates": recreates.Load(), "unknown outcomes": outcomeUnknown.Load(),
 			"queue timeouts": queueTimeouts.Load(), "not executed after ambiguous": ambThenNotExecuted.Load(),
+			"not executed after a fence": notExecutedAfterFence.Load(), "late inserts of a deleted gen": lateInsertOfDeleted.Load(),
+			"retries finding the gen claimed": retryFindsOtherLife.Load(),
 		}
 		for name, n := range counters {
 			if n == 0 {

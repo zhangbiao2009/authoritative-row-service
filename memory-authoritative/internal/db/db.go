@@ -1,7 +1,8 @@
 // Package db is the interface between the Store and the database.
 //
-// Errors (design.md 8.4). Every error a write returns is classified by the DB implementation, and the
-// Store trusts the classification:
+// Errors (design.md 8.4). Every error a call returns, a read's included, is classified by the DB
+// implementation, and the Store trusts the classification. (A read matters too: after ErrGenClaimed, the
+// error of the confirming Select decides whether the create retries or answers.)
 //   - *AmbiguousError: the statement may have executed, or may still execute.
 //   - ErrNotExecuted: definitely not executed.
 //   - ErrCrossRow: rejected because of another row; the same statement may succeed later.

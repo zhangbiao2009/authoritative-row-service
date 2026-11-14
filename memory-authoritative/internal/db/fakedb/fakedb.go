@@ -116,6 +116,13 @@ func (d *DB) Claimed(key schema.Key, gen int64) bool {
 	return d.dedup[dedupKey{key, gen}]
 }
 
+// Deleted reports whether a Delete removed the row of (key, gen). It counts nothing and runs no hook.
+func (d *DB) Deleted(key schema.Key, gen int64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.deleted[dedupKey{key, gen}]
+}
+
 // SetCrossRow turns the cross-row-constraint switch of key on or off. While it is on, an Insert that would
 // write the row, or a Delete that would delete it, when it executes (on time or late), is rejected with
 // db.ErrCrossRow and changes nothing. An Insert whose gen is claimed, or a Delete that finds no row, never
@@ -290,7 +297,7 @@ func (d *DB) Delete(ctx context.Context, key schema.Key, gen int64) error {
 				return false
 			}
 			delete(d.rows, key)
-			d.deleted[dedupKey{key, gen}] = true
+			d.deleted[dedupKey{key, cur.Gen}] = true // the life of the row removed
 			return true
 		}
 		return false

@@ -430,3 +430,28 @@ func TestFenceNotConfirmedKeepsTrying(t *testing.T) {
 		}
 	})
 }
+
+// A caller that gave up (ErrOutcomeUnknown) may reuse its row; the create goes on with the row as it was
+// when Create was called.
+func TestCreateDoesNotKeepCallersRow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		release := make(chan struct{})
+		script(d, map[fakedb.Kind][]step{fakedb.Insert: {blockOn(release)}})
+		in := newRow(k, 1, 100)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if _, err := s.Create(ctx, in); !errors.Is(err, ErrOutcomeUnknown) {
+			t.Fatalf("Create: %v; want ErrOutcomeUnknown", err)
+		}
+		in.Vals[1] = "reused" // the caller reuses its row
+		close(release)
+		s.inflight.Wait()
+		if r := d.Row(k); r == nil || r.Vals[1] != "a" {
+			t.Fatalf("DB row %+v; want the values given to Create (name \"a\")", r)
+		}
+		memMatchesDB(t, s, d, k)
+	})
+}

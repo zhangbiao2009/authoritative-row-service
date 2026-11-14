@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"slices"
 
 	"rowsvc/internal/db"
 	"rowsvc/internal/schema"
@@ -16,6 +17,9 @@ import (
 // it. (nil, nil): the create of this gen took effect earlier, and the row has been deleted since.
 // ErrOutcomeUnknown: ctx expired first; the create goes on and settles in the background.
 func (s *Store) Create(ctx context.Context, in *schema.Row) (*schema.Row, error) {
+	// The create may go on after the caller has its answer (ErrOutcomeUnknown), and the caller may then reuse
+	// its row. The values themselves are immutable (I11).
+	in = &schema.Row{Key: in.Key, Gen: in.Gen, Vals: slices.Clone(in.Vals)}
 	if err := s.checkRow(in); err != nil {
 		return nil, err
 	}
