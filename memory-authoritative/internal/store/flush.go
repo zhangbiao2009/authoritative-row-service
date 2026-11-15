@@ -22,46 +22,56 @@ const (
 
 // RunFlusher flushes every shard once per FlushInterval until ctx is cancelled, then returns once its
 // goroutines have. The caller starts it. Shard i belongs to worker i % W (design.md 7.6), so a shard is
-// never flushed by two goroutines at once. A shard whose write failed is skipped for FlushInterval,
-// doubled per consecutive failure, at most flushBackoffMax.
+// never flushed by two goroutines at once.
 func (s *Store) RunFlusher(ctx context.Context) {
 	w := min(flushWorkers, len(s.shards))
 	var wg sync.WaitGroup
 	for first := range w {
-		wg.Go(func() {
-			var mine []*shard
-			for i := first; i < len(s.shards); i += w {
-				mine = append(mine, s.shards[i])
-			}
-			fails, next := make([]int, len(mine)), make([]time.Time, len(mine))
-			tick := time.NewTicker(s.cfg.FlushInterval)
-			defer tick.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-tick.C:
-					for i, sh := range mine {
-						if time.Now().Before(next[i]) {
-							continue
-						}
-						failed := s.flushShard(ctx, sh)
-						// After each shard, not each round: while the DB hangs, a round takes one DBTimeout
-						// per shard, far longer than MaxDirtyAge.
-						s.refreshTooOld()
-						if !failed {
-							fails[i] = 0
-							continue
-						}
-						fails[i]++
-						next[i] = time.Now().Add(min(s.cfg.FlushInterval<<min(fails[i]-1, 20), flushBackoffMax))
-					}
-					s.refreshTooOld() // also when every shard was skipped: the rows only get older
-				}
-			}
-		})
+		wg.Go(func() { s.flushWorker(ctx, first, w) })
 	}
 	wg.Wait()
+}
+
+// flushWorker flushes shards first, first+w, ... once per FlushInterval until ctx is cancelled. A shard
+// whose write failed is skipped for FlushInterval, doubled per consecutive failure, at most
+// flushBackoffMax.
+func (s *Store) flushWorker(ctx context.Context, first, w int) {
+	type slot struct {
+		sh    *shard
+		delay time.Duration // 0 after a success
+		next  time.Time     // skipped until then
+	}
+	var mine []slot
+	for i := first; i < len(s.shards); i += w {
+		mine = append(mine, slot{sh: s.shards[i]})
+	}
+	var refreshed time.Time
+	tick := time.NewTicker(s.cfg.FlushInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		for i := range mine {
+			x := &mine[i]
+			if !time.Now().Before(x.next) {
+				if s.flushShard(ctx, x.sh) {
+					x.delay = min(max(2*x.delay, s.cfg.FlushInterval), flushBackoffMax)
+					x.next = time.Now().Add(x.delay)
+				} else {
+					x.delay = 0
+				}
+			}
+			// Between shards, not only per round: while the DB hangs, a round takes one DBTimeout per
+			// shard, far longer than MaxDirtyAge. At most once per FlushInterval.
+			if time.Since(refreshed) >= s.cfg.FlushInterval {
+				s.refreshTooOld()
+				refreshed = time.Now()
+			}
+		}
+	}
 }
 
 // flushItem is one entry being written: the snapshot taken, its dirty columns, and since when they were
@@ -70,7 +80,7 @@ type flushItem struct {
 	e     *entry
 	row   *schema.Row
 	mask  uint64
-	since time.Time
+	since int64 // dirtySince
 }
 
 // flushShard writes the shard's queued entries back to the DB in batches of at most FlushBatchMax rows,
@@ -101,7 +111,7 @@ func (s *Store) flushShard(ctx context.Context, sh *shard) (failed bool) {
 			continue
 		}
 		poisoned := e.poisoned
-		if poisoned && r.Ver == e.poisonVer && time.Now().Before(e.poisonRetryAt) {
+		if poisoned && r.Ver == e.poisonVer && time.Now().UnixNano() < e.poisonRetryAt {
 			e.mu.Unlock() // quarantined, and not updated since the DB rejected it: its retry is not due
 			e.unlockOp()
 			retry = append(retry, e)
@@ -122,7 +132,7 @@ func (s *Store) flushShard(ctx context.Context, sh *shard) (failed bool) {
 				retry = append(retry, queue[i+1:]...) // still marked queued
 				break
 			}
-			items = nil
+			items = items[:0] // writeBatch keeps no reference
 		}
 	}
 	if !failed && len(items) > 0 {
@@ -191,12 +201,9 @@ func (s *Store) writeAlone(ctx context.Context, items []flushItem) (failed bool)
 			e.mu.Unlock()
 		case rejected(err):
 			s.mergeBack(it)
-			e.poisonVer, e.poisonRetryAt = it.row.Ver, time.Now().Add(poisonRetryInterval) // op held
+			e.poisonVer, e.poisonRetryAt = it.row.Ver, time.Now().Add(poisonRetryInterval).UnixNano() // op held
 			e.mu.Lock()
-			if !e.poisoned {
-				e.poisoned = true
-				s.m.poisoned.Add(1)
-			}
+			s.poisonLocked(e)
 			e.mu.Unlock()
 			slog.Warn("flush rejected by the DB; row quarantined", "table", s.schema.Table, "key", e.id, "err", err)
 		default:
@@ -226,7 +233,7 @@ func (s *Store) mergeBack(it flushItem) {
 	e := it.e
 	e.mu.Lock()
 	s.markDirtyLocked(e, it.mask)
-	if it.since.Before(e.dirtySince) {
+	if it.since < e.dirtySince {
 		e.dirtySince = it.since // the earliest: the age of 11.1 must not restart with every failed round
 	}
 	need := !e.queued
@@ -258,8 +265,8 @@ func (s *Store) recordOldestDirty(sh *shard) {
 	var oldest int64
 	for _, e := range queue {
 		e.mu.Lock()
-		if e.dirty != 0 && !e.poisoned && (oldest == 0 || e.dirtySince.UnixNano() < oldest) {
-			oldest = e.dirtySince.UnixNano()
+		if e.dirty != 0 && !e.poisoned && (oldest == 0 || e.dirtySince < oldest) {
+			oldest = e.dirtySince
 		}
 		e.mu.Unlock()
 	}
@@ -267,11 +274,13 @@ func (s *Store) recordOldestDirty(sh *shard) {
 }
 
 // refreshTooOld publishes whether the oldest dirty row that is not quarantined is older than MaxDirtyAge
-// (11.1). The flusher calls it after each shard and each round, so the limit is approximate: what a crash
-// can lose is bounded by about MaxDirtyAge + max(FlushInterval, DBTimeout).
+// (11.1). The flusher calls it between shards, at most once per FlushInterval, so the limit is
+// approximate: what a crash can lose is bounded by about MaxDirtyAge + max(FlushInterval, DBTimeout).
 func (s *Store) refreshTooOld() {
 	o := s.oldestDirty()
-	s.tooOld.Store(s.cfg.MaxDirtyAge > 0 && !o.IsZero() && time.Since(o) > s.cfg.MaxDirtyAge)
+	if v := s.cfg.MaxDirtyAge > 0 && !o.IsZero() && time.Since(o) > s.cfg.MaxDirtyAge; v != s.tooOld.Load() {
+		s.tooOld.Store(v) // only on a change: every Update reads it
+	}
 }
 
 // oldestDirty returns the earliest dirtySince over all shards, as their flushes last recorded it; the zero

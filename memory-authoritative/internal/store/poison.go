@@ -11,6 +11,9 @@ import (
 // acknowledged but the DB definitely rejects. A human corrects them with an Update, which is retried at
 // once.
 func (s *Store) Poisoned() []schema.Key {
+	if s.m.poisoned.Load() == 0 {
+		return nil
+	}
 	var keys []schema.Key
 	for _, sh := range s.shards {
 		sh.mu.RLock()

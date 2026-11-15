@@ -3,10 +3,8 @@ package store
 import (
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -234,7 +232,7 @@ func dirtyRows(t *testing.T, s *Store, d *fakedb.DB, n int) []schema.Key {
 // failBatches is a Hook under which every UpdateBatch is definitely not executed.
 func failBatches(_ context.Context, st *fakedb.Stmt) error {
 	if st.Kind == fakedb.UpdateBatch {
-		return fmt.Errorf("%w: injected", db.ErrNotExecuted)
+		return fail(db.ErrNotExecuted)(st)
 	}
 	return nil
 }
@@ -299,21 +297,10 @@ func TestFlushBacksOffWhileDBFails(t *testing.T) {
 		d := fakedb.New()
 		s := newTestStore(t, d) // FlushInterval 200ms
 		k := dirtyRows(t, s, d, 1)[0]
-		var calls atomic.Int64
-		var down atomic.Bool
-		down.Store(true)
-		d.Hook = func(ctx context.Context, st *fakedb.Stmt) error {
-			if !down.Load() {
-				return nil
-			}
-			calls.Add(1)
-			return failBatches(ctx, st)
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		var wg sync.WaitGroup
-		wg.Go(func() { s.RunFlusher(ctx) })
+		down := failWhileDown(d)
+		stop := runFlusher(s)
 		time.Sleep(10 * time.Second)
-		if n := calls.Load(); n < 3 || n > 12 {
+		if n := d.Updates(); n < 3 || n > 12 {
 			t.Fatalf("%d UpdateBatch calls in 10s, want 3 to 12 (about 50 without backoff)", n)
 		}
 		down.Store(false)
@@ -321,8 +308,7 @@ func TestFlushBacksOffWhileDBFails(t *testing.T) {
 		if got := bookkeeping(s, k); got != clean {
 			t.Fatalf("after the DB recovered: %s, want %s", got, clean)
 		}
-		cancel()
-		wg.Wait()
+		stop()
 		checkInvariants(t, s, d)
 	})
 }

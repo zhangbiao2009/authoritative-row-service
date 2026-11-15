@@ -89,8 +89,8 @@ type Store struct {
 	inflight   sync.WaitGroup // runSync goroutines: creates and deletes still running
 	entryCount atomic.Int64   // entries in the maps
 	m          metrics        // design.md 11.2
-	// The oldest dirty row that is not quarantined is older than MaxDirtyAge (11.1). Refreshed by the
-	// flusher after each round.
+	// The oldest dirty row that is not quarantined is older than MaxDirtyAge (11.1). Written only by
+	// refreshTooOld.
 	tooOld atomic.Bool
 	nowSec atomic.Int64 // coarse clock in Unix seconds, kept current by RunEvictor; cheaper than time.Now per access
 
@@ -131,8 +131,9 @@ func New(sch *schema.Schema, d db.DB, cfg Config) (*Store, error) {
 }
 
 type shard struct {
-	mu sync.RWMutex          // leaf lock: guards m only
-	m  map[schema.Key]*entry // at most one entry per key (I1)
+	mu           sync.RWMutex          // leaf lock: guards m only
+	hits, misses atomic.Int64          // Gets of the shard's keys; next to mu, which every Get writes anyway
+	m            map[schema.Key]*entry // at most one entry per key (I1)
 
 	qmu sync.Mutex // leaf lock: guards queue only
 	// Entries waiting to be flushed. A slice, so appending never blocks; an entry is in it at most once,
@@ -142,8 +143,6 @@ type shard struct {
 	// UnixNano of the earliest dirtySince among the shard's dirty rows, as its last flush found it; 0 if
 	// none. Written by that flush only.
 	oldestDirty atomic.Int64
-
-	hits, misses atomic.Int64 // Gets of the shard's keys; next to mu, whose cache line Get writes anyway
 }
 
 // absent is the snap of a row that definitely does not exist: a tombstone or a negative cache entry.
@@ -164,21 +163,21 @@ type entry struct {
 	mu     sync.Mutex
 	dirty  uint64 // columns changed in memory and not yet written to the DB (schema.ColBit); mu
 	queued bool   // in its shard's flush queue, or about to be appended to it; mu
-	// When dirty last went from 0 to non-zero; mu. A failed flush keeps the earlier time (11.1).
-	dirtySince time.Time
 	// The DB definitely rejected its flush: quarantined (7.9). It stays dirty, is written alone, and is
 	// left out of the age of 11.1; mu.
 	poisoned bool
 	// dead: removed from the map, or about to be (I1). Written with op and mu held, read with either (I9).
 	dead bool
+	// UnixNano of when dirty last went from 0 to non-zero; mu. A failed flush keeps the earlier time (11.1).
+	dirtySince int64
 
 	lastAccess atomic.Int64 // nowSec of the last access; read without locks by the evictor
 
 	// Accessed only with op held.
 	lastLoadErr   error
 	lastLoadErrAt time.Time
-	poisonVer     int64     // ver of the row the DB rejected; a newer one is retried at once
-	poisonRetryAt time.Time // when the same row is tried again
+	poisonVer     int64 // ver of the row the DB rejected; a newer one is retried at once
+	poisonRetryAt int64 // UnixNano of when the same row is tried again
 }
 
 func (s *Store) shardFor(key schema.Key) *shard {
@@ -186,9 +185,11 @@ func (s *Store) shardFor(key schema.Key) *shard {
 }
 
 // getOrCreate returns the key's entry, adding one if the map has none (I1).
-func (s *Store) getOrCreate(key schema.Key) *entry {
+func (s *Store) getOrCreate(key schema.Key) *entry { return s.getOrCreateIn(s.shardFor(key), key) }
+
+// getOrCreateIn is getOrCreate for a caller that has key's shard already.
+func (s *Store) getOrCreateIn(sh *shard, key schema.Key) *entry {
 	// TLA: Goc
-	sh := s.shardFor(key)
 	sh.mu.RLock()
 	e := sh.m[key]
 	sh.mu.RUnlock()
@@ -264,7 +265,7 @@ func (s *Store) lockOpTimed(ctx context.Context, e *entry) error {
 func (s *Store) markDirtyLocked(e *entry, mask uint64) {
 	if e.dirty == 0 {
 		s.dirtyCount.Add(1)
-		e.dirtySince = time.Now() // in-memory work: allowed under mu
+		e.dirtySince = time.Now().UnixNano() // in-memory work: allowed under mu
 	}
 	e.dirty |= mask
 }
@@ -274,6 +275,14 @@ func (s *Store) clearDirtyLocked(e *entry) {
 		s.dirtyCount.Add(-1)
 	}
 	e.dirty = 0
+}
+
+// poisonLocked puts e in quarantine (7.9).
+func (s *Store) poisonLocked(e *entry) {
+	if !e.poisoned {
+		e.poisoned = true
+		s.m.poisoned.Add(1)
+	}
 }
 
 // unpoisonLocked takes e out of quarantine: the DB holds its row, or the row is gone.

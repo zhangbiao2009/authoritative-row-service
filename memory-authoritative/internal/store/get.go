@@ -11,15 +11,16 @@ import (
 
 // Get returns the row, or ErrNotFound. The row is shared and immutable (I2): callers only read it.
 func (s *Store) Get(ctx context.Context, key schema.Key) (*schema.Row, error) {
+	sh := s.shardFor(key)
 	counted := false
 	for {
-		e := s.getOrCreate(key)
+		e := s.getOrCreateIn(sh, key)
 		s.touch(e)
 		// TLA: G_read. Linearization point: the load of snap.
 		r := e.snap.Load()
-		if !counted {
+		if !counted { // the first look only: a miss loads, then looks again
 			counted = true
-			if sh := s.shardFor(key); r != nil {
+			if r != nil {
 				sh.hits.Add(1)
 			} else {
 				sh.misses.Add(1)

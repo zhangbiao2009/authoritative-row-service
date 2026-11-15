@@ -27,6 +27,12 @@ type Change struct {
 	Gen  int64 // 0: no check; else ErrNotFound unless the row has this gen: an update for one life never changes another (7.3)
 }
 
+// Built once: they are answered exactly when the service is overloaded.
+var (
+	errBusyAge   = fmt.Errorf("%w: an unflushed update is older than MaxDirtyAge", ErrBusy)
+	errBusyCount = fmt.Errorf("%w: MaxDirty rows are dirty", ErrBusy)
+)
+
 // Update applies ch to the row in memory and returns the new row, which is shared and immutable (I2). It
 // does no DB IO: the flusher writes the row later. ErrNotFound if the row does not exist, or is not the
 // life ch.Gen names; ErrInvalid if ch is malformed or an increment fails, in which case nothing changes.
@@ -37,7 +43,7 @@ func (s *Store) Update(ctx context.Context, key schema.Key, ch Change) (*schema.
 	}
 	if s.tooOld.Load() { // every update, those of dirty rows included: they would only lengthen what a crash loses
 		s.m.busyAge.Add(1)
-		return nil, fmt.Errorf("%w: an unflushed update is older than MaxDirtyAge %v", ErrBusy, s.cfg.MaxDirtyAge)
+		return nil, errBusyAge
 	}
 	for {
 		e := s.getOrCreate(key)
@@ -63,7 +69,7 @@ func (s *Store) Update(ctx context.Context, key schema.Key, ch Change) (*schema.
 		if e.dirty == 0 && s.dirtyCount.Load() >= int64(s.cfg.MaxDirty) { // a dirty row does not grow the backlog
 			e.mu.Unlock()
 			s.m.busyCount.Add(1)
-			return nil, fmt.Errorf("%w: MaxDirty %d rows are dirty", ErrBusy, s.cfg.MaxDirty)
+			return nil, errBusyCount
 		}
 		nr := *old
 		nr.Vals = slices.Clone(old.Vals) // the values themselves are immutable and can be shared (I11)

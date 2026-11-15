@@ -16,9 +16,8 @@ import (
 	"rowsvc/internal/schema"
 )
 
-// startFlusher runs RunFlusher with a 1ms FlushInterval; the returned func stops it and waits for it.
-func startFlusher(s *Store) (stop func()) {
-	s.cfg.FlushInterval = time.Millisecond
+// runFlusher runs RunFlusher; the returned func stops it and waits for it.
+func runFlusher(s *Store) (stop func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Go(func() { s.RunFlusher(ctx) })
@@ -26,6 +25,12 @@ func startFlusher(s *Store) (stop func()) {
 		cancel()
 		wg.Wait()
 	}
+}
+
+// startFlusher runs RunFlusher with a 1ms FlushInterval.
+func startFlusher(s *Store) (stop func()) {
+	s.cfg.FlushInterval = time.Millisecond
+	return runFlusher(s)
 }
 
 // Acceptance (design.md 12.2 M2): N goroutines each increment the same column K times while the flusher

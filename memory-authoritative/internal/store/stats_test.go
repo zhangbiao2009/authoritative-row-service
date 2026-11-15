@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -102,17 +101,7 @@ func TestStats(t *testing.T) {
 		want.Fences, want.FencesUnconfirmed = 2, 1
 		check("a fence and an unconfirmed one")
 
-		release := make(chan struct{})
-		script(d, map[fakedb.Kind][]step{fakedb.Insert: {blockOn(release)}})
-		cctx, cancel := context.WithTimeout(ctx, time.Second)
-		_, err := s.Create(cctx, newRow(k5, 5, 0))
-		cancel()
-		if !errors.Is(err, ErrOutcomeUnknown) {
-			t.Fatalf("Create = %v, want ErrOutcomeUnknown", err)
-		}
-		close(release)
-		s.inflight.Wait()
-		d.Hook = nil
+		giveUp(t, s, d, newRow(k5, 5, 0))()
 		want.Entries, want.OutcomeUnknown = 4, 1
 		check("a create answered ErrOutcomeUnknown")
 	})

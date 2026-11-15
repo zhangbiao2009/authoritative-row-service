@@ -148,7 +148,8 @@ func (d *DB) Stats() Stats {
 // Selects returns the number of Select calls so far, including ones the hook failed.
 func (d *DB) Selects() int { return int(d.selects.Load()) }
 
-// Updates returns the number of Update calls so far, including ones the hook failed.
+// Updates returns the number of Update and UpdateBatch calls so far, one per call, including ones the hook
+// failed.
 func (d *DB) Updates() int { return int(d.updates.Load()) }
 
 // Violation returns the first broken assertion (tla-mapping.md section 5), or nil:

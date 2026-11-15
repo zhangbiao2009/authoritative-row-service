@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"slices"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -26,17 +25,6 @@ func failWhileDown(d *fakedb.DB) *atomic.Bool {
 		return nil
 	}
 	return &down
-}
-
-// runFlusher starts RunFlusher with the store's own FlushInterval; stop ends it.
-func runFlusher(s *Store) (stop func()) {
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	wg.Go(func() { s.RunFlusher(ctx) })
-	return func() {
-		cancel()
-		wg.Wait()
-	}
 }
 
 func maxDirtyAge(d time.Duration) func(*Config) { return func(c *Config) { c.MaxDirtyAge = d } }
