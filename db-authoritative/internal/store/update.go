@@ -56,7 +56,7 @@ func (s *Store) updateLocked(e *entry, ch Change) (*schema.Row, error) {
 	if err != nil {
 		return nil, err // ErrInvalid: nothing was sent
 	}
-	got, err := s.db.Update(s.bgCtx, nr, cols) // WHERE pk AND gen = old.Gen; ver = ver + 1
+	got, err := s.db.Update(s.bgCtx, nr, cols) // WHERE pk AND gen = old.Gen; ver = ver + 1 (I6)
 	// TLA: B_2
 	switch {
 	case err == nil:
