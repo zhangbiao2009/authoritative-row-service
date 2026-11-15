@@ -54,7 +54,8 @@ func (s *Store) createLocked(e *entry, in *schema.Row) (*schema.Row, error) {
 		}
 		return nil, ErrAlreadyExists
 	}
-	if in.Gen == 0 {
+	fresh := in.Gen == 0 // a gen generated here has never been used before
+	if fresh {
 		in.Gen = newGen()
 	}
 	got, err := s.db.InsertDedup(s.bgCtx, in)
@@ -77,13 +78,21 @@ func (s *Store) createLocked(e *entry, in *schema.Row) (*schema.Row, error) {
 		if now != absent && now.Gen == in.Gen {
 			return now, nil
 		}
-		claimed, cerr := s.db.GenClaimed(s.bgCtx, e.id, in.Gen)
-		if cerr != nil {
-			// Settled in the DB, but unknown to us. A retry with this gen decides it: nothing is in flight.
-			return nil, ErrOutcomeUnknown
-		}
-		if claimed {
-			return nil, nil
+		// The row is absent, so this INSERT did not execute (it writes the row and the dedup record together,
+		// and op is held). The gen can still be claimed by an earlier create with the same gen whose life was
+		// deleted since (an SDK retry, hole 2); a gen generated here cannot. The lookup is retried until it
+		// succeeds, like the read: the outcome is settled in the DB, so the answer must be definite (7.5).
+		if !fresh {
+			for attempt := 0; ; attempt++ {
+				claimed, cerr := s.db.GenClaimed(s.bgCtx, e.id, in.Gen)
+				if cerr == nil {
+					if claimed {
+						return nil, nil
+					}
+					break
+				}
+				s.backoff(attempt) // M6: give up with errAbandoned at shutdown, as fenceAndReadLocked does
+			}
 		}
 		return nil, fmt.Errorf("%w: create not applied after fence", db.ErrNotExecuted)
 	default:
