@@ -404,12 +404,12 @@ func TestUpdateAmbiguousNotApplied(t *testing.T) {
 			t.Fatalf("err = %v, want ErrNotExecuted", err)
 		}
 		rec.wantFences(t, 1, fakedb.Update)
+		if n := d.Pending(); n != 0 { // before late(): only the fence can clear it
+			t.Fatalf("Pending = %d, want 0", n)
+		}
 		late() // too late: the session is fenced
 		if r := d.Row(k); r.Ver != 3 || r.Vals[1] != "a" {
 			t.Fatalf("DB row %+v changed after the answer", r)
-		}
-		if n := d.Pending(); n != 0 {
-			t.Fatalf("Pending = %d, want 0", n)
 		}
 		checkInvariants(t, s, d)
 	})
@@ -476,6 +476,9 @@ func TestUpdateReadAfterFenceFails(t *testing.T) {
 			t.Fatalf("err = %v, want ErrNotExecuted", err)
 		}
 		rec.wantFences(t, 1, fakedb.Update)
+		if n := d.Pending(); n != 0 { // the kept statement never runs: only the fence clears it
+			t.Fatalf("Pending = %d, want 0", n)
+		}
 		if n := len(rec.of(fakedb.Select)); n != 4 { // the load, then three after the fence
 			t.Fatalf("Selects = %d, want 4", n)
 		}
