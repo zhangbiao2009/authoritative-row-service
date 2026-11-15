@@ -35,6 +35,10 @@ func (s *Store) Update(ctx context.Context, key schema.Key, ch Change) (*schema.
 	if err != nil {
 		return nil, err
 	}
+	if s.tooOld.Load() { // every update, those of dirty rows included: they would only lengthen what a crash loses
+		s.m.busyAge.Add(1)
+		return nil, fmt.Errorf("%w: an unflushed update is older than MaxDirtyAge %v", ErrBusy, s.cfg.MaxDirtyAge)
+	}
 	for {
 		e := s.getOrCreate(key)
 		s.touch(e)
@@ -55,6 +59,11 @@ func (s *Store) Update(ctx context.Context, key schema.Key, ch Change) (*schema.
 		if old == absent || (ch.Gen != 0 && old.Gen != ch.Gen) {
 			e.mu.Unlock()
 			return nil, ErrNotFound
+		}
+		if e.dirty == 0 && s.dirtyCount.Load() >= int64(s.cfg.MaxDirty) { // a dirty row does not grow the backlog
+			e.mu.Unlock()
+			s.m.busyCount.Add(1)
+			return nil, fmt.Errorf("%w: MaxDirty %d rows are dirty", ErrBusy, s.cfg.MaxDirty)
 		}
 		nr := *old
 		nr.Vals = slices.Clone(old.Vals) // the values themselves are immutable and can be shared (I11)

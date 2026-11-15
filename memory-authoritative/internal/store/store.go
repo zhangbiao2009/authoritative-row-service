@@ -32,6 +32,7 @@ var (
 	ErrNotFound       = errors.New("not found")
 	ErrAlreadyExists  = errors.New("already exists")
 	ErrOutcomeUnknown = errors.New("outcome unknown") // the caller's ctx expired; the create or delete goes on (7.4)
+	ErrBusy           = errors.New("busy")            // backpressure (11.1): the update was not applied
 	ErrInvalid        = schema.ErrInvalid             // the same value, so errors.Is works whichever package wrapped it
 	ErrInternal       = errors.New("internal")        // an invariant is broken
 )
@@ -43,6 +44,10 @@ type Config struct {
 	DBTimeout      time.Duration // timeout for each DB call on the Go side (design.md 11.4)
 	OpFenceTimeout time.Duration // how long one FenceSessions call may wait for the sessions to exit (7.4)
 	FlushBatchMax  int           // rows per UpdateBatch, at most (design.md 7.6)
+
+	// Backpressure (design.md 11.1).
+	MaxDirty    int           // updates of clean rows get ErrBusy while this many rows are dirty
+	MaxDirtyAge time.Duration // every update gets ErrBusy while the oldest dirty row is older; 0: no limit
 
 	// Eviction (design.md 7.7). TTLs count in whole seconds; 0 means "not accessed in the current second".
 	IdleTTL         time.Duration // a loaded row idle this long is removed from memory
@@ -61,6 +66,8 @@ func DefaultConfig() Config {
 		DBTimeout:      3 * time.Second,
 		OpFenceTimeout: 10 * time.Second,
 		FlushBatchMax:  500,
+		MaxDirty:       100_000, // 11.4: TBD; a tenth of MaxEntries
+		MaxDirtyAge:    30 * time.Second,
 
 		IdleTTL:         10 * time.Minute, // 11.4: TBD
 		NegativeIdleTTL: time.Minute,      // 11.4: 1-5 minutes
@@ -82,7 +89,10 @@ type Store struct {
 	inflight   sync.WaitGroup // runSync goroutines: creates and deletes still running
 	entryCount atomic.Int64   // entries in the maps
 	m          metrics        // design.md 11.2
-	nowSec     atomic.Int64   // coarse clock in Unix seconds, kept current by RunEvictor; cheaper than time.Now per access
+	// The oldest dirty row that is not quarantined is older than MaxDirtyAge (11.1). Refreshed by the
+	// flusher after each round.
+	tooOld atomic.Bool
+	nowSec atomic.Int64 // coarse clock in Unix seconds, kept current by RunEvictor; cheaper than time.Now per access
 
 	// failpoint, if set, runs at the named points of a gap that is not a DB call (tla-mapping.md 3.1). Tests
 	// only; nil in production.
@@ -104,8 +114,9 @@ func New(sch *schema.Schema, d db.DB, cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("FlushInterval %v, DBTimeout %v and OpFenceTimeout %v must be positive",
 			cfg.FlushInterval, cfg.DBTimeout, cfg.OpFenceTimeout)
 	}
-	if cfg.FlushBatchMax <= 0 {
-		return nil, fmt.Errorf("FlushBatchMax %d must be positive", cfg.FlushBatchMax)
+	if cfg.FlushBatchMax <= 0 || cfg.MaxDirty <= 0 || cfg.MaxDirtyAge < 0 {
+		return nil, fmt.Errorf("FlushBatchMax %d and MaxDirty %d must be positive, MaxDirtyAge %v not negative",
+			cfg.FlushBatchMax, cfg.MaxDirty, cfg.MaxDirtyAge)
 	}
 	if cfg.IdleTTL < 0 || cfg.NegativeIdleTTL < 0 || cfg.EvictInterval <= 0 || cfg.MaxSweepRounds <= 0 || cfg.MaxEntries <= 0 {
 		return nil, fmt.Errorf("eviction config: TTLs must not be negative, EvictInterval %v, MaxSweepRounds %d and MaxEntries %d must be positive",
