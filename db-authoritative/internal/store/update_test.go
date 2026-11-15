@@ -357,3 +357,28 @@ func TestConcurrentIncrementsMatchDB(t *testing.T) {
 	}
 	checkInvariants(t, s, d)
 }
+
+// A request whose ctx is already done has not started: it must not take op or send a write.
+func TestUpdateWithExpiredCtxSendsNothing(t *testing.T) {
+	d := fakedb.New()
+	s := newTestStore(t, d)
+	k := key(t, s, 1)
+	d.Put(testRow(k, 1))
+	if _, err := s.Get(context.Background(), k); err != nil {
+		t.Fatal(err)
+	}
+	before := d.Row(k)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < 100; i++ {
+		if _, err := s.Update(ctx, k, Change{Cols: []ColChange{incr(2, 1)}}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("call %d: Update = %v, want context.Canceled", i, err)
+		}
+	}
+	if n := d.Updates(); n != 0 {
+		t.Fatalf("Updates = %d, want 0", n)
+	}
+	if got := d.Row(k); !reflect.DeepEqual(got, before) {
+		t.Fatalf("row changed: %+v, want %+v", got, before)
+	}
+}

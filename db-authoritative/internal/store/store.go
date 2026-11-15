@@ -116,6 +116,9 @@ func (s *Store) getOrCreate(key schema.Key) *entry {
 }
 
 func (e *entry) lockOp(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err // already expired: the request has not started, and select would pick at random
+	}
 	select {
 	case e.op <- struct{}{}:
 		return nil

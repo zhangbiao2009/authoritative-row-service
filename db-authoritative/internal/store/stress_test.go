@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,9 +25,17 @@ func TestStressUpdates(t *testing.T) {
 		keys[i] = key(t, s, int64(i+1))
 		d.Put(testRow(keys[i], int64(i+1)))
 	}
+	// Slow about one Update in three, so the 1 ms ctx sometimes expires while the write is in flight.
+	d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
+		if st.Kind == fakedb.Update && rand.IntN(3) == 0 {
+			time.Sleep(time.Duration(rand.IntN(3000)) * time.Microsecond)
+		}
+		return nil
+	}
 	var mu sync.Mutex
 	okIncr := make([]int, len(keys))      // answered OK
 	unknownIncr := make([]int, len(keys)) // answered ErrOutcomeUnknown: it still ran (no faults)
+	var gaveUp atomic.Int64               // all Updates answered ErrOutcomeUnknown
 	var wg sync.WaitGroup
 	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
@@ -70,6 +79,7 @@ func TestStressUpdates(t *testing.T) {
 							mu.Unlock()
 						}
 					case errors.Is(err, ErrOutcomeUnknown):
+						gaveUp.Add(1)
 						if isIncr {
 							mu.Lock()
 							unknownIncr[ki]++
@@ -90,6 +100,9 @@ func TestStressUpdates(t *testing.T) {
 	}
 	wg.Wait()
 	s.inflight.Wait()
+	if gaveUp.Load() == 0 {
+		t.Error("no Update was answered ErrOutcomeUnknown: the stress test never reached W_ClientGaveUp")
+	}
 	checkInvariants(t, s, d)
 	for i, k := range keys {
 		want := int64(10 + okIncr[i] + unknownIncr[i])
