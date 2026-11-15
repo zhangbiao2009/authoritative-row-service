@@ -83,14 +83,17 @@ func (s *Store) idleExpired(e *entry, now int64) bool {
 	return now-e.lastAccess.Load() > int64(ttl/time.Second)
 }
 
-// capacityEvictShard removes up to quota of the shard's least recently accessed entries, from samples. A
-// sample that yields nothing (every entry dirty or busy) ends it: backpressure is what limits growth then.
+// capacityEvictShard removes up to quota of the shard's least recently accessed entries, from samples. Each
+// sample gives up at most its oldest quarter, so however large the quota, no entry with sampleK*3/4 or more
+// newer entries in the shard is chosen; a sample smaller than sampleK is the whole shard, and gives up its
+// oldest. A sample that yields nothing (the oldest all dirty or busy) ends it: backpressure is what limits
+// growth then. Every round but the last evicts at least one entry, so there are at most quota rounds.
 func (s *Store) capacityEvictShard(sh *shard, quota int) {
 	type cand struct {
 		e  *entry
 		at int64 // lastAccess when sampled, so that the order holds while touches go on
 	}
-	for range s.cfg.MaxSweepRounds {
+	for {
 		cands := make([]cand, 0, sampleK)
 		sh.mu.RLock()
 		for _, e := range sh.m {
@@ -99,11 +102,13 @@ func (s *Store) capacityEvictShard(sh *shard, quota int) {
 			}
 		}
 		sh.mu.RUnlock()
-		if quota < len(cands) { // otherwise every candidate is tried and the order does not matter
-			slices.SortFunc(cands, func(a, b cand) int { return cmp.Compare(a.at, b.at) })
+		slices.SortFunc(cands, func(a, b cand) int { return cmp.Compare(a.at, b.at) })
+		oldest := cands
+		if len(cands) == sampleK {
+			oldest = cands[:sampleK/4]
 		}
 		evicted := 0
-		for _, c := range cands {
+		for _, c := range oldest {
 			if evicted == quota {
 				break
 			}

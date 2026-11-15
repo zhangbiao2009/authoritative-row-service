@@ -974,7 +974,7 @@ Eviction has two triggers:
 | Trigger | Condition | Approach |
 |---|---|---|
 | Idle sweep | `now - lastAccess > IdleTTL` (absent entries or entries that failed to load use `NegativeIdleTTL`) | Each shard is sample-checked once every `EvictInterval` |
-| Capacity eviction | `entryCount > MaxEntries` (high-water mark) | Sample, and evict the least recently accessed in the sample, until dropping to the low-water mark (e.g. 0.9 × MaxEntries) |
+| Capacity eviction | `entryCount > MaxEntries` (high-water mark) | Sample, and evict the least recently accessed quarter of each sample, until dropping to the low-water mark (e.g. 0.9 × MaxEntries) |
 
 **Why sampling, rather than a full scan or an LRU list:**
 
@@ -1047,7 +1047,7 @@ func (s *Store) tryEvict(sh *shard, e *entry, eligible func(*entry) bool) bool {
 }
 ```
 
-Capacity eviction (`capacityEvictShard`) follows the same flow: take K samples under RLock, release the lock, sort by `lastAccess` from oldest to newest, and call `tryEvict` on each (eligible simply returns true), until this shard has evicted its quota. If capacity is already exceeded and all entries in the sample are dirty and cannot be evicted, the flush is falling behind; at that point backpressure (11.1) is relied on to limit growth.
+Capacity eviction (`capacityEvictShard`) follows the same flow: take K samples under RLock, release the lock, sort by `lastAccess` from oldest to newest, and call `tryEvict` on the oldest quarter (eligible simply returns true); repeat until this shard has evicted its quota. Only a quarter: the quota is often far larger than a sample (just above `MaxEntries` with the defaults, 0.1 × 1,000,000 / 256 shards ≈ 391 per shard, against K = 64), and evicting whole samples would be random eviction. Taking the oldest quarter, no entry with 3K/4 or more newer entries in its shard is evicted. A sample smaller than K is the whole shard, and gives up its oldest. The rounds are not capped by `MaxSweepRounds`: each round but the last evicts at least one entry, so there are at most quota rounds. If capacity is already exceeded and the oldest entries in the sample are all dirty and cannot be evicted, the flush is falling behind; at that point backpressure (11.1) is relied on to limit growth.
 
 **The three rules of the dead protocol:**
 
@@ -1610,7 +1610,7 @@ The whole service is deployed as a single instance, and the deployment process r
 | `IdleTTL` | How long a row must be idle before it is cleared from memory | TBD |
 | `NegativeIdleTTL` | Idle TTL for tombstones and negative-cache entries | Shorter than IdleTTL, e.g. 1-5 minutes |
 | `EvictInterval` | Interval between idle sampling runs | 1s |
-| `MaxSweepRounds` | Maximum consecutive rounds per sampling run | 16 |
+| `MaxSweepRounds` | Maximum consecutive rounds per idle sweep of a shard | 16 |
 | `MaxEntries` | Upper limit (high-water mark) on the number of entries per table, determined by the memory budget | TBD |
 | `MaxDirty` | Upper limit on dirty rows; beyond it, backpressure applies | TBD |
 | `MaxDirtyAge` | Upper limit on the age of the oldest dirty row; beyond it, every update returns `ErrBusy` (11.1). Bounds what a crash can lose while the DB cannot be written. 0 disables it | 30s |

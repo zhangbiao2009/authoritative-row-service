@@ -390,6 +390,31 @@ func TestCapacityEvictsOldestFirst(t *testing.T) {
 	checkInvariants(t, s, d)
 }
 
+// A quota larger than a sample: each sample gives up only its oldest quarter, so an entry with sampleK*3/4
+// or more entries newer than it in the shard is never chosen.
+func TestCapacityEvictsOnlyOldestOfLargeSamples(t *testing.T) {
+	d := fakedb.New()
+	s := newTestStore(t, d, ttls(time.Hour, time.Hour), func(c *Config) { c.NumShards, c.MaxEntries = 1, 100 })
+	var ks []schema.Key
+	for i := range 200 {
+		s.nowSec.Store(int64(1000 + i))
+		k := key(t, s, int64(i+1))
+		create(t, s, newRow(k, int64(i+1), 0))
+		ks = append(ks, k)
+	}
+	s.nowSec.Store(2000)
+	s.evictOnce()
+	if n := s.entryCount.Load(); n != 90 {
+		t.Fatalf("entryCount %d, want 90 (the low-water mark)", n)
+	}
+	for i, k := range ks[len(ks)-sampleK*3/4:] {
+		if entryOf(s, k) == nil {
+			t.Fatalf("one of the %d most recent keys (accessed at second %d) was evicted", sampleK*3/4, 1000+200-sampleK*3/4+i)
+		}
+	}
+	checkInvariants(t, s, d)
+}
+
 // Review Focus 3.
 func TestCapacityEvictionAllDirtyReturns(t *testing.T) {
 	d := fakedb.New()
