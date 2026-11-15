@@ -83,33 +83,35 @@ func TestEvictSkipsBusyOp(t *testing.T) {
 }
 
 // Review Focus 4; gap evict-dead (tla-mapping.md 3.1); mutations EvictNoDead, UpdateIgnoresDead. An Update that
-// meets the entry between dead and its removal from the map spins, then lands on a fresh entry. Real time:
-// a spinning goroutine never blocks, so synctest could not wait for it.
+// meets the entry between dead and its removal from the map waits for op, which the remover holds until the
+// entry is gone, then lands on a fresh entry loaded from the DB.
 func TestUpdateDuringEvictionIsKept(t *testing.T) {
-	d := fakedb.New()
-	s := newTestStore(t, d)
-	k := key(t, s, 1)
-	loaded(t, s, d, k)
-	var wg sync.WaitGroup
-	var got *schema.Row
-	var err error
-	at(s, "evict-dead", func(*entry) {
-		wg.Go(func() { got, err = s.Update(context.Background(), k, Change{Cols: []ColChange{set(1, "x")}}) })
-		time.Sleep(50 * time.Millisecond) // the Update reaches the dead entry and spins
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		loaded(t, s, d, k)
+		var wg sync.WaitGroup
+		var got *schema.Row
+		var err error
+		at(s, "evict-dead", func(*entry) {
+			wg.Go(func() { got, err = s.Update(context.Background(), k, Change{Cols: []ColChange{set(1, "x")}}) })
+			synctest.Wait() // the Update meets the dead entry and waits for its op
+		})
+		if !evict(t, s, k) {
+			t.Fatal("not evicted")
+		}
+		wg.Wait()
+		if err != nil || got.Vals[1] != "x" {
+			t.Fatalf("Update = %+v, %v", got, err)
+		}
+		if g, _ := s.Get(context.Background(), k); g.Vals[1] != "x" {
+			t.Fatalf("Get after the update = %+v, want name x: the update was lost", g)
+		}
+		flushAll(s)
+		memMatchesDB(t, s, d, k)
+		checkInvariants(t, s, d)
 	})
-	if !evict(t, s, k) {
-		t.Fatal("not evicted")
-	}
-	wg.Wait()
-	if err != nil || got.Vals[1] != "x" {
-		t.Fatalf("Update = %+v, %v", got, err)
-	}
-	if g, _ := s.Get(context.Background(), k); g.Vals[1] != "x" {
-		t.Fatalf("Get after the update = %+v, want name x: the update was lost", g)
-	}
-	flushAll(s)
-	memMatchesDB(t, s, d, k)
-	checkInvariants(t, s, d)
 }
 
 // Dead protocol rule 3: a lock-free reader of the entry being removed reads its last value.

@@ -29,6 +29,7 @@ the model to match the code, without asking.
 | `"rej"` only means "rejected because of another row" | Rejection by the row's own data (CHECK, NOT NULL, length) is the `default` branch of the until-sure loops | Same parameters on every attempt, so the earlier attempt was rejected too (7.4) |
 | Not modeled: poison rows (7.9), backpressure (11.1), `lastLoadErr` cache, backoff, `nowSec`, `dirtySince`, metrics | Present | They only return errors earlier or change timing; none may change which branch a step takes |
 | Eviction may happen at any moment | TTL / capacity policy, sampling, `eligible` re-check | The model covers every timing; policy only narrows it |
+| `U_mu` on a dead entry goes straight back to `Goc` | `Update` on a dead entry goes through `load`: waits for `op`, sees `dead`, then looks the key up again (design.md 7.3, changed in M5) | The extra steps change no state: they only hold the `op` of an entry already removed from the map, which no one else can reach; the model already takes `Update` through `L_lock`/`L_load` on a dead entry whose `snap` is nil |
 | Superseded instance detects the new epoch: not a step | 0-row UPDATE/DELETE triggers an epoch check (7.6); periodic check (7.8) | The model checks the effect (`EpochOk`) of every statement; stopping is liveness, not safety |
 | SDK behaviour (`retry`, `unkGen`, `NotFinal`, `SdkAnswer`) is part of the client process | `client/` package (M8) | |
 | No TCP server, no protocol | `internal/server` (M8) | |
@@ -103,7 +104,7 @@ Each row is one atomic step of the model. In Go a step is a stretch of one funct
 | `G_read` | `Get` (7.2) | `e.snap.Load()`: linearization point; `nil` → `load`, then back to the top. No `dead` check (dead protocol rule 3) |
 | `L_lock` | `load` (7.2) | `e.lockOp(ctx)` |
 | `L_load` | `load` → `ensureLoadedLocked` (7.2) | `dead` check; re-check `snap`; `db.Select`; `snap.Store` under `mu`; `unlockOp` |
-| `U_mu` | `Update` (7.3) | the whole `mu` critical section: `dead` → `Gosched`, retry; `nil` → unlock `mu`, `load`; absent or gen mismatch → `ErrNotFound`; else build the new Row, `snap.Store` (linearization point), `markDirtyLocked`, set `queued` |
+| `U_mu` | `Update` (7.3) | the whole `mu` critical section: `dead` or `nil` → unlock `mu`, `load` (which, for a dead entry, waits for `op` and returns without reading), retry; absent or gen mismatch → `ErrNotFound`; else build the new Row, `snap.Store` (linearization point), `markDirtyLocked`, set `queued` |
 | `U_enq` | `Update` → `enqueue` (7.1) | after `mu.Unlock` |
 | `X_lock` | `Create` / `Delete` → `lockOpLive` (7.1), then `runSync` starts the goroutine (7.4) | |
 | `X_qtimeout` | `lockOpLive` returns `ctx.Err()` | timed out while queued for `op`: definitely not executed |
