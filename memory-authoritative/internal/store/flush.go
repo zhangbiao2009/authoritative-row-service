@@ -144,9 +144,16 @@ func (s *Store) writeBatch(ctx context.Context, items []flushItem) (failed bool)
 		ws[i] = db.Write{Row: it.row, Mask: it.mask}
 	}
 	// TLA: F_send. One transaction of conditional writes of absolute values (I6, I12).
+	start := time.Now()
 	wctx, cancel := context.WithTimeout(ctx, s.cfg.DBTimeout)
 	err := s.db.UpdateBatch(wctx, ws)
 	cancel()
+	s.m.flushBatches.Add(1)
+	s.m.flushRows.Add(int64(len(items)))
+	s.m.flushTime.Add(int64(time.Since(start)))
+	if err != nil {
+		s.m.flushFailures.Add(1)
+	}
 	// TLA: F_done
 	switch {
 	case err == nil:

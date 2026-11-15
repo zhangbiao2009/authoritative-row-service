@@ -147,6 +147,7 @@ func (s *Store) tryEvict(sh *shard, e *entry, eligible func(*entry) bool) bool {
 	}
 	s.fail("evict-dead", e)
 	s.removeLocked(sh, e)
+	s.m.evictions.Add(1)
 	return true
 }
 

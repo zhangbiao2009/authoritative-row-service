@@ -142,6 +142,8 @@ type shard struct {
 	// UnixNano of the earliest dirtySince among the shard's dirty rows, as its last flush found it; 0 if
 	// none. Written by that flush only.
 	oldestDirty atomic.Int64
+
+	hits, misses atomic.Int64 // Gets of the shard's keys; next to mu, whose cache line Get writes anyway
 }
 
 // absent is the snap of a row that definitely does not exist: a tombstone or a negative cache entry.
@@ -216,7 +218,7 @@ func (s *Store) touch(e *entry) {
 func (s *Store) lockOpLive(ctx context.Context, key schema.Key) (*entry, error) {
 	for {
 		e := s.getOrCreate(key)
-		if err := e.lockOp(ctx); err != nil {
+		if err := s.lockOpTimed(ctx, e); err != nil {
 			return nil, err
 		}
 		if !e.dead { // op is enough to read dead (I9)
@@ -245,6 +247,18 @@ func (e *entry) tryLockOp() bool {
 }
 
 func (e *entry) unlockOp() { <-e.op }
+
+// lockOpTimed is lockOp that counts the time spent waiting (11.2).
+func (s *Store) lockOpTimed(ctx context.Context, e *entry) error {
+	if e.tryLockOp() {
+		return nil
+	}
+	start := time.Now()
+	err := e.lockOp(ctx)
+	s.m.opWaits.Add(1)
+	s.m.opWaitTime.Add(int64(time.Since(start)))
+	return err
+}
 
 // markDirtyLocked adds mask (non-zero) to e's dirty columns.
 func (s *Store) markDirtyLocked(e *entry, mask uint64) {

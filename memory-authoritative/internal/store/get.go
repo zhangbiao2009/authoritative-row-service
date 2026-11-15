@@ -11,11 +11,21 @@ import (
 
 // Get returns the row, or ErrNotFound. The row is shared and immutable (I2): callers only read it.
 func (s *Store) Get(ctx context.Context, key schema.Key) (*schema.Row, error) {
+	counted := false
 	for {
 		e := s.getOrCreate(key)
 		s.touch(e)
 		// TLA: G_read. Linearization point: the load of snap.
-		if r := e.snap.Load(); r != nil {
+		r := e.snap.Load()
+		if !counted {
+			counted = true
+			if sh := s.shardFor(key); r != nil {
+				sh.hits.Add(1)
+			} else {
+				sh.misses.Add(1)
+			}
+		}
+		if r != nil {
 			if r == absent {
 				return nil, ErrNotFound
 			}
@@ -30,7 +40,7 @@ func (s *Store) Get(ctx context.Context, key schema.Key) (*schema.Row, error) {
 // load fills e.snap from the DB. Concurrent misses queue on op, so only the first one reads the DB.
 func (s *Store) load(ctx context.Context, e *entry) error {
 	// TLA: L_lock
-	if err := e.lockOp(ctx); err != nil {
+	if err := s.lockOpTimed(ctx, e); err != nil {
 		return err // gave up while queued
 	}
 	defer e.unlockOp()
@@ -59,6 +69,7 @@ func (s *Store) ensureLoadedLocked(ctx context.Context, e *entry) (*schema.Row, 
 	case err != nil:
 		if ctx.Err() == nil { // the caller's own cancellation says nothing about the DB
 			e.lastLoadErr, e.lastLoadErrAt = err, time.Now()
+			s.m.loadErrors.Add(1)
 		}
 		return nil, err
 	}
