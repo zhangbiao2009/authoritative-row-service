@@ -192,7 +192,7 @@ point (no operation running), takes each entry's `op` with `tryLockOp`, and comp
 | `LiveEntryInMap` (I1) | `checkInvariants`: entries in the map are not dead; the evict-dead failpoint test | M5 |
 | `DbValsBelongToGen` | stress updates carry `Change.Gen` and write values tagged with that gen; `fakedb` asserts every applied write keeps the tags equal to the row's gen | M3 |
 | `FencedRestart` (I13) | crash-recovery test: once the new Store's startup returns, no pending statement of an old session can still execute | M6 |
-| `DbVerMonotonic` | `fakedb` asserts on every applied write: same gen → ver does not decrease; values change → ver increases | M2 |
+| `DbVerMonotonic` | holds by construction in `fakedb`, which computes `ver = ver + 1` itself; against PG, the SQL of 8.3 (M7) | M2, M7 |
 | `EventuallyResponds` | every test operation returns before its deadline | M2 |
 | `BackgroundSettles` | `s.inflight.Wait()` returns once faults stop | M3 |
 | `NoLockLeak` | end of every stress test: `tryLockOp` succeeds on every entry | M2 |

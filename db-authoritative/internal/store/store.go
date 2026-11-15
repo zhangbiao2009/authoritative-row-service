@@ -26,6 +26,9 @@ import (
 var (
 	ErrNotFound = errors.New("not found")
 	ErrInvalid  = schema.ErrInvalid // the same value, so errors.Is works whichever package wrapped it
+
+	ErrOutcomeUnknown = errors.New("outcome unknown") // the caller's ctx expired before the outcome was settled
+	ErrInternal       = errors.New("internal")        // an invariant is broken
 )
 
 type Config struct {
@@ -48,13 +51,16 @@ type Store struct {
 	db     db.DB
 	cfg    Config
 	seed   maphash.Seed
+
+	inflight sync.WaitGroup  // runSync goroutines
+	bgCtx    context.Context // for DB calls that must finish whatever the caller does (design.md 7.1)
 }
 
 func New(sch *schema.Schema, d db.DB, cfg Config) (*Store, error) {
 	if cfg.NumShards <= 0 || cfg.NumShards&(cfg.NumShards-1) != 0 {
 		return nil, fmt.Errorf("NumShards %d is not a positive power of 2", cfg.NumShards)
 	}
-	s := &Store{schema: sch, db: d, cfg: cfg, seed: maphash.MakeSeed(), shards: make([]*shard, cfg.NumShards)}
+	s := &Store{schema: sch, db: d, cfg: cfg, seed: maphash.MakeSeed(), bgCtx: context.Background(), shards: make([]*shard, cfg.NumShards)}
 	for i := range s.shards {
 		s.shards[i] = &shard{m: make(map[schema.Key]*entry)}
 	}
@@ -110,6 +116,9 @@ func (s *Store) getOrCreate(key schema.Key) *entry {
 }
 
 func (e *entry) lockOp(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err // already expired: the request has not started, and select would pick at random
+	}
 	select {
 	case e.op <- struct{}{}:
 		return nil
@@ -119,3 +128,41 @@ func (e *entry) lockOp(ctx context.Context) error {
 }
 
 func (e *entry) unlockOp() { <-e.op }
+
+// lockOpLive acquires op on the key's entry. (Until M5 no entry is ever dead, so this is getOrCreate + lockOp.)
+// TLA: X_lock; a ctx error while queued is X_qtimeout.
+func (s *Store) lockOpLive(ctx context.Context, key schema.Key) (*entry, error) {
+	e := s.getOrCreate(key)
+	if err := e.lockOp(ctx); err != nil {
+		return nil, err // timed out while queued: this request did nothing
+	}
+	return e, nil
+}
+
+// runSync runs fn in a background goroutine that already holds op, and releases op only when fn returns,
+// that is, when the outcome is settled. If the client's ctx expires first, the client gets ErrOutcomeUnknown
+// and fn keeps running. Used by Create, Update and Delete.
+func runSync[T any](ctx context.Context, s *Store, e *entry, fn func(*entry) (T, error)) (T, error) {
+	type result struct {
+		v   T
+		err error
+	}
+	done := make(chan result, 1)
+	s.inflight.Add(1)
+	go func() {
+		defer s.inflight.Done()
+		// No defer for op or the answer: a panic in fn crashes the process with op held, instead of
+		// releasing op and sending a zero result (which Create would read as success).
+		v, err := fn(e)
+		// Release op first, then answer: a caller that has its answer always finds op free (TLA: FinishOp).
+		e.unlockOp()
+		done <- result{v, err}
+	}()
+	select {
+	case r := <-done:
+		return r.v, r.err
+	case <-ctx.Done(): // TLA: X_wait, the client giving up
+		var zero T
+		return zero, ErrOutcomeUnknown
+	}
+}
