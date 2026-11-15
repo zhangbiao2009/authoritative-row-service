@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"rowcache/internal/db/fakedb"
+	"rowcache/internal/schema"
 )
 
 // A step decides one statement: it returns what the caller gets, and calls st.Exec if and when the
@@ -93,5 +94,14 @@ func (r *recorder) wantFences(t *testing.T, n int, k fakedb.Kind) {
 		if st.Session != session {
 			t.Fatalf("Fence statements %+v, want each with session %d", f, session)
 		}
+	}
+}
+
+// behind changes the DB row behind the cache (a writer outside the service, which section 2 of design.md
+// rules out), then answers ambiguous without executing the statement.
+func behind(d *fakedb.DB, r *schema.Row) step {
+	return func(st *fakedb.Stmt) error {
+		d.Put(r)
+		return fakedb.Ambiguous(st, context.DeadlineExceeded)
 	}
 }

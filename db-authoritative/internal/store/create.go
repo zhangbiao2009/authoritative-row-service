@@ -75,8 +75,12 @@ func (s *Store) createLocked(e *entry, in *schema.Row) (*schema.Row, error) {
 			return nil, ferr
 		}
 		// TLA: B_3
-		if now != absent && now.Gen == in.Gen {
-			return now, nil
+		if now != absent {
+			if now.Gen == in.Gen {
+				return now, nil
+			}
+			// The load saw no row and op is held (I5): another life here is a broken assumption (7.3).
+			return nil, s.unexpectedLocked(e, fmt.Errorf("after the fence: row %+v, created gen %d", now, in.Gen))
 		}
 		// The row is absent, so this INSERT did not execute (it writes the row and the dedup record together,
 		// and op is held). The gen can still be claimed by an earlier create with the same gen whose life was

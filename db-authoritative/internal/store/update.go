@@ -72,11 +72,15 @@ func (s *Store) updateLocked(e *entry, ch Change) (*schema.Row, error) {
 		if ferr != nil {
 			return nil, ferr
 		}
-		// TLA: B_3
-		if now != absent && now.Gen == old.Gen && now.Ver == old.Ver+1 {
+		// TLA: B_3. With op held the row is the loaded one, or the loaded one with this update applied (I5);
+		// anything else is a broken assumption, not an answer (7.3).
+		switch {
+		case now != absent && now.Gen == old.Gen && now.Ver == old.Ver+1:
 			return now, nil
+		case now != absent && now.Gen == old.Gen && now.Ver == old.Ver:
+			return nil, fmt.Errorf("%w: update not applied after fence", db.ErrNotExecuted)
 		}
-		return nil, fmt.Errorf("%w: update not applied after fence", db.ErrNotExecuted)
+		return nil, s.unexpectedLocked(e, fmt.Errorf("after the fence: row %+v, loaded gen %d ver %d", now, old.Gen, old.Ver))
 	default:
 		return nil, err // ErrNotExecuted or ErrRejected: nothing changed
 	}

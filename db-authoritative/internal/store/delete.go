@@ -46,11 +46,15 @@ func (s *Store) deleteLocked(e *entry, gen int64) error {
 		if ferr != nil {
 			return ferr
 		}
-		// TLA: B_3
-		if now == absent || now.Gen != r.Gen {
+		// TLA: B_3. With op held the row is gone (deleted) or still the loaded one (I5); anything else is a
+		// broken assumption, not an answer (7.3).
+		switch {
+		case now == absent:
 			return nil
+		case now.Gen == r.Gen && now.Ver == r.Ver:
+			return fmt.Errorf("%w: delete not applied after fence", db.ErrNotExecuted)
 		}
-		return fmt.Errorf("%w: delete not applied after fence", db.ErrNotExecuted)
+		return s.unexpectedLocked(e, fmt.Errorf("after the fence: row %+v, loaded gen %d ver %d", now, r.Gen, r.Ver))
 	default:
 		return err // ErrNotExecuted or ErrRejected
 	}
