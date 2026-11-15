@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"slices"
 
 	"rowcache/internal/db"
 	"rowcache/internal/schema"
@@ -15,6 +16,9 @@ import (
 // passes its own gen. (nil, nil): this gen was created earlier and that life has been deleted since
 // (design.md 7.5, hole 2).
 func (s *Store) Create(ctx context.Context, in *schema.Row) (*schema.Row, error) {
+	// The create may go on after the caller has its answer (ErrOutcomeUnknown), and the caller may then reuse
+	// its row. The values themselves are immutable (I11).
+	in = &schema.Row{Key: in.Key, Gen: in.Gen, Vals: slices.Clone(in.Vals)} // Ver 0: a new life
 	if err := s.checkRow(in); err != nil {
 		return nil, err
 	}

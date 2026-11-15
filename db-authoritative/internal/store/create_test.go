@@ -330,3 +330,31 @@ func TestUpdateWaitsForCreate(t *testing.T) {
 		checkInvariants(t, s, d)
 	})
 }
+
+// The background create must not read the caller's row after Create has returned.
+func TestCreateDoesNotKeepCallerRow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		s := newTestStore(t, d)
+		k, other := key(t, s, 1), key(t, s, 2)
+		release := make(chan struct{})
+		script(d, map[fakedb.Kind][]step{fakedb.Select: {blockOn(release)}})
+		in := newRow(k, 1, 7)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if r, err := s.Create(ctx, in); !errors.Is(err, ErrOutcomeUnknown) {
+			t.Fatalf("Create = %+v, %v; want ErrOutcomeUnknown", r, err)
+		}
+		in.Key = other // the caller reuses its row
+		in.Vals[1] = "changed"
+		close(release)
+		s.inflight.Wait()
+		if r := d.Row(k); r == nil || r.Vals[1] != "a" {
+			t.Fatalf("DB row of the original key = %+v, want the original values", r)
+		}
+		if r := d.Row(other); r != nil {
+			t.Fatalf("DB row of the other key = %+v, want none", r)
+		}
+		checkInvariants(t, s, d)
+	})
+}
