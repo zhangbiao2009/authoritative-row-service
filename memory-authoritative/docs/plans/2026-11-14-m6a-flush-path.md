@@ -63,7 +63,7 @@ The admin interface of 7.9 point 4 is here as Store methods. Exposing them over 
    In `F_scan`, a poisoned entry is written alone, after the shard's batches, when its `snap.Ver != poisonVer` (an update since: 7.9 "every new update also triggers a retry") or `now >= poisonRetryAt`. Otherwise it goes back on the queue untouched. A successful solo write clears `poisoned`.
 
    `deleteLocked` clears `poisoned` along with the dirty columns, since the row is gone. Create cannot meet a poisoned entry: it only creates over `absent`.
-9. **Admin** (7.9 point 4):
+9. **Admin** (7.9 point 4). *Changed after the final review, with the user: `DiscardPoisoned` was removed (a late flush still in flight could land after the reload); only `Poisoned()` remains, and a row is corrected with an Update. design.md 7.9 point 4 says so.*
    - `Poisoned() []schema.Key` lists the quarantined keys (a scan).
    - `DiscardPoisoned(ctx, key) error` is the human's "drop my changes and reload": it does the following.
      1. It takes `op` with `lockOpLive`.

@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"errors"
 	"slices"
 	"testing"
 	"testing/synctest"
@@ -159,27 +158,6 @@ func TestDeletePoisonedRow(t *testing.T) {
 	}
 	if !evict(t, s, poison) {
 		t.Fatal("the deleted row's tombstone was not evicted")
-	}
-	checkInvariants(t, s, d)
-}
-
-func TestDiscardPoisoned(t *testing.T) {
-	d := fakedb.New()
-	s := newTestStore(t, d, oneShard)
-	ks, poison := quarantine(t, s, d)
-	if err := s.DiscardPoisoned(context.Background(), ks[0]); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("DiscardPoisoned of a row that is not quarantined: %v, want ErrNotFound", err)
-	}
-	if err := s.DiscardPoisoned(context.Background(), poison); err != nil {
-		t.Fatalf("DiscardPoisoned: %v", err)
-	}
-	if n := s.dirtyCount.Load(); n != 0 || len(s.Poisoned()) != 0 || s.m.poisoned.Load() != 0 {
-		t.Fatalf("after the discard: dirtyCount %d, Poisoned %q, gauge %d; want 0, none, 0", n, s.Poisoned(), s.m.poisoned.Load())
-	}
-	selects := d.Selects()
-	r, err := s.Get(context.Background(), poison)
-	if err != nil || r.Vals[2] != int64(10) || d.Selects() != selects+1 {
-		t.Fatalf("Get after the discard = %+v, %v, Selects +%d; want the DB's row, loaded", r, err, d.Selects()-selects)
 	}
 	checkInvariants(t, s, d)
 }

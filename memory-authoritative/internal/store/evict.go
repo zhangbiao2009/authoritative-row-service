@@ -146,18 +146,13 @@ func (s *Store) tryEvict(sh *shard, e *entry, eligible func(*entry) bool) bool {
 		return false
 	}
 	s.fail("evict-dead", e)
-	s.removeLocked(sh, e)
-	s.m.evictions.Add(1)
-	return true
-}
-
-// removeLocked deletes e from the shard's map. The caller holds op and has set dead (7.7).
-func (s *Store) removeLocked(sh *shard, e *entry) {
-	// TLA: V_remove
+	// TLA: V_remove. Still holding op.
 	sh.mu.Lock()
 	if sh.m[e.id] == e {
 		delete(sh.m, e.id)
 		s.entryCount.Add(-1)
 	}
 	sh.mu.Unlock()
+	s.m.evictions.Add(1)
+	return true
 }
