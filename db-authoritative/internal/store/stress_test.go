@@ -301,7 +301,6 @@ func TestStressAll(t *testing.T) {
 			{"W_Delete: deletes answered OK", deletes.Load()},
 			{"W_Recreate: creates answered OK after a delete of the key", recreates.Load()},
 			{"W_AmbStmtInFlight: answers lost", f.lost.Load()},
-			{"W_AmbStmtInFlight: late Execs that landed", f.landed.Load()},
 			{"W_FenceThenNotApplied: kept statements dropped by a fence", f.dropped.Load()},
 			{"W_CreateAmb: Inserts answered ambiguous", f.amb[fakedb.Insert].Load()},
 			{"W_FenceThenApplied: Updates answered ambiguous", f.amb[fakedb.Update].Load()},
@@ -315,9 +314,12 @@ func TestStressAll(t *testing.T) {
 				t.Errorf("non-vacuity: %s is 0", c.name)
 			}
 		}
-		t.Logf("not asserted: W_DedupClaimed: creates answered (nil, nil): %d; W_RetryFindsOtherLife: %d; "+
-			"updates answered OK: %d; never executed: %d; writes not executed: %d; fences not confirmed: %d; reads failed: %d",
-			claimedNoRow.Load(), f.retryFindsOtherLife.Load(), updates.Load(), f.never.Load(), f.notExecuted.Load(),
-			f.fencesFailed.Load(), f.readsFailed.Load())
+		// Late Execs that landed before their fence are too rare to assert per run (about one run in a
+		// thousand has none); TestUpdateAmbiguousExecutesAtFence and TestUpdateFenceNotConfirmed cover them.
+		t.Logf("not asserted: W_AmbStmtInFlight: late Execs that landed: %d; W_DedupClaimed: creates answered (nil, nil): %d; "+
+			"W_RetryFindsOtherLife: %d; updates answered OK: %d; never executed: %d; writes not executed: %d; "+
+			"fences not confirmed: %d; reads failed: %d",
+			f.landed.Load(), claimedNoRow.Load(), f.retryFindsOtherLife.Load(), updates.Load(), f.never.Load(),
+			f.notExecuted.Load(), f.fencesFailed.Load(), f.readsFailed.Load())
 	})
 }
