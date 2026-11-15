@@ -24,8 +24,9 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("not found")
-	ErrInvalid  = schema.ErrInvalid // the same value, so errors.Is works whichever package wrapped it
+	ErrNotFound      = errors.New("not found")
+	ErrAlreadyExists = errors.New("already exists")
+	ErrInvalid       = schema.ErrInvalid // the same value, so errors.Is works whichever package wrapped it
 
 	ErrOutcomeUnknown = errors.New("outcome unknown") // the caller's ctx expired before the outcome was settled
 	ErrInternal       = errors.New("internal")        // an invariant is broken
