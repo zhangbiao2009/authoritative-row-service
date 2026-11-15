@@ -37,7 +37,7 @@ func (s *Store) Update(ctx context.Context, key schema.Key, ch Change) (*schema.
 	}
 	e, err := s.lockOpLive(ctx, key)
 	if err != nil {
-		return nil, err // timed out while queued: not executed
+		return nil, err
 	}
 	return runSync(ctx, s, e, func(e *entry) (*schema.Row, error) { return s.updateLocked(e, ch) })
 }

@@ -109,7 +109,9 @@ func (d *DB) Update(ctx context.Context, r *schema.Row, cols []int) (*schema.Row
 	d.mu.Unlock()
 	defer func() {
 		d.mu.Lock()
-		d.writing[r.Key]--
+		if d.writing[r.Key]--; d.writing[r.Key] == 0 {
+			delete(d.writing, r.Key)
+		}
 		d.mu.Unlock()
 	}()
 	if d.Hook != nil {
@@ -126,17 +128,15 @@ func (d *DB) Update(ctx context.Context, r *schema.Row, cols []int) (*schema.Row
 	if !ok || stored.Gen != r.Gen {
 		return nil, db.ErrNoRows
 	}
-	n := clone(stored)
 	for _, c := range cols {
 		v := r.Vals[c]
 		if d.Normalize != nil {
 			v = d.Normalize(c, v)
 		}
-		n.Vals[c] = v
+		stored.Vals[c] = v
 	}
-	n.Ver++
-	d.rows[r.Key] = n
-	return clone(n), nil
+	stored.Ver++
+	return clone(stored), nil
 }
 
 func clone(r *schema.Row) *schema.Row {

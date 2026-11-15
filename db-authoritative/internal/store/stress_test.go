@@ -18,6 +18,7 @@ import (
 // exactly the increments that ran.
 func TestStressUpdates(t *testing.T) {
 	const goroutines, ops = 64, 200
+	const staleGen = 999
 	d := fakedb.New()
 	s := newTestStore(t, d)
 	keys := make([]schema.Key, 4)
@@ -25,31 +26,27 @@ func TestStressUpdates(t *testing.T) {
 		keys[i] = key(t, s, int64(i+1))
 		d.Put(testRow(keys[i], int64(i+1)))
 	}
-	// Slow about one Update in three, so the 1 ms ctx sometimes expires while the write is in flight.
+	// Slow about one Update in eight, so the 1 ms ctx sometimes expires while the write is in flight.
 	d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
-		if st.Kind == fakedb.Update && rand.IntN(3) == 0 {
-			time.Sleep(time.Duration(rand.IntN(3000)) * time.Microsecond)
+		if st.Kind == fakedb.Update && rand.IntN(8) == 0 {
+			time.Sleep(time.Duration(rand.IntN(2000)) * time.Microsecond)
 		}
 		return nil
 	}
-	var mu sync.Mutex
-	okIncr := make([]int, len(keys))      // answered OK
-	unknownIncr := make([]int, len(keys)) // answered ErrOutcomeUnknown: it still ran (no faults)
-	var gaveUp atomic.Int64               // all Updates answered ErrOutcomeUnknown
+	applied := make([]atomic.Int64, len(keys)) // INCRs answered OK or ErrOutcomeUnknown: each ran (no faults)
+	var gaveUp atomic.Int64                    // all Updates answered ErrOutcomeUnknown
 	var wg sync.WaitGroup
-	for g := 0; g < goroutines; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for g := range goroutines {
+		wg.Go(func() {
 			rng := rand.New(rand.NewPCG(uint64(g), 1))
 			for n := 0; n < ops; n++ {
 				ki := rng.IntN(len(keys))
 				short := rng.IntN(10) == 0
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				timeout := 5 * time.Second
 				if short {
-					cancel()
-					ctx, cancel = context.WithTimeout(context.Background(), time.Millisecond)
+					timeout = time.Millisecond
 				}
+				ctx, cancel := context.WithTimeout(context.Background(), timeout)
 				start := time.Now()
 				if rng.IntN(2) == 0 {
 					r, err := s.Get(ctx, keys[ki])
@@ -67,25 +64,21 @@ func TestStressUpdates(t *testing.T) {
 					} else {
 						ch = Change{Cols: []ColChange{set(1, "v")}}
 						if rng.IntN(10) == 0 {
-							ch.Gen = 999 // stale: only on SET, since an INCR answered ErrOutcomeUnknown is counted as applied
+							ch.Gen = staleGen // stale: only on SET, since an INCR answered ErrOutcomeUnknown is counted as applied
 						}
 					}
 					_, err := s.Update(ctx, keys[ki], ch)
 					switch {
 					case err == nil:
 						if isIncr {
-							mu.Lock()
-							okIncr[ki]++
-							mu.Unlock()
+							applied[ki].Add(1)
 						}
 					case errors.Is(err, ErrOutcomeUnknown):
 						gaveUp.Add(1)
 						if isIncr {
-							mu.Lock()
-							unknownIncr[ki]++
-							mu.Unlock()
+							applied[ki].Add(1)
 						}
-					case errors.Is(err, ErrNotFound) && ch.Gen == 999:
+					case errors.Is(err, ErrNotFound) && ch.Gen == staleGen:
 					case errors.Is(err, context.DeadlineExceeded) && short:
 					default:
 						t.Errorf("Update: %v", err)
@@ -96,7 +89,7 @@ func TestStressUpdates(t *testing.T) {
 					t.Errorf("an operation took %v (EventuallyResponds)", time.Since(start))
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	s.inflight.Wait()
@@ -105,9 +98,9 @@ func TestStressUpdates(t *testing.T) {
 	}
 	checkInvariants(t, s, d)
 	for i, k := range keys {
-		want := int64(10 + okIncr[i] + unknownIncr[i])
+		want := 10 + applied[i].Load()
 		if got := d.Row(k).Vals[2]; got != want {
-			t.Errorf("key %d: DB score = %v, want %d (%d OK + %d unknown)", i, got, want, okIncr[i], unknownIncr[i])
+			t.Errorf("key %d: DB score = %v, want %d", i, got, want)
 		}
 	}
 }

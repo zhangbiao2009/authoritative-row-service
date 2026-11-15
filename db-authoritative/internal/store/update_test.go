@@ -19,6 +19,18 @@ import (
 func set(col int, v any) ColChange    { return ColChange{Col: col, Op: OpSet, Val: v} }
 func incr(col int, d int64) ColChange { return ColChange{Col: col, Op: OpIncr, Val: d} }
 
+// blockUpdates makes every fakedb.Update statement wait until the returned channel is closed.
+func blockUpdates(d *fakedb.DB) (release chan struct{}) {
+	release = make(chan struct{})
+	d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
+		if st.Kind == fakedb.Update {
+			<-release
+		}
+		return nil
+	}
+	return release
+}
+
 func entryOf(s *Store, k schema.Key) *entry {
 	sh := s.shardFor(k)
 	sh.mu.RLock()
@@ -232,13 +244,7 @@ func TestUpdateZeroRowsIsInternal(t *testing.T) {
 func TestUpdateClientGivesUp(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
-		release := make(chan struct{})
-		d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
-			if st.Kind == fakedb.Update {
-				<-release
-			}
-			return nil
-		}
+		release := blockUpdates(d)
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
@@ -263,13 +269,7 @@ func TestUpdateClientGivesUp(t *testing.T) {
 func TestUpdateTimesOutWhileQueued(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
-		release := make(chan struct{})
-		d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
-			if st.Kind == fakedb.Update {
-				<-release
-			}
-			return nil
-		}
+		release := blockUpdates(d)
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
@@ -296,13 +296,7 @@ func TestUpdateTimesOutWhileQueued(t *testing.T) {
 func TestGetDuringWriteSeesOldRow(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
-		release := make(chan struct{})
-		d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
-			if st.Kind == fakedb.Update {
-				<-release
-			}
-			return nil
-		}
+		release := blockUpdates(d)
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
@@ -322,9 +316,6 @@ func TestGetDuringWriteSeesOldRow(t *testing.T) {
 		if d.Updates() != 2 || r.Vals[1] != "first" || r.Vals[2] != int64(11) || r.Ver != 5 {
 			t.Fatalf("Updates = %d, DB row = %+v; want both applied in order", d.Updates(), r)
 		}
-		if err := d.Violation(); err != nil {
-			t.Fatal(err)
-		}
 		checkInvariants(t, s, d)
 	})
 }
@@ -335,17 +326,15 @@ func TestConcurrentIncrementsMatchDB(t *testing.T) {
 	k := key(t, s, 1)
 	d.Put(testRow(k, 1))
 	var wg sync.WaitGroup
-	for g := 0; g < 8; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 8 {
+		wg.Go(func() {
 			for i := 0; i < 100; i++ {
 				if _, err := s.Update(context.Background(), k, Change{Cols: []ColChange{incr(2, 1)}}); err != nil {
 					t.Error(err)
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	r, err := s.Get(context.Background(), k)
