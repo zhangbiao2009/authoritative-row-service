@@ -32,6 +32,7 @@ var (
 	ErrNotFound       = errors.New("not found")
 	ErrAlreadyExists  = errors.New("already exists")
 	ErrOutcomeUnknown = errors.New("outcome unknown") // the caller's ctx expired; the create or delete goes on (7.4)
+	ErrBusy           = errors.New("busy")            // backpressure (11.1): the update was not applied
 	ErrInvalid        = schema.ErrInvalid             // the same value, so errors.Is works whichever package wrapped it
 	ErrInternal       = errors.New("internal")        // an invariant is broken
 )
@@ -42,6 +43,11 @@ type Config struct {
 	FlushInterval  time.Duration // how often RunFlusher writes dirty rows back
 	DBTimeout      time.Duration // timeout for each DB call on the Go side (design.md 11.4)
 	OpFenceTimeout time.Duration // how long one FenceSessions call may wait for the sessions to exit (7.4)
+	FlushBatchMax  int           // rows per UpdateBatch, at most (design.md 7.6)
+
+	// Backpressure (design.md 11.1).
+	MaxDirty    int           // updates of clean rows get ErrBusy while this many rows are dirty
+	MaxDirtyAge time.Duration // every update gets ErrBusy while the oldest dirty row is older; 0: no limit
 
 	// Eviction (design.md 7.7). TTLs count in whole seconds; 0 means "not accessed in the current second".
 	IdleTTL         time.Duration // a loaded row idle this long is removed from memory
@@ -59,6 +65,9 @@ func DefaultConfig() Config {
 		FlushInterval:  200 * time.Millisecond,
 		DBTimeout:      3 * time.Second,
 		OpFenceTimeout: 10 * time.Second,
+		FlushBatchMax:  500,
+		MaxDirty:       100_000, // 11.4: TBD; a tenth of MaxEntries
+		MaxDirtyAge:    30 * time.Second,
 
 		IdleTTL:         10 * time.Minute, // 11.4: TBD
 		NegativeIdleTTL: time.Minute,      // 11.4: 1-5 minutes
@@ -79,7 +88,11 @@ type Store struct {
 	dirtyCount atomic.Int64   // entries with dirty != 0; changed only with that entry's mu held
 	inflight   sync.WaitGroup // runSync goroutines: creates and deletes still running
 	entryCount atomic.Int64   // entries in the maps
-	nowSec     atomic.Int64   // coarse clock in Unix seconds, kept current by RunEvictor; cheaper than time.Now per access
+	m          metrics        // design.md 11.2
+	// The oldest dirty row that is not quarantined is older than MaxDirtyAge (11.1). Written only by
+	// refreshTooOld.
+	tooOld atomic.Bool
+	nowSec atomic.Int64 // coarse clock in Unix seconds, kept current by RunEvictor; cheaper than time.Now per access
 
 	// failpoint, if set, runs at the named points of a gap that is not a DB call (tla-mapping.md 3.1). Tests
 	// only; nil in production.
@@ -101,6 +114,10 @@ func New(sch *schema.Schema, d db.DB, cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("FlushInterval %v, DBTimeout %v and OpFenceTimeout %v must be positive",
 			cfg.FlushInterval, cfg.DBTimeout, cfg.OpFenceTimeout)
 	}
+	if cfg.FlushBatchMax <= 0 || cfg.MaxDirty <= 0 || cfg.MaxDirtyAge < 0 {
+		return nil, fmt.Errorf("FlushBatchMax %d and MaxDirty %d must be positive, MaxDirtyAge %v not negative",
+			cfg.FlushBatchMax, cfg.MaxDirty, cfg.MaxDirtyAge)
+	}
 	if cfg.IdleTTL < 0 || cfg.NegativeIdleTTL < 0 || cfg.EvictInterval <= 0 || cfg.MaxSweepRounds <= 0 || cfg.MaxEntries <= 0 {
 		return nil, fmt.Errorf("eviction config: TTLs must not be negative, EvictInterval %v, MaxSweepRounds %d and MaxEntries %d must be positive",
 			cfg.EvictInterval, cfg.MaxSweepRounds, cfg.MaxEntries)
@@ -114,13 +131,18 @@ func New(sch *schema.Schema, d db.DB, cfg Config) (*Store, error) {
 }
 
 type shard struct {
-	mu sync.RWMutex          // leaf lock: guards m only
-	m  map[schema.Key]*entry // at most one entry per key (I1)
+	mu           sync.RWMutex          // leaf lock: guards m only
+	hits, misses atomic.Int64          // Gets of the shard's keys; next to mu, which every Get writes anyway
+	m            map[schema.Key]*entry // at most one entry per key (I1)
 
 	qmu sync.Mutex // leaf lock: guards queue only
 	// Entries waiting to be flushed. A slice, so appending never blocks; an entry is in it at most once,
 	// because only the caller that sets entry.queued appends it.
 	queue []*entry
+
+	// UnixNano of the earliest dirtySince among the shard's dirty rows, as its last flush found it; 0 if
+	// none. Written by that flush only.
+	oldestDirty atomic.Int64
 }
 
 // absent is the snap of a row that definitely does not exist: a tombstone or a negative cache entry.
@@ -141,14 +163,21 @@ type entry struct {
 	mu     sync.Mutex
 	dirty  uint64 // columns changed in memory and not yet written to the DB (schema.ColBit); mu
 	queued bool   // in its shard's flush queue, or about to be appended to it; mu
+	// The DB definitely rejected its flush: quarantined (7.9). It stays dirty, is written alone, and is
+	// left out of the age of 11.1; mu.
+	poisoned bool
 	// dead: removed from the map, or about to be (I1). Written with op and mu held, read with either (I9).
 	dead bool
+	// UnixNano of when dirty last went from 0 to non-zero; mu. A failed flush keeps the earlier time (11.1).
+	dirtySince int64
 
 	lastAccess atomic.Int64 // nowSec of the last access; read without locks by the evictor
 
 	// Accessed only with op held.
 	lastLoadErr   error
 	lastLoadErrAt time.Time
+	poisonVer     int64 // ver of the row the DB rejected; a newer one is retried at once
+	poisonRetryAt int64 // UnixNano of when the same row is tried again
 }
 
 func (s *Store) shardFor(key schema.Key) *shard {
@@ -156,9 +185,11 @@ func (s *Store) shardFor(key schema.Key) *shard {
 }
 
 // getOrCreate returns the key's entry, adding one if the map has none (I1).
-func (s *Store) getOrCreate(key schema.Key) *entry {
+func (s *Store) getOrCreate(key schema.Key) *entry { return s.getOrCreateIn(s.shardFor(key), key) }
+
+// getOrCreateIn is getOrCreate for a caller that has key's shard already.
+func (s *Store) getOrCreateIn(sh *shard, key schema.Key) *entry {
 	// TLA: Goc
-	sh := s.shardFor(key)
 	sh.mu.RLock()
 	e := sh.m[key]
 	sh.mu.RUnlock()
@@ -188,7 +219,7 @@ func (s *Store) touch(e *entry) {
 func (s *Store) lockOpLive(ctx context.Context, key schema.Key) (*entry, error) {
 	for {
 		e := s.getOrCreate(key)
-		if err := e.lockOp(ctx); err != nil {
+		if err := s.lockOpTimed(ctx, e); err != nil {
 			return nil, err
 		}
 		if !e.dead { // op is enough to read dead (I9)
@@ -218,10 +249,23 @@ func (e *entry) tryLockOp() bool {
 
 func (e *entry) unlockOp() { <-e.op }
 
+// lockOpTimed is lockOp that counts the time spent waiting (11.2).
+func (s *Store) lockOpTimed(ctx context.Context, e *entry) error {
+	if e.tryLockOp() {
+		return nil
+	}
+	start := time.Now()
+	err := e.lockOp(ctx)
+	s.m.opWaits.Add(1)
+	s.m.opWaitTime.Add(int64(time.Since(start)))
+	return err
+}
+
 // markDirtyLocked adds mask (non-zero) to e's dirty columns.
 func (s *Store) markDirtyLocked(e *entry, mask uint64) {
 	if e.dirty == 0 {
 		s.dirtyCount.Add(1)
+		e.dirtySince = time.Now().UnixNano() // in-memory work: allowed under mu
 	}
 	e.dirty |= mask
 }
@@ -231,6 +275,22 @@ func (s *Store) clearDirtyLocked(e *entry) {
 		s.dirtyCount.Add(-1)
 	}
 	e.dirty = 0
+}
+
+// poisonLocked puts e in quarantine (7.9).
+func (s *Store) poisonLocked(e *entry) {
+	if !e.poisoned {
+		e.poisoned = true
+		s.m.poisoned.Add(1)
+	}
+}
+
+// unpoisonLocked takes e out of quarantine: the DB holds its row, or the row is gone.
+func (s *Store) unpoisonLocked(e *entry) {
+	if e.poisoned {
+		e.poisoned = false
+		s.m.poisoned.Add(-1)
+	}
 }
 
 // enqueue appends e to its shard's flush queue. The caller holds no lock: it is called after e.mu is

@@ -77,6 +77,7 @@ func runSync[T any](ctx context.Context, s *Store, e *entry, fn func() (T, error
 	case r := <-done:
 		return r.v, r.err
 	case <-ctx.Done():
+		s.m.outcomeUnknown.Add(1)
 		var zero T
 		return zero, ErrOutcomeUnknown
 	}
@@ -147,6 +148,7 @@ func (s *Store) insertUntilSure(r *schema.Row) (*schema.Row, error) {
 			// This gen is in the dedup table: an earlier attempt took effect, or this is a client retry.
 			// Either way the create of this gen has happened; never answer "failed" from here on.
 			unsure = true
+			s.m.genClaimed.Add(1)
 			ctx, cancel := s.dbCtx()
 			cur, serr := s.db.Select(ctx, r.Key)
 			cancel()
@@ -157,15 +159,18 @@ func (s *Store) insertUntilSure(r *schema.Row) (*schema.Row, error) {
 				return nil, nil // inserted, then deleted
 			case serr == nil:
 				// Memory said absent, the DB holds another life: loading first rules this out.
+				s.m.internal.Add(1)
 				return nil, fmt.Errorf("%w: key %q: gen %d claimed, row has gen %d", ErrInternal, r.Key, r.Gen, cur.Gen)
 			}
 			err = serr // the Select failed: the rules below decide
 		case errors.Is(err, db.ErrDuplicate):
 			// The dedup record was new but the row exists: loading first rules this out.
+			s.m.internal.Add(1)
 			return nil, fmt.Errorf("%w: key %q: gen %d claimed but a row exists", ErrInternal, r.Key, r.Gen)
 		}
 		switch {
 		case db.IsAmbiguous(err):
+			s.m.ambiguous.Add(1)
 			unsure = true
 			inflight = append(inflight, db.SessionOf(err))
 		case db.NotExecuted(err) && unsure:
@@ -192,7 +197,12 @@ func (s *Store) insertUntilSure(r *schema.Row) (*schema.Row, error) {
 func (s *Store) fence(ids []db.SessionID) error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.OpFenceTimeout)
 	defer cancel()
-	return s.db.FenceSessions(ctx, ids)
+	s.m.fences.Add(1)
+	err := s.db.FenceSessions(ctx, ids)
+	if err != nil {
+		s.m.fencesUnconfirmed.Add(1)
+	}
+	return err
 }
 
 // newGen returns a gen for a new life: non-zero, 63 bits. It only needs to differ from the other lives of

@@ -153,5 +153,6 @@ func (s *Store) tryEvict(sh *shard, e *entry, eligible func(*entry) bool) bool {
 		s.entryCount.Add(-1)
 	}
 	sh.mu.Unlock()
+	s.m.evictions.Add(1)
 	return true
 }

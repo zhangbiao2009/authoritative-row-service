@@ -127,6 +127,9 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		"MaxEntries 0":        func(c *Config) { c.MaxEntries = 0 },
 		"IdleTTL < 0":         func(c *Config) { c.IdleTTL = -time.Second },
 		"NegativeIdleTTL < 0": func(c *Config) { c.NegativeIdleTTL = -time.Second },
+		"FlushBatchMax 0":     func(c *Config) { c.FlushBatchMax = 0 },
+		"MaxDirty 0":          func(c *Config) { c.MaxDirty = 0 },
+		"MaxDirtyAge < 0":     func(c *Config) { c.MaxDirtyAge = -time.Second },
 	} {
 		cfg := DefaultConfig()
 		change(&cfg)

@@ -27,6 +27,7 @@ the model to match the code, without asking.
 | Update sets one column | `Change` with several columns, SET and INCR | Same path, same `mu` critical section (I12) |
 | Flush sends one item per round | `flushShard` writes a batch in one transaction | Each item still holds its own `op`; per-key behaviour is the same |
 | `"rej"` only means "rejected because of another row" | Rejection by the row's own data (CHECK, NOT NULL, length) is the `default` branch of the until-sure loops | Same parameters on every attempt, so the earlier attempt was rejected too (7.4) |
+| One `F_send` writes one row | A flush batch is one transaction of up to `FlushBatchMax` rows (7.6, 8.3) | All or nothing, so a batch is the rows' `F_send` steps at one instant; each row keeps its own `op`, snapshot and `F_done`. A late batch lands whole, like a late single write. Rows of one batch are different keys, so no step of one row reads another's state |
 | Not modeled: poison rows (7.9), backpressure (11.1), `lastLoadErr` cache, backoff, `nowSec`, `dirtySince`, metrics | Present | They only return errors earlier or change timing; none may change which branch a step takes |
 | Eviction may happen at any moment | TTL / capacity policy, sampling, `eligible` re-check | The model covers every timing; policy only narrows it |
 | `U_mu` on a dead entry goes straight back to `Goc` | `Update` on a dead entry goes through `load`: waits for `op`, sees `dead`, then looks the key up again (design.md 7.3, changed in M5) | The extra steps change no state: they only hold the `op` of an entry already removed from the map, which no one else can reach; the model already takes `Update` through `L_lock`/`L_load` on a dead entry whose `snap` is nil |
@@ -115,9 +116,9 @@ Each row is one atomic step of the model. In Go a step is a stretch of one funct
 | `B_d1` | `deleteLocked` (7.5) | `ensureLoadedLocked`; absent or gen mismatch → `ErrNotFound`; else first `db.Delete` |
 | `B_d2` | `deleteUntilSure` loop body, then the end of `deleteLocked` (7.5) | success → under `mu`: `snap.Store(absent)`, `clearDirtyLocked` (linearization point) |
 | `F_take` | `flushShard` (7.6) | take `sh.queue` under `qmu` |
-| `F_scan` | `flushShard` loop over `batch` | `tryLockOp` (fails → `retry`); under `mu`: dead / nil / absent / clean → `queued = false`, `unlockOp`; else snapshot row + mask, `clearDirtyLocked`, `queued = false`, keep `op` |
-| `F_send` | `flushShard` | M2: `db.Update` per item, each right after its `F_scan`; `requeueAll(retry)` after the shard's items. From M6: `requeueAll(retry)`, then `db.UpdateBatch` |
-| `F_done` | `flushShard` after `UpdateBatch` | on error: merge the mask back, re-enqueue if not queued; `unlockOp` |
+| `F_scan` | `flushShard` loop over the queue | `tryLockOp` (fails → `retry`); under `mu`: dead / nil / absent / clean → `queued = false`, `unlockOp`; quarantined and not due (7.9) → `unlockOp`, `retry`; else snapshot row + mask + `dirtySince`, `clearDirtyLocked`, `queued = false`, keep `op` |
+| `F_send` | `writeBatch` (`db.UpdateBatch`, every `FlushBatchMax` items, sorted by key); `writeAlone` (`db.Update`: a batch the DB definitely rejected, row by row; quarantined rows) | one transaction per batch, all or nothing; after an ordinary failure the shard stops for the round and the rest of the queue goes back with `requeueAll` |
+| `F_done` | `writeBatch` / `writeAlone` after the write, `mergeBack` | on error: merge the mask back, keep the earlier `dirtySince`, re-enqueue if not queued; a definite rejection of a row alone also quarantines it; `unlockOp` |
 | `V_evict` | `tryEvict` (`evict.go`, 7.7), called by `idleSweepShard` / `capacityEvictShard` from `RunEvictor` | `tryLockOp`; under `mu`: `!dead && dirty == 0 && eligible` → `dead = true` |
 | `V_remove` | `tryEvict` | under `shard.mu`: delete from the map; `unlockOp` |
 | `DbExec`, `DbTimeout`, `DbDrop` | `fakedb` (and real PG) | execute; time out and maybe execute later; definitely not execute |

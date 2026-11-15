@@ -41,6 +41,7 @@ func (s *Store) deleteLocked(e *entry, gen int64) error {
 	e.mu.Lock()
 	e.snap.Store(absent) // linearization point
 	s.clearDirtyLocked(e)
+	s.unpoisonLocked(e)
 	e.mu.Unlock()
 	s.touch(e) // the tombstone's NegativeIdleTTL counts from the delete
 	return nil
@@ -60,6 +61,7 @@ func (s *Store) deleteUntilSure(key schema.Key, gen int64) error {
 		case err == nil:
 			return nil
 		case db.IsAmbiguous(err):
+			s.m.ambiguous.Add(1)
 			unsure = true
 			inflight = append(inflight, db.SessionOf(err))
 		case db.NotExecuted(err) && unsure:

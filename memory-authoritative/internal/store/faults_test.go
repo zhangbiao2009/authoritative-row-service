@@ -48,7 +48,7 @@ type answerKind uint8
 
 const (
 	answered   answerKind = iota // took effect, or tells something about the row: nil, ErrNotFound, ErrAlreadyExists, ErrOutcomeUnknown
-	noEffect                     // definitely had no effect: not executed, rejected because of another row, timed out queued
+	noEffect                     // definitely had no effect: not executed, rejected because of another row, timed out queued, ErrBusy
 	unexpected                   // anything else, a DB ambiguity reaching the caller included
 )
 
@@ -58,7 +58,7 @@ func classify(err error) answerKind {
 		return unexpected
 	case err == nil, errors.Is(err, ErrNotFound), errors.Is(err, ErrAlreadyExists), errors.Is(err, ErrOutcomeUnknown):
 		return answered
-	case db.NotExecuted(err), db.IsCrossRow(err), errors.Is(err, context.DeadlineExceeded):
+	case db.NotExecuted(err), db.IsCrossRow(err), errors.Is(err, context.DeadlineExceeded), errors.Is(err, ErrBusy):
 		return noEffect
 	}
 	return unexpected

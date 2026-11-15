@@ -66,7 +66,7 @@ func dbMatches(t *testing.T, d *fakedb.DB, want *schema.Row) {
 
 // hang is a Hook for a DB that never answers an Update.
 func hang(ctx context.Context, st *fakedb.Stmt) error {
-	if st.Kind != fakedb.Update {
+	if st.Kind != fakedb.UpdateBatch {
 		return nil
 	}
 	<-ctx.Done()

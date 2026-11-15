@@ -16,9 +16,8 @@ import (
 	"rowsvc/internal/schema"
 )
 
-// startFlusher runs RunFlusher with a 1ms FlushInterval; the returned func stops it and waits for it.
-func startFlusher(s *Store) (stop func()) {
-	s.cfg.FlushInterval = time.Millisecond
+// runFlusher runs RunFlusher; the returned func stops it and waits for it.
+func runFlusher(s *Store) (stop func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Go(func() { s.RunFlusher(ctx) })
@@ -26,6 +25,12 @@ func startFlusher(s *Store) (stop func()) {
 		cancel()
 		wg.Wait()
 	}
+}
+
+// startFlusher runs RunFlusher with a 1ms FlushInterval.
+func startFlusher(s *Store) (stop func()) {
+	s.cfg.FlushInterval = time.Millisecond
+	return runFlusher(s)
 }
 
 // Acceptance (design.md 12.2 M2): N goroutines each increment the same column K times while the flusher
@@ -76,7 +81,7 @@ func TestStressUpdates(t *testing.T) {
 	var writes, failed, late atomic.Int64
 	var lateExecs sync.WaitGroup
 	d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
-		if st.Kind != fakedb.Update {
+		if st.Kind != fakedb.UpdateBatch {
 			return nil
 		}
 		n := rand.IntN(10)
