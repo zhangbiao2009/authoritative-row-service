@@ -6,7 +6,10 @@ import (
 	"math"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"rowcache/internal/db"
 	"rowcache/internal/db/fakedb"
@@ -222,4 +225,135 @@ func TestUpdateZeroRowsIsInternal(t *testing.T) {
 	if r, err := s.Get(context.Background(), k); err != nil || r.Gen != 999 {
 		t.Fatalf("Get = %+v, %v; want gen 999", r, err)
 	}
+}
+
+// The caller's ctx expires while its write is in flight (TLA: X_wait): ErrOutcomeUnknown, and the write
+// still completes in the background.
+func TestUpdateClientGivesUp(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		release := make(chan struct{})
+		d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
+			if st.Kind == fakedb.Update {
+				<-release
+			}
+			return nil
+		}
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1))
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if _, err := s.Update(ctx, k, Change{Cols: []ColChange{set(1, "b")}}); !errors.Is(err, ErrOutcomeUnknown) {
+			t.Fatalf("err = %v, want ErrOutcomeUnknown", err)
+		}
+		if opFree(entryOf(s, k)) {
+			t.Fatal("op free while the write is still in flight (I5)")
+		}
+		close(release)
+		s.inflight.Wait()
+		if r, err := s.Get(context.Background(), k); err != nil || r.Vals[1] != "b" {
+			t.Fatalf("Get = %+v, %v; want the background write applied", r, err)
+		}
+		checkInvariants(t, s, d)
+	})
+}
+
+// A request that times out while queued for op did nothing (TLA: X_qtimeout).
+func TestUpdateTimesOutWhileQueued(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		release := make(chan struct{})
+		d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
+			if st.Kind == fakedb.Update {
+				<-release
+			}
+			return nil
+		}
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1))
+		go s.Update(context.Background(), k, Change{Cols: []ColChange{set(1, "first")}})
+		synctest.Wait() // the first Update is blocked in the hook, holding op
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if _, err := s.Update(ctx, k, Change{Cols: []ColChange{set(1, "second")}}); !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrOutcomeUnknown) {
+			t.Fatalf("err = %v, want context.DeadlineExceeded and not ErrOutcomeUnknown", err)
+		}
+		close(release)
+		s.inflight.Wait()
+		if d.Updates() != 1 {
+			t.Fatalf("Updates = %d, want 1", d.Updates())
+		}
+		if r := d.Row(k); r.Vals[1] != "first" || r.Ver != 4 {
+			t.Fatalf("DB row = %+v, want only the first change", r)
+		}
+		checkInvariants(t, s, d)
+	})
+}
+
+// While a write is in flight a Get answers with the old row at once, and the next write waits for op.
+func TestGetDuringWriteSeesOldRow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		release := make(chan struct{})
+		d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
+			if st.Kind == fakedb.Update {
+				<-release
+			}
+			return nil
+		}
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1))
+		go s.Update(context.Background(), k, Change{Cols: []ColChange{set(1, "first")}})
+		synctest.Wait()
+		if r, err := s.Get(context.Background(), k); err != nil || r.Vals[1] != "a" || r.Ver != 3 {
+			t.Fatalf("Get during the write = %+v, %v; want the old row", r, err)
+		}
+		go s.Update(context.Background(), k, Change{Cols: []ColChange{incr(2, 1)}})
+		synctest.Wait()
+		if d.Updates() != 1 {
+			t.Fatalf("Updates = %d while the first write is in flight, want 1", d.Updates())
+		}
+		close(release)
+		synctest.Wait() // both Updates have returned
+		r := d.Row(k)
+		if d.Updates() != 2 || r.Vals[1] != "first" || r.Vals[2] != int64(11) || r.Ver != 5 {
+			t.Fatalf("Updates = %d, DB row = %+v; want both applied in order", d.Updates(), r)
+		}
+		if err := d.Violation(); err != nil {
+			t.Fatal(err)
+		}
+		checkInvariants(t, s, d)
+	})
+}
+
+func TestConcurrentIncrementsMatchDB(t *testing.T) {
+	d := fakedb.New()
+	s := newTestStore(t, d)
+	k := key(t, s, 1)
+	d.Put(testRow(k, 1))
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				if _, err := s.Update(context.Background(), k, Change{Cols: []ColChange{incr(2, 1)}}); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	r, err := s.Get(context.Background(), k)
+	if err != nil || r.Vals[2] != int64(810) {
+		t.Fatalf("memory = %+v, %v; want 810", r, err)
+	}
+	if dr := d.Row(k); dr.Vals[2] != int64(810) || dr.Ver != 803 {
+		t.Fatalf("DB = %+v; want score 810, ver 803", dr)
+	}
+	checkInvariants(t, s, d)
 }
