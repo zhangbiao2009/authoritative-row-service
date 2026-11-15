@@ -128,7 +128,7 @@ func (d *DB) SetRejecting(key schema.Key, on bool) {
 	d.rejecting[key] = on
 }
 
-// Pending returns the number of statements answered ambiguous whose Exec has neither run nor been fenced.
+// Pending returns the number of write statements (Insert, Update, Delete) answered ambiguous whose Exec has neither run nor been fenced.
 func (d *DB) Pending() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -192,9 +192,9 @@ func (d *DB) run(ctx context.Context, st *Stmt, execLocked func()) error {
 	}
 	if d.Hook != nil {
 		if err := d.Hook(ctx, st); err != nil {
-			if db.IsAmbiguous(err) && st.Kind != Fence {
+			if db.IsAmbiguous(err) && (st.Kind == Insert || st.Kind == Update || st.Kind == Delete) {
 				d.mu.Lock()
-				if !ran.Load() {
+				if !ran.Load() && !d.fenced[st.Session] {
 					d.pending[st.Session] = true
 				}
 				d.mu.Unlock()
@@ -218,7 +218,9 @@ func (d *DB) write(key schema.Key) (done func()) {
 	d.mu.Unlock()
 	return func() {
 		d.mu.Lock()
-		d.writing[key]--
+		if d.writing[key]--; d.writing[key] == 0 {
+			delete(d.writing, key)
+		}
 		d.mu.Unlock()
 	}
 }
@@ -303,7 +305,10 @@ func (d *DB) GenClaimed(ctx context.Context, key schema.Key, gen int64) (bool, e
 	err := d.run(ctx, &Stmt{Kind: GenClaimed, Key: key, Gen: gen}, func() {
 		claimed = d.dedup[dedupKey{key, gen}]
 	})
-	return claimed, err
+	if err != nil {
+		return false, err
+	}
+	return claimed, nil
 }
 
 // Update applies r.Vals[c] for c in cols to the row with key r.Key and gen r.Gen, sets ver = ver + 1,

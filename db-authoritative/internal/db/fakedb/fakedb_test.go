@@ -446,3 +446,42 @@ func TestOneWriterPerKeyAcrossKinds(t *testing.T) {
 		t.Fatal("an Update and a Delete of one key in progress at once were not reported")
 	}
 }
+
+func TestLateExecRace(t *testing.T) {
+	d := New()
+	d.Put(row(5, "a"))
+	var wg sync.WaitGroup
+	d.Hook = func(ctx context.Context, st *Stmt) error {
+		if st.Kind == Fence {
+			return nil
+		}
+		wg.Go(st.Exec) // runs concurrently with the call returning
+		return Ambiguous(st, errors.New("timeout"))
+	}
+	ctx := context.Background()
+	for range 200 {
+		d.GenClaimed(ctx, "k", 5)
+		_, err := d.Update(ctx, row(5, "x"), []int{1})
+		d.Pending()
+		d.FenceSession(ctx, db.SessionOf(err))
+	}
+	wg.Wait()
+	if d.Pending() != 0 {
+		t.Fatalf("Pending = %d, want 0", d.Pending())
+	}
+}
+
+func TestPendingCountsWritesOnly(t *testing.T) {
+	d := New()
+	d.Put(row(5, "a"))
+	d.Hook = func(_ context.Context, st *Stmt) error { return Ambiguous(st, errors.New("timeout")) }
+	d.Select(context.Background(), "k")
+	d.GenClaimed(context.Background(), "k", 5)
+	if d.Pending() != 0 {
+		t.Fatalf("Pending = %d after ambiguous reads, want 0", d.Pending())
+	}
+	d.Update(context.Background(), row(5, "x"), []int{1})
+	if d.Pending() != 1 {
+		t.Fatalf("Pending = %d after an ambiguous write, want 1", d.Pending())
+	}
+}
