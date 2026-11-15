@@ -45,14 +45,18 @@ func (s *Store) RunFlusher(ctx context.Context) {
 						if time.Now().Before(next[i]) {
 							continue
 						}
-						if !s.flushShard(ctx, sh) {
+						failed := s.flushShard(ctx, sh)
+						// After each shard, not each round: while the DB hangs, a round takes one DBTimeout
+						// per shard, far longer than MaxDirtyAge.
+						s.refreshTooOld()
+						if !failed {
 							fails[i] = 0
 							continue
 						}
 						fails[i]++
 						next[i] = time.Now().Add(min(s.cfg.FlushInterval<<min(fails[i]-1, 20), flushBackoffMax))
 					}
-					s.refreshTooOld()
+					s.refreshTooOld() // also when every shard was skipped: the rows only get older
 				}
 			}
 		})
@@ -263,8 +267,8 @@ func (s *Store) recordOldestDirty(sh *shard) {
 }
 
 // refreshTooOld publishes whether the oldest dirty row that is not quarantined is older than MaxDirtyAge
-// (11.1). The flusher calls it after each round, so the limit is approximate: what a crash can lose is
-// bounded by about MaxDirtyAge + FlushInterval.
+// (11.1). The flusher calls it after each shard and each round, so the limit is approximate: what a crash
+// can lose is bounded by about MaxDirtyAge + max(FlushInterval, DBTimeout).
 func (s *Store) refreshTooOld() {
 	o := s.oldestDirty()
 	s.tooOld.Store(s.cfg.MaxDirtyAge > 0 && !o.IsZero() && time.Since(o) > s.cfg.MaxDirtyAge)

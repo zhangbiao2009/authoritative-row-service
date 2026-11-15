@@ -175,3 +175,25 @@ func TestMaxDirtyAgeZeroDisables(t *testing.T) {
 		}
 	})
 }
+
+// Final review, Important 2: with a DB that hangs, each write takes DBTimeout, and a worker's round over
+// its shards takes far longer than MaxDirtyAge. The age limit must still fire about MaxDirtyAge after the
+// oldest update, not a whole round later.
+func TestBusyWhenDBHangs(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		s := newTestStore(t, d, maxDirtyAge(30*time.Second), func(c *Config) { c.NumShards = 256 })
+		dirtyRows(t, s, d, 2000) // rows in every shard: a worker's round is 32 shards x DBTimeout
+		d.Hook = hang
+		start := time.Now()
+		stop := runFlusher(s)
+		defer stop()
+		limit := s.cfg.MaxDirtyAge + s.cfg.DBTimeout + 2*s.cfg.FlushInterval
+		for !s.tooOld.Load() && time.Since(start) < 10*time.Minute {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if took := time.Since(start); took > limit {
+			t.Fatalf("the age limit fired after %v, want at most %v", took, limit)
+		}
+	})
+}
