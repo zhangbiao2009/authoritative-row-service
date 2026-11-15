@@ -81,6 +81,7 @@ type Store struct {
 	dirtyCount atomic.Int64   // entries with dirty != 0; changed only with that entry's mu held
 	inflight   sync.WaitGroup // runSync goroutines: creates and deletes still running
 	entryCount atomic.Int64   // entries in the maps
+	m          metrics        // design.md 11.2
 	nowSec     atomic.Int64   // coarse clock in Unix seconds, kept current by RunEvictor; cheaper than time.Now per access
 
 	// failpoint, if set, runs at the named points of a gap that is not a DB call (tla-mapping.md 3.1). Tests
@@ -152,6 +153,9 @@ type entry struct {
 	queued bool   // in its shard's flush queue, or about to be appended to it; mu
 	// When dirty last went from 0 to non-zero; mu. A failed flush keeps the earlier time (11.1).
 	dirtySince time.Time
+	// The DB definitely rejected its flush: quarantined (7.9). It stays dirty, is written alone, and is
+	// left out of the age of 11.1; mu.
+	poisoned bool
 	// dead: removed from the map, or about to be (I1). Written with op and mu held, read with either (I9).
 	dead bool
 
@@ -160,6 +164,8 @@ type entry struct {
 	// Accessed only with op held.
 	lastLoadErr   error
 	lastLoadErrAt time.Time
+	poisonVer     int64     // ver of the row the DB rejected; a newer one is retried at once
+	poisonRetryAt time.Time // when the same row is tried again
 }
 
 func (s *Store) shardFor(key schema.Key) *shard {
@@ -243,6 +249,14 @@ func (s *Store) clearDirtyLocked(e *entry) {
 		s.dirtyCount.Add(-1)
 	}
 	e.dirty = 0
+}
+
+// unpoisonLocked takes e out of quarantine: the DB holds its row, or the row is gone.
+func (s *Store) unpoisonLocked(e *entry) {
+	if e.poisoned {
+		e.poisoned = false
+		s.m.poisoned.Add(-1)
+	}
 }
 
 // enqueue appends e to its shard's flush queue. The caller holds no lock: it is called after e.mu is

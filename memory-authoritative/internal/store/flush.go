@@ -3,6 +3,8 @@ package store
 import (
 	"cmp"
 	"context"
+	"errors"
+	"log/slog"
 	"slices"
 	"sync"
 	"time"
@@ -14,6 +16,8 @@ import (
 const (
 	flushWorkers    = 8               // RunFlusher's goroutines, at most; to be tuned in the M7 load test
 	flushBackoffMax = 5 * time.Second // the longest a shard whose writes fail is skipped
+
+	poisonRetryInterval = time.Minute // a quarantined row with no update since is tried again after this
 )
 
 // RunFlusher flushes every shard once per FlushInterval until ctx is cancelled, then returns once its
@@ -76,7 +80,7 @@ func (s *Store) flushShard(ctx context.Context, sh *shard) (failed bool) {
 	sh.qmu.Unlock()
 
 	var retry []*entry
-	var items []flushItem
+	var items, solo []flushItem // solo: quarantined rows due for a retry, written alone (7.9)
 	for i, e := range queue {
 		// TLA: F_scan
 		if !e.tryLockOp() {
@@ -91,15 +95,25 @@ func (s *Store) flushShard(ctx context.Context, sh *shard) (failed bool) {
 			e.unlockOp()
 			continue
 		}
+		poisoned := e.poisoned
+		if poisoned && r.Ver == e.poisonVer && time.Now().Before(e.poisonRetryAt) {
+			e.mu.Unlock() // quarantined, and not updated since the DB rejected it: its retry is not due
+			e.unlockOp()
+			retry = append(retry, e)
+			continue
+		}
 		// I4: dirty is cleared only here, with op held until the write returns, and merged back if the
 		// write fails. So dirty == 0 with op free means the DB holds this row.
-		items = append(items, flushItem{e, r, mask, e.dirtySince})
+		it := flushItem{e, r, mask, e.dirtySince}
 		s.clearDirtyLocked(e)
 		e.queued = false
 		e.mu.Unlock()
-		if len(items) == s.cfg.FlushBatchMax {
-			if !s.writeBatch(ctx, items) {
-				failed = true
+		if poisoned {
+			solo = append(solo, it)
+			continue
+		}
+		if items = append(items, it); len(items) == s.cfg.FlushBatchMax {
+			if failed = s.writeBatch(ctx, items); failed {
 				retry = append(retry, queue[i+1:]...) // still marked queued
 				break
 			}
@@ -107,16 +121,22 @@ func (s *Store) flushShard(ctx context.Context, sh *shard) (failed bool) {
 		}
 	}
 	if !failed && len(items) > 0 {
-		failed = !s.writeBatch(ctx, items)
+		failed = s.writeBatch(ctx, items)
+	}
+	if failed {
+		s.giveBack(solo)
+	} else {
+		failed = s.writeAlone(ctx, solo)
 	}
 	s.requeueAll(sh, retry)
 	s.recordOldestDirty(sh)
 	return failed
 }
 
-// writeBatch sends items as one UpdateBatch, merges them back if it failed, and releases their op. It
-// reports whether the write succeeded.
-func (s *Store) writeBatch(ctx context.Context, items []flushItem) bool {
+// writeBatch sends items as one UpdateBatch and releases their op. If the DB definitely rejected the
+// batch, it writes the rows one by one to find the poison rows (7.9). It reports whether a write failed
+// otherwise; every item not written is then merged back.
+func (s *Store) writeBatch(ctx context.Context, items []flushItem) (failed bool) {
 	slices.SortFunc(items, func(a, b flushItem) int { return cmp.Compare(a.e.id, b.e.id) }) // 8.3
 	ws := make([]db.Write, len(items))
 	for i, it := range items {
@@ -127,13 +147,65 @@ func (s *Store) writeBatch(ctx context.Context, items []flushItem) bool {
 	err := s.db.UpdateBatch(wctx, ws)
 	cancel()
 	// TLA: F_done
-	for _, it := range items {
-		if err != nil {
-			s.mergeBack(it)
+	switch {
+	case err == nil:
+		for _, it := range items {
+			it.e.unlockOp()
 		}
+		return false
+	case rejected(err):
+		return s.writeAlone(ctx, items) // the transaction was rolled back: nothing of it was written
+	default:
+		s.giveBack(items)
+		return true
+	}
+}
+
+// writeAlone writes each item in a transaction of its own and releases its op. A row the DB definitely
+// rejects is quarantined (7.9). After any other failure the rest is merged back untried; it reports
+// whether that happened.
+func (s *Store) writeAlone(ctx context.Context, items []flushItem) (failed bool) {
+	for i, it := range items {
+		e := it.e
+		// TLA: F_send
+		wctx, cancel := context.WithTimeout(ctx, s.cfg.DBTimeout)
+		err := s.db.Update(wctx, it.row, it.mask)
+		cancel()
+		// TLA: F_done
+		switch {
+		case err == nil:
+			e.mu.Lock()
+			s.unpoisonLocked(e)
+			e.mu.Unlock()
+		case rejected(err):
+			s.mergeBack(it)
+			e.poisonVer, e.poisonRetryAt = it.row.Ver, time.Now().Add(poisonRetryInterval) // op held
+			e.mu.Lock()
+			if !e.poisoned {
+				e.poisoned = true
+				s.m.poisoned.Add(1)
+			}
+			e.mu.Unlock()
+			slog.Warn("flush rejected by the DB; row quarantined", "table", s.schema.Table, "key", e.id, "err", err)
+		default:
+			s.giveBack(items[i:])
+			return true
+		}
+		e.unlockOp()
+	}
+	return false
+}
+
+// rejected reports whether the DB definitely rejected a write because of the row's data or another row
+// (8.4): the same write fails again, at least until something changes.
+func rejected(err error) bool { return errors.Is(err, db.ErrRejected) || db.IsCrossRow(err) }
+
+// giveBack merges back items that were not written and releases their op.
+func (s *Store) giveBack(items []flushItem) {
+	for _, it := range items {
+		s.mergeBack(it)
 		it.e.unlockOp()
 	}
-	return err == nil
 }
 
 // mergeBack puts the columns of a failed write back, so that the next round writes them with the newest
@@ -163,7 +235,8 @@ func (s *Store) requeueAll(sh *shard, es []*entry) {
 	sh.qmu.Unlock()
 }
 
-// recordOldestDirty stores the earliest dirtySince of the shard's dirty rows in sh.oldestDirty (11.1). It
+// recordOldestDirty stores the earliest dirtySince of the shard's dirty rows that are not quarantined in
+// sh.oldestDirty (11.1): a poison row waits for a human, and must not stop every update. It
 // runs at the end of flushShard: every dirty entry is then in the queue, since only flushShard takes
 // entries out and it has put back what it did not write.
 func (s *Store) recordOldestDirty(sh *shard) {
@@ -173,7 +246,7 @@ func (s *Store) recordOldestDirty(sh *shard) {
 	var oldest int64
 	for _, e := range queue {
 		e.mu.Lock()
-		if e.dirty != 0 && (oldest == 0 || e.dirtySince.UnixNano() < oldest) {
+		if e.dirty != 0 && !e.poisoned && (oldest == 0 || e.dirtySince.UnixNano() < oldest) {
 			oldest = e.dirtySince.UnixNano()
 		}
 		e.mu.Unlock()
