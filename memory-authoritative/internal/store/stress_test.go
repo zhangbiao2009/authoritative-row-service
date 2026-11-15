@@ -76,7 +76,7 @@ func TestStressUpdates(t *testing.T) {
 	var writes, failed, late atomic.Int64
 	var lateExecs sync.WaitGroup
 	d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
-		if st.Kind != fakedb.Update {
+		if st.Kind != fakedb.UpdateBatch {
 			return nil
 		}
 		n := rand.IntN(10)

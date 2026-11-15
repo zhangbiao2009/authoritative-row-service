@@ -42,6 +42,7 @@ type Config struct {
 	FlushInterval  time.Duration // how often RunFlusher writes dirty rows back
 	DBTimeout      time.Duration // timeout for each DB call on the Go side (design.md 11.4)
 	OpFenceTimeout time.Duration // how long one FenceSessions call may wait for the sessions to exit (7.4)
+	FlushBatchMax  int           // rows per UpdateBatch, at most (design.md 7.6)
 
 	// Eviction (design.md 7.7). TTLs count in whole seconds; 0 means "not accessed in the current second".
 	IdleTTL         time.Duration // a loaded row idle this long is removed from memory
@@ -59,6 +60,7 @@ func DefaultConfig() Config {
 		FlushInterval:  200 * time.Millisecond,
 		DBTimeout:      3 * time.Second,
 		OpFenceTimeout: 10 * time.Second,
+		FlushBatchMax:  500,
 
 		IdleTTL:         10 * time.Minute, // 11.4: TBD
 		NegativeIdleTTL: time.Minute,      // 11.4: 1-5 minutes
@@ -101,6 +103,9 @@ func New(sch *schema.Schema, d db.DB, cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("FlushInterval %v, DBTimeout %v and OpFenceTimeout %v must be positive",
 			cfg.FlushInterval, cfg.DBTimeout, cfg.OpFenceTimeout)
 	}
+	if cfg.FlushBatchMax <= 0 {
+		return nil, fmt.Errorf("FlushBatchMax %d must be positive", cfg.FlushBatchMax)
+	}
 	if cfg.IdleTTL < 0 || cfg.NegativeIdleTTL < 0 || cfg.EvictInterval <= 0 || cfg.MaxSweepRounds <= 0 || cfg.MaxEntries <= 0 {
 		return nil, fmt.Errorf("eviction config: TTLs must not be negative, EvictInterval %v, MaxSweepRounds %d and MaxEntries %d must be positive",
 			cfg.EvictInterval, cfg.MaxSweepRounds, cfg.MaxEntries)
@@ -121,6 +126,10 @@ type shard struct {
 	// Entries waiting to be flushed. A slice, so appending never blocks; an entry is in it at most once,
 	// because only the caller that sets entry.queued appends it.
 	queue []*entry
+
+	// UnixNano of the earliest dirtySince among the shard's dirty rows, as its last flush found it; 0 if
+	// none. Written by that flush only.
+	oldestDirty atomic.Int64
 }
 
 // absent is the snap of a row that definitely does not exist: a tombstone or a negative cache entry.
@@ -141,6 +150,8 @@ type entry struct {
 	mu     sync.Mutex
 	dirty  uint64 // columns changed in memory and not yet written to the DB (schema.ColBit); mu
 	queued bool   // in its shard's flush queue, or about to be appended to it; mu
+	// When dirty last went from 0 to non-zero; mu. A failed flush keeps the earlier time (11.1).
+	dirtySince time.Time
 	// dead: removed from the map, or about to be (I1). Written with op and mu held, read with either (I9).
 	dead bool
 
@@ -222,6 +233,7 @@ func (e *entry) unlockOp() { <-e.op }
 func (s *Store) markDirtyLocked(e *entry, mask uint64) {
 	if e.dirty == 0 {
 		s.dirtyCount.Add(1)
+		e.dirtySince = time.Now() // in-memory work: allowed under mu
 	}
 	e.dirty |= mask
 }

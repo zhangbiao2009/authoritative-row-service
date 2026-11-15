@@ -117,7 +117,7 @@ func TestDeleteWaitsForFlush(t *testing.T) {
 		loaded(t, s, d, k)
 		update(t, s, k, set(1, "x"))
 		release := make(chan struct{})
-		rec := script(d, map[fakedb.Kind][]step{fakedb.Update: {blockOn(release)}})
+		rec := script(d, map[fakedb.Kind][]step{fakedb.UpdateBatch: {blockOn(release)}})
 		var wg sync.WaitGroup
 		wg.Go(func() { flushAll(s) })
 		synctest.Wait() // the flush write is in progress
@@ -292,7 +292,7 @@ func lateFlush(t *testing.T, s *Store, d *fakedb.DB, k schema.Key) (late func())
 	t.Helper()
 	create(t, s, newRow(k, 1, 100))
 	update(t, s, k, set(1, "old"))
-	script(d, map[fakedb.Kind][]step{fakedb.Update: {amb(&late)}})
+	script(d, map[fakedb.Kind][]step{fakedb.UpdateBatch: {amb(&late)}})
 	flushAll(s)
 	d.Hook = nil
 	return late
