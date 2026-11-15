@@ -702,7 +702,9 @@ type ColChange struct {
 	Val any   // OpSet: the new value, copied by the API layer; OpIncr: the delta (int64 or float64)
 }
 
-// Change is built and validated by the API layer (types, NOT NULL, lengths, ranges; 5.3, 7.9).
+// Change is built and its values validated by the API layer (types, NOT NULL, lengths, ranges; 5.3, 7.9).
+// The Store checks its shape itself (checkChange), because it relies on it: an out-of-range column would
+// panic, and a Change with no columns would only bump ver.
 type Change struct {
 	Cols []ColChange
 	Gen  int64 // optional: the gen the client expects; 0 = no check
@@ -710,6 +712,12 @@ type Change struct {
 
 // Update returns the row as the DB stored it. The API layer takes the new values of incremented columns from it.
 func (s *Store) Update(ctx context.Context, id Key, ch Change) (*Row, error) {
+	// The write may go on after the caller has its answer (ErrOutcomeUnknown), so it must not read the
+	// caller's memory: copy the slice first. The values themselves are immutable (I2).
+	ch.Cols = slices.Clone(ch.Cols)
+	if err := s.checkChange(ch); err != nil { // shape of the Change: columns, primary key (I11), repeats
+		return nil, err
+	}
 	e, err := s.lockOpLive(ctx, id)
 	if err != nil {
 		return nil, err // timed out while queued: not executed
@@ -772,6 +780,12 @@ func (s *Store) applyChange(old *Row, ch Change) (*Row, []int, error)
 // Create returns the full row as stored (with DB defaults). (nil, nil) means: this gen was created earlier
 // and that life has been deleted since (an SDK retry, hole 2).
 func (s *Store) Create(ctx context.Context, in *Row) (*Row, error) {
+	// The create may go on after the caller has its answer (ErrOutcomeUnknown), so it must not read the
+	// caller's row: a changed Key would be inserted under another key's op (I5, I11). Copy it first.
+	in = &Row{Key: in.Key, Gen: in.Gen, Vals: slices.Clone(in.Vals)}
+	if err := s.checkRow(in); err != nil { // one value per column; Key matches the primary key values (I11)
+		return nil, err
+	}
 	e, err := s.lockOpLive(ctx, in.Key)
 	if err != nil {
 		return nil, err // timed out while queued: not executed
@@ -1402,6 +1416,7 @@ Two checks are **not needed** by the model and are kept on purpose (0.4): `AND g
 | 6 | Tables with constraints on other rows | **Accepted** without an option: a rejection is synchronous and nothing of it can land later. Cascading foreign keys are still refused | 5.3 |
 | 7 | Package of `Key`, `Row`, `ErrInvalid` | **`schema`**: `db` and `store` both use them, and `store` imports `db` (M1 plan, decision 1) | 5.2 |
 | 8 | A create's dedup lookup after the fence fails | **Retried until it succeeds**, like the read, so the answer is definite; **skipped** for a gen this create generated (it cannot be claimed). `OUTCOME_UNKNOWN` then comes only from the client's deadline (M3 review) | 7.5, 12.3 |
+| 9 | Create and Update read the caller's input in the background write | **Copy it first** (Create: the row with cloned `Vals`; Update: `ch.Cols`), then check its shape (`checkRow`, `checkChange`), before taking `op`. A write that outlives its caller (`ErrOutcomeUnknown`) must not read memory the caller may reuse (M2 plan decision 3, M3 review) | 7.4, 7.5 |
 
 ### 13.2 The holes of the memory-authoritative design, here
 
