@@ -266,6 +266,33 @@ func TestUpdateClientGivesUp(t *testing.T) {
 	})
 }
 
+// The caller reuses its []ColChange after ErrOutcomeUnknown: the update still in flight must write what was
+// sent, not what the caller wrote since.
+func TestUpdateDoesNotKeepCallerChange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		release := make(chan struct{})
+		script(d, map[fakedb.Kind][]step{fakedb.Select: {blockOn(release)}})
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1))
+		pk := d.Row(k).Vals[0]
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		cols := []ColChange{set(1, "b")}
+		if _, err := s.Update(ctx, k, Change{Cols: cols}); !errors.Is(err, ErrOutcomeUnknown) {
+			t.Fatalf("err = %v, want ErrOutcomeUnknown", err)
+		}
+		cols[0] = set(1, "other") // the caller reuses its slice
+		close(release)
+		s.inflight.Wait()
+		if r := d.Row(k); r.Vals[1] != "b" || r.Vals[0] != pk {
+			t.Fatalf("row = %+v, want column 1 \"b\" and the primary key %v", r, pk)
+		}
+		checkInvariants(t, s, d)
+	})
+}
+
 // A request that times out while queued for op did nothing (TLA: X_qtimeout).
 func TestUpdateTimesOutWhileQueued(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {

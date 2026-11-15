@@ -485,3 +485,42 @@ func TestPendingCountsWritesOnly(t *testing.T) {
 		t.Fatalf("Pending = %d after an ambiguous write, want 1", d.Pending())
 	}
 }
+
+// A statement whose call has returned, executed while another write call of its key is in progress, breaks
+// StmtOnlyUnderOp (I5).
+func TestLateExecDuringAnotherWriteIsAsserted(t *testing.T) {
+	d := New()
+	d.Put(row(5, "a"))
+	var exec func()
+	var sess db.SessionID
+	keepAmbiguous(d, &exec, &sess)
+	if _, err := d.Update(context.Background(), row(5, "x"), []int{1}); !db.IsAmbiguous(err) {
+		t.Fatalf("err = %v", err)
+	}
+	inside, release := make(chan struct{}), make(chan struct{})
+	d.Hook = func(context.Context, *Stmt) error { inside <- struct{}{}; <-release; return nil }
+	var wg sync.WaitGroup
+	wg.Go(func() { d.Update(context.Background(), row(5, "y"), []int{1}) })
+	<-inside // the second call is in progress
+	exec()
+	close(release)
+	wg.Wait()
+	if err := d.Violation(); err == nil || !strings.Contains(err.Error(), "StmtOnlyUnderOp") {
+		t.Fatalf("Violation = %v, want StmtOnlyUnderOp", err)
+	}
+}
+
+func TestLateExecAloneIsNotAViolation(t *testing.T) {
+	d := New()
+	d.Put(row(5, "a"))
+	var exec func()
+	var sess db.SessionID
+	keepAmbiguous(d, &exec, &sess)
+	if _, err := d.Update(context.Background(), row(5, "x"), []int{1}); !db.IsAmbiguous(err) {
+		t.Fatalf("err = %v", err)
+	}
+	exec()
+	if err := d.Violation(); err != nil {
+		t.Fatalf("Violation = %v, want nil", err)
+	}
+}

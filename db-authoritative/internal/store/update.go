@@ -32,6 +32,9 @@ type Change struct {
 // exist or is not the life ch.Gen names; ErrInvalid if ch is malformed or an increment fails, in which
 // case nothing was sent.
 func (s *Store) Update(ctx context.Context, key schema.Key, ch Change) (*schema.Row, error) {
+	// The update may go on after the caller has its answer (ErrOutcomeUnknown), and the caller may then reuse
+	// its slice. The values themselves are immutable (I2).
+	ch.Cols = slices.Clone(ch.Cols)
 	if err := s.checkChange(ch); err != nil {
 		return nil, err
 	}
