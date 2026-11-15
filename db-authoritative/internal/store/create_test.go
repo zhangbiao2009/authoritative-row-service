@@ -65,20 +65,6 @@ func TestCreateNewGenIsNonZero(t *testing.T) {
 	}
 }
 
-func TestCreateExistingIsAlreadyExists(t *testing.T) {
-	d := fakedb.New()
-	s := newTestStore(t, d)
-	k := key(t, s, 1)
-	d.Put(testRow(k, 1)) // gen 101
-	rec := script(d, nil)
-	if r, err := s.Create(context.Background(), newRow(k, 1, 7)); !errors.Is(err, ErrAlreadyExists) {
-		t.Fatalf("Create = %+v, %v; want ErrAlreadyExists", r, err)
-	}
-	if n := len(rec.of(fakedb.Insert)); n != 0 {
-		t.Fatalf("Insert statements = %d, want 0", n)
-	}
-}
-
 func TestCreateSameGenReturnsRow(t *testing.T) {
 	d := fakedb.New()
 	s := newTestStore(t, d)
@@ -92,33 +78,9 @@ func TestCreateSameGenReturnsRow(t *testing.T) {
 	if r, err := s.Create(context.Background(), newRow(k, 1, 101)); err != nil || r != cached {
 		t.Fatalf("Create = %p, %v; want the cached row %p", r, err, cached)
 	}
-	if n := len(rec.of(fakedb.Insert)); n != 0 {
+	if n := rec.count(fakedb.Insert); n != 0 {
 		t.Fatalf("Insert statements = %d, want 0", n)
 	}
-}
-
-// Hole 6: the gen was created earlier, that life was deleted, and the key was created again.
-func TestCreateOtherLifeGenClaimed(t *testing.T) {
-	d := fakedb.New()
-	s := newTestStore(t, d)
-	k := key(t, s, 1)
-	ctx := context.Background()
-	if _, err := d.InsertDedup(ctx, newRow(k, 1, 7)); err != nil {
-		t.Fatal(err)
-	}
-	if err := d.Delete(ctx, k, 7); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := d.InsertDedup(ctx, newRow(k, 1, 200)); err != nil {
-		t.Fatal(err)
-	}
-	if r, err := s.Create(ctx, newRow(k, 1, 7)); r != nil || err != nil {
-		t.Fatalf("Create = %+v, %v; want (nil, nil)", r, err)
-	}
-	if r := d.Row(k); r == nil || r.Gen != 200 {
-		t.Fatalf("DB row = %+v, want gen 200 to stay", r)
-	}
-	checkInvariants(t, s, d)
 }
 
 func TestCreateLoadsFirst(t *testing.T) {
@@ -130,8 +92,11 @@ func TestCreateLoadsFirst(t *testing.T) {
 	if r, err := s.Create(context.Background(), newRow(k, 1, 7)); !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("Create = %+v, %v; want ErrAlreadyExists", r, err)
 	}
-	if n, m := len(rec.of(fakedb.Select)), len(rec.of(fakedb.Insert)); n != 1 || m != 0 {
+	if n, m := rec.count(fakedb.Select), rec.count(fakedb.Insert); n != 1 || m != 0 {
 		t.Fatalf("Select %d, Insert %d; want 1, 0", n, m)
+	}
+	if n := rec.count(fakedb.GenClaimed); n != 1 { // another life: the dedup table is asked before ALREADY_EXISTS
+		t.Fatalf("GenClaimed lookups = %d, want 1", n)
 	}
 }
 
@@ -143,7 +108,7 @@ func TestCreateLoadErrorSendsNothing(t *testing.T) {
 	if r, err := s.Create(context.Background(), newRow(k, 1, 7)); !errors.Is(err, db.ErrNotExecuted) {
 		t.Fatalf("Create = %+v, %v; want db.ErrNotExecuted", r, err)
 	}
-	if n := len(rec.of(fakedb.Insert)); n != 0 {
+	if n := rec.count(fakedb.Insert); n != 0 {
 		t.Fatalf("Insert statements = %d, want 0", n)
 	}
 }

@@ -20,18 +20,6 @@ import (
 func set(col int, v any) ColChange    { return ColChange{Col: col, Op: OpSet, Val: v} }
 func incr(col int, d int64) ColChange { return ColChange{Col: col, Op: OpIncr, Val: d} }
 
-// blockUpdates makes every fakedb.Update statement wait until the returned channel is closed.
-func blockUpdates(d *fakedb.DB) (release chan struct{}) {
-	release = make(chan struct{})
-	d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
-		if st.Kind == fakedb.Update {
-			<-release
-		}
-		return nil
-	}
-	return release
-}
-
 func entryOf(s *Store, k schema.Key) *entry {
 	sh := s.shardFor(k)
 	sh.mu.RLock()
@@ -245,7 +233,8 @@ func TestUpdateZeroRowsIsInternal(t *testing.T) {
 func TestUpdateClientGivesUp(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
-		release := blockUpdates(d)
+		release := make(chan struct{})
+		script(d, map[fakedb.Kind][]step{fakedb.Update: {blockOn(release)}})
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
@@ -297,7 +286,8 @@ func TestUpdateDoesNotKeepCallerChange(t *testing.T) {
 func TestUpdateTimesOutWhileQueued(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
-		release := blockUpdates(d)
+		release := make(chan struct{})
+		script(d, map[fakedb.Kind][]step{fakedb.Update: {blockOn(release)}})
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
@@ -324,7 +314,8 @@ func TestUpdateTimesOutWhileQueued(t *testing.T) {
 func TestGetDuringWriteSeesOldRow(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
-		release := blockUpdates(d)
+		release := make(chan struct{})
+		script(d, map[fakedb.Kind][]step{fakedb.Update: {blockOn(release)}})
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
@@ -506,7 +497,7 @@ func TestUpdateReadAfterFenceFails(t *testing.T) {
 		if n := d.Pending(); n != 0 { // the kept statement never runs: only the fence clears it
 			t.Fatalf("Pending = %d, want 0", n)
 		}
-		if n := len(rec.of(fakedb.Select)); n != 4 { // the load, then three after the fence
+		if n := rec.count(fakedb.Select); n != 4 { // the load, then three after the fence
 			t.Fatalf("Selects = %d, want 4", n)
 		}
 		checkInvariants(t, s, d)
@@ -527,7 +518,7 @@ func TestUpdateRejected(t *testing.T) {
 		if r := d.Row(k); r.Ver != 3 || r.Vals[1] != "a" {
 			t.Fatalf("DB row %+v changed", r)
 		}
-		if n := len(rec.of(fakedb.Fence)); n != 0 {
+		if n := rec.count(fakedb.Fence); n != 0 {
 			t.Fatalf("%d fences, want none", n)
 		}
 		checkInvariants(t, s, d)

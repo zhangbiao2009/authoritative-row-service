@@ -10,8 +10,6 @@ import (
 	"rowcache/internal/db/fakedb"
 )
 
-func deletes(rec *recorder) int { return len(rec.of(fakedb.Delete)) }
-
 func TestDeleteRow(t *testing.T) {
 	d := fakedb.New()
 	s := newTestStore(t, d)
@@ -43,7 +41,7 @@ func TestDeleteGenMismatch(t *testing.T) {
 	if err := s.Delete(context.Background(), k, 999); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Delete = %v, want ErrNotFound", err)
 	}
-	if n := deletes(rec); n != 0 {
+	if n := rec.count(fakedb.Delete); n != 0 {
 		t.Fatalf("%d Delete statements sent, want 0", n)
 	}
 	if d.Row(k) == nil {
@@ -60,7 +58,7 @@ func TestDeleteMissingIsNotFound(t *testing.T) {
 		if err := s.Delete(context.Background(), k, 0); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("Delete #%d = %v, want ErrNotFound", i, err)
 		}
-		if n := deletes(rec); n != 0 {
+		if n := rec.count(fakedb.Delete); n != 0 {
 			t.Fatalf("%d Delete statements sent, want 0", n)
 		}
 		if !opFree(entryOf(s, k)) {
@@ -169,7 +167,7 @@ func TestUpdateAfterDeleteIsNotFound(t *testing.T) {
 		if derr != nil || !errors.Is(uerr, ErrNotFound) {
 			t.Fatalf("Delete = %v, Update = %v; want nil, ErrNotFound", derr, uerr)
 		}
-		if n := len(rec.of(fakedb.Update)); n != 0 {
+		if n := rec.count(fakedb.Update); n != 0 {
 			t.Fatalf("%d Update statements sent, want 0", n)
 		}
 	})

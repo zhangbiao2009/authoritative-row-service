@@ -169,7 +169,8 @@ func runSync[T any](ctx context.Context, s *Store, e *entry, fn func(*entry) (T,
 }
 
 // backoff waits before retry number attempt: 10 ms doubled per attempt, at most 1 s. M6 makes it return an
-// error once bgCtx is cancelled (shutdown).
+// error once bgCtx is cancelled (shutdown). The inner min only keeps the shift from overflowing; the outer
+// min caps the wait.
 func (s *Store) backoff(attempt int) {
 	time.Sleep(min(10*time.Millisecond<<min(attempt, 7), time.Second))
 }

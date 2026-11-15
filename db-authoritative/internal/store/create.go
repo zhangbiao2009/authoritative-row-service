@@ -38,27 +38,26 @@ func (s *Store) createLocked(e *entry, in *schema.Row) (*schema.Row, error) {
 		return nil, err
 	}
 	if cur != absent {
-		if in.Gen != 0 && cur.Gen == in.Gen {
-			return cur, nil // a retry whose earlier attempt succeeded
-		}
 		if in.Gen != 0 {
+			if cur.Gen == in.Gen {
+				return cur, nil // a retry whose earlier attempt succeeded
+			}
 			// Another life. If the dedup table holds this gen, this is a retry of a create that took effect
 			// and whose life was deleted since (hole 6): success with no row.
 			claimed, err := s.db.GenClaimed(s.bgCtx, e.id, in.Gen)
-			switch {
-			case err != nil:
+			if err != nil {
 				return nil, fmt.Errorf("%w: dedup lookup: %v", db.ErrNotExecuted, err) // a read: nothing done
-			case claimed:
+			}
+			if claimed {
 				return nil, nil
 			}
 		}
 		return nil, ErrAlreadyExists
 	}
-	nr := *in
-	if nr.Gen == 0 {
-		nr.Gen = newGen()
+	if in.Gen == 0 {
+		in.Gen = newGen()
 	}
-	got, err := s.db.InsertDedup(s.bgCtx, &nr)
+	got, err := s.db.InsertDedup(s.bgCtx, in)
 	// TLA: B_2
 	switch {
 	case err == nil:
@@ -75,15 +74,15 @@ func (s *Store) createLocked(e *entry, in *schema.Row) (*schema.Row, error) {
 			return nil, ferr
 		}
 		// TLA: B_3
-		if now != absent && now.Gen == nr.Gen {
+		if now != absent && now.Gen == in.Gen {
 			return now, nil
 		}
-		claimed, cerr := s.db.GenClaimed(s.bgCtx, e.id, nr.Gen)
-		switch {
-		case cerr != nil:
+		claimed, cerr := s.db.GenClaimed(s.bgCtx, e.id, in.Gen)
+		if cerr != nil {
 			// Settled in the DB, but unknown to us. A retry with this gen decides it: nothing is in flight.
 			return nil, ErrOutcomeUnknown
-		case claimed:
+		}
+		if claimed {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("%w: create not applied after fence", db.ErrNotExecuted)

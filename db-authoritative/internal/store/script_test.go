@@ -77,6 +77,9 @@ func (r *recorder) of(k fakedb.Kind) []fakedb.Stmt {
 	return out
 }
 
+// count returns the number of statements of kind k seen so far.
+func (r *recorder) count(k fakedb.Kind) int { return len(r.of(k)) }
+
 // wantFences checks that n Fence statements were sent, each terminating the session of the first
 // statement of kind k: the attempt the test kept ambiguous.
 func (r *recorder) wantFences(t *testing.T, n int, k fakedb.Kind) {

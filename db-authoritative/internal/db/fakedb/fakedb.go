@@ -27,12 +27,11 @@ const (
 
 // Stmt is one statement, as the hook sees it.
 type Stmt struct {
-	Kind     Kind
-	Key      schema.Key   // not set for Fence
-	Gen      int64        // Update, Insert, Delete, GenClaimed
-	Session  db.SessionID // the statement's own session (a new one per statement); Fence: the session to terminate
-	returned bool         // its write call has returned (guarded by DB.mu)
-	Exec     func()       // executes the statement; at most once; does nothing once its session is fenced
+	Kind    Kind
+	Key     schema.Key   // not set for Fence
+	Gen     int64        // Update, Insert, Delete, GenClaimed
+	Session db.SessionID // the statement's own session (a new one per statement); Fence: the session to terminate
+	Exec    func()       // executes the statement; at most once; does nothing once its session is fenced
 }
 
 // Ambiguous returns the error of a statement whose outcome the caller cannot know.
@@ -180,6 +179,11 @@ func (d *DB) run(ctx context.Context, st *Stmt, execLocked func()) error {
 	if st.Kind != Fence {
 		st.Session = db.SessionID(d.sessions.Add(1))
 	}
+	write := isWrite(st.Kind)
+	returned := false // a write's call has returned (guarded by d.mu): its Exec is then a late one
+	if write {
+		defer d.startWrite(st.Key, &returned)()
+	}
 	var ran atomic.Bool
 	var once sync.Once
 	st.Exec = func() {
@@ -189,7 +193,7 @@ func (d *DB) run(ctx context.Context, st *Stmt, execLocked func()) error {
 			defer d.mu.Unlock()
 			delete(d.pending, st.Session)
 			if !d.fenced[st.Session] {
-				if st.returned && d.writing[st.Key] > 0 {
+				if returned && d.writing[st.Key] > 0 {
 					d.violateLocked("StmtOnlyUnderOp (I5): a late statement (kind %d) of key %q executes while another write call of the key is in progress", st.Kind, st.Key)
 				}
 				execLocked()
@@ -198,7 +202,7 @@ func (d *DB) run(ctx context.Context, st *Stmt, execLocked func()) error {
 	}
 	if d.Hook != nil {
 		if err := d.Hook(ctx, st); err != nil {
-			if db.IsAmbiguous(err) && (st.Kind == Insert || st.Kind == Update || st.Kind == Delete) {
+			if write && db.IsAmbiguous(err) {
 				d.mu.Lock()
 				if !ran.Load() && !d.fenced[st.Session] {
 					d.pending[st.Session] = true
@@ -215,10 +219,11 @@ func (d *DB) run(ctx context.Context, st *Stmt, execLocked func()) error {
 	return nil
 }
 
-// write registers the write call of st, for OneWriterPerKey; the returned func unregisters it and marks st
-// returned, so that a later Exec of st is a late one.
-func (d *DB) write(st *Stmt) (done func()) {
-	key := st.Key
+func isWrite(k Kind) bool { return k == Insert || k == Update || k == Delete }
+
+// startWrite registers a write call of key, for OneWriterPerKey; the returned func unregisters it and sets
+// *returned, so that a later Exec of the statement is a late one.
+func (d *DB) startWrite(key schema.Key, returned *bool) (done func()) {
 	d.mu.Lock()
 	if d.writing[key]++; d.writing[key] > 1 {
 		d.violateLocked("OneWriterPerKey (I5): two write calls of key %q in progress at once", key)
@@ -226,7 +231,7 @@ func (d *DB) write(st *Stmt) (done func()) {
 	d.mu.Unlock()
 	return func() {
 		d.mu.Lock()
-		st.returned = true
+		*returned = true
 		if d.writing[key]--; d.writing[key] == 0 {
 			delete(d.writing, key)
 		}
@@ -270,7 +275,6 @@ func (d *DB) Select(ctx context.Context, key schema.Key) (*schema.Row, error) {
 // InsertDedup executes the create statement of design.md 8.3: the dedup record and the row, in one statement.
 func (d *DB) InsertDedup(ctx context.Context, r *schema.Row) (*schema.Row, error) {
 	st := &Stmt{Kind: Insert, Key: r.Key, Gen: r.Gen}
-	defer d.write(st)()
 	var got *schema.Row
 	var res error
 	err := d.run(ctx, st, func() {
@@ -326,7 +330,6 @@ func (d *DB) GenClaimed(ctx context.Context, key schema.Key, gen int64) (bool, e
 func (d *DB) Update(ctx context.Context, r *schema.Row, cols []int) (*schema.Row, error) {
 	d.updates.Add(1)
 	st := &Stmt{Kind: Update, Key: r.Key, Gen: r.Gen}
-	defer d.write(st)()
 	var got *schema.Row
 	var res error
 	err := d.run(ctx, st, func() {
@@ -346,7 +349,7 @@ func (d *DB) Update(ctx context.Context, r *schema.Row, cols []int) (*schema.Row
 		n.Ver++
 		d.checkRowLocked(n)
 		d.rows[r.Key] = n
-		d.applied = append(d.applied, clone(n))
+		d.applied = append(d.applied, n) // rows are replaced, never mutated
 		got = clone(n)
 	})
 	if err != nil {
@@ -358,7 +361,6 @@ func (d *DB) Update(ctx context.Context, r *schema.Row, cols []int) (*schema.Row
 // Delete executes DELETE WHERE key AND gen. The dedup record stays (I12).
 func (d *DB) Delete(ctx context.Context, key schema.Key, gen int64) error {
 	st := &Stmt{Kind: Delete, Key: key, Gen: gen}
-	defer d.write(st)()
 	var res error
 	err := d.run(ctx, st, func() {
 		cur, ok := d.rows[key]

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
@@ -88,27 +89,36 @@ func (f *faults) takeLocked(id db.SessionID) bool {
 	return ok
 }
 
+// settle is the answer of a statement the faults leave alone. A Fence is then confirmed: the statement of the
+// session, if kept, is dropped. (The fence executes right after this returns, and a late Exec takes mu before
+// it runs, so a kept statement either landed before or never.)
+func (f *faults) settle(st *fakedb.Stmt) error {
+	if st.Kind == fakedb.Fence {
+		f.mu.Lock()
+		if f.takeLocked(st.Session) {
+			f.dropped.Add(1)
+		}
+		f.mu.Unlock()
+	}
+	return nil
+}
+
 func (f *faults) hook(ctx context.Context, st *fakedb.Stmt) error {
 	if st.Kind == fakedb.GenClaimed {
 		if f.on.Load() && rand.IntN(100) < 5 {
 			f.readsFailed.Add(1)
-			return fail(db.ErrNotExecuted)(st)
+			return fmt.Errorf("%w: injected", db.ErrNotExecuted)
 		}
 		st.Exec()
-		if r := f.d.Row(st.Key); r != nil && r.Gen != st.Gen && f.d.Claimed(st.Key, st.Gen) {
-			f.retryFindsOtherLife.Add(1)
+		if f.d.Claimed(st.Key, st.Gen) {
+			if r := f.d.Row(st.Key); r != nil && r.Gen != st.Gen {
+				f.retryFindsOtherLife.Add(1)
+			}
 		}
 		return nil
 	}
 	if !f.on.Load() {
-		if st.Kind == fakedb.Fence {
-			f.mu.Lock()
-			if f.takeLocked(st.Session) {
-				f.dropped.Add(1)
-			}
-			f.mu.Unlock()
-		}
-		return nil
+		return f.settle(st)
 	}
 	// The delay ends early if ctx does, as a real driver's would: an operation never overruns its deadline
 	// (EventuallyResponds). Writes and fences run on bgCtx, which is never done.
@@ -116,28 +126,21 @@ func (f *faults) hook(ctx context.Context, st *fakedb.Stmt) error {
 	case <-time.After(time.Duration(rand.IntN(500)) * time.Microsecond):
 	case <-ctx.Done():
 	}
+	if !f.on.Load() { // stopped while this hook slept: no new fault after stop
+		return f.settle(st)
+	}
 	switch st.Kind {
 	case fakedb.Fence:
-		if f.on.Load() && rand.IntN(100) < 20 {
+		if rand.IntN(100) < 20 {
 			f.fencesFailed.Add(1)
-			return fail(db.ErrNotExecuted)(st) // not confirmed: the session goes on, its kept statement may land
+			return fmt.Errorf("%w: injected", db.ErrNotExecuted) // not confirmed: the session goes on, its kept statement may land
 		}
-		// Confirmed: the statement of the session, if kept, is dropped. (The fence executes right after this
-		// returns, and a late Exec takes mu before it runs, so a kept statement either landed before or never.)
-		f.mu.Lock()
-		if f.takeLocked(st.Session) {
-			f.dropped.Add(1)
-		}
-		f.mu.Unlock()
-		return nil
+		return f.settle(st)
 	case fakedb.Select:
-		if f.on.Load() && rand.IntN(100) < 5 {
+		if rand.IntN(100) < 5 {
 			f.readsFailed.Add(1)
-			return fail(db.ErrNotExecuted)(st)
+			return fmt.Errorf("%w: injected", db.ErrNotExecuted)
 		}
-		return nil
-	}
-	if !f.on.Load() { // stopped while this hook slept: no new fault after stop
 		return nil
 	}
 	switch n := rand.IntN(100); {
@@ -147,39 +150,39 @@ func (f *faults) hook(ctx context.Context, st *fakedb.Stmt) error {
 		f.amb[st.Kind].Add(1)
 		f.lost.Add(1)
 		return lost(st)
-	case n < 75:
+	case n < 85: // ambiguous, kept: neither landed nor dropped yet
+		late := n < 75
 		f.mu.Lock()
-		if !f.on.Load() { // stop ran since the check above: register nothing after its late.Wait
-			f.mu.Unlock()
-			return nil
-		}
-		f.late.Add(1)
-		f.kept[st.Session] = true
-		f.mu.Unlock()
-		f.amb[st.Kind].Add(1)
-		id, exec := st.Session, st.Exec
-		go func() {
-			defer f.late.Done()
-			// Virtual time: a window wider than the backoff, so a late statement can land after a fence that
-			// was not confirmed, or be dropped by one that was.
-			time.Sleep(time.Duration(rand.IntN(50_000)) * time.Microsecond)
-			f.mu.Lock()
-			defer f.mu.Unlock()
-			if f.takeLocked(id) {
-				exec()
-				f.landed.Add(1)
+		if late {
+			if !f.on.Load() { // stop ran since the check above: register nothing after its late.Wait
+				f.mu.Unlock()
+				return nil
 			}
-		}()
-		return fakedb.Ambiguous(st, context.DeadlineExceeded)
-	case n < 85:
-		f.mu.Lock()
+			f.late.Add(1)
+		}
 		f.kept[st.Session] = true
 		f.mu.Unlock()
 		f.amb[st.Kind].Add(1)
-		f.never.Add(1)
-		return fakedb.Ambiguous(st, context.DeadlineExceeded) // never executes
+		if late {
+			id, exec := st.Session, st.Exec
+			go func() {
+				defer f.late.Done()
+				// Virtual time: a window wider than the backoff, so a late statement can land after a fence
+				// that was not confirmed, or be dropped by one that was.
+				time.Sleep(time.Duration(rand.IntN(50_000)) * time.Microsecond)
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				if f.takeLocked(id) {
+					exec()
+					f.landed.Add(1)
+				}
+			}()
+		} else {
+			f.never.Add(1)
+		}
+		return fakedb.Ambiguous(st, context.DeadlineExceeded) // else never executes
 	default:
 		f.notExecuted.Add(1)
-		return fail(db.ErrNotExecuted)(st)
+		return fmt.Errorf("%w: injected", db.ErrNotExecuted)
 	}
 }

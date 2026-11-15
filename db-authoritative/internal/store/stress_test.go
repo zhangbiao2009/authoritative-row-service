@@ -147,6 +147,11 @@ func TestStressAll(t *testing.T) {
 		var nextGen atomic.Int64 // every create's gen is new, except an SDK retry's
 		deleted := make([]atomic.Bool, len(keys))
 		var deletes, recreates, gaveUp, rejected, claimedNoRow, updates atomic.Int64
+		countRejected := func(err error) {
+			if errors.Is(err, db.ErrRejected) {
+				rejected.Add(1)
+			}
+		}
 		var mu sync.Mutex
 		var okVals, failedVals []string // SET values answered OK / with a failure
 		var failedCreates []createReq   // first attempts answered with a failure
@@ -208,9 +213,7 @@ func TestStressAll(t *testing.T) {
 								retry = &c
 							}
 						case errors.Is(err, ErrAlreadyExists), failed(err):
-							if errors.Is(err, db.ErrRejected) {
-								rejected.Add(1)
-							}
+							countRejected(err)
 							if c.first {
 								mu.Lock()
 								failedCreates = append(failedCreates, c)
@@ -234,9 +237,7 @@ func TestStressAll(t *testing.T) {
 						case errors.Is(err, ErrOutcomeUnknown):
 							gaveUp.Add(1)
 						case errors.Is(err, ErrNotFound), failed(err):
-							if errors.Is(err, db.ErrRejected) {
-								rejected.Add(1)
-							}
+							countRejected(err)
 							mu.Lock()
 							failedVals = append(failedVals, val)
 							mu.Unlock()
@@ -256,9 +257,7 @@ func TestStressAll(t *testing.T) {
 						case errors.Is(err, ErrOutcomeUnknown):
 							gaveUp.Add(1)
 						case errors.Is(err, ErrNotFound), failed(err):
-							if errors.Is(err, db.ErrRejected) {
-								rejected.Add(1)
-							}
+							countRejected(err)
 						default:
 							t.Errorf("Delete gen %d: %v", gen, err)
 						}
