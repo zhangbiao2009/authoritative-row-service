@@ -23,12 +23,14 @@ const (
 	Delete
 	GenClaimed
 	Fence
+	UpdateBatch
 )
 
 // Stmt is one statement, as the hook sees it.
 type Stmt struct {
 	Kind     Kind
-	Key      schema.Key     // not set for Fence
+	Key      schema.Key     // not set for Fence and UpdateBatch
+	Keys     []schema.Key   // UpdateBatch: the keys of its rows, in order
 	Gen, Ver int64          // Gen: Insert, Update, Delete, GenClaimed; Ver: Update
 	Session  db.SessionID   // a new session per statement
 	Sessions []db.SessionID // Fence: the sessions to terminate
@@ -64,6 +66,10 @@ type DB struct {
 	// RowCheck, if set, runs on every row an Insert or Update writes; an error is a DbValsBelongToGen
 	// violation. Set it before concurrent use.
 	RowCheck func(r *schema.Row) error
+
+	// Reject, if set, is a CHECK constraint: an Update or UpdateBatch that would leave a row it matches
+	// fails with db.ErrRejected, and nothing of that call is written. Set it before concurrent use.
+	Reject func(r *schema.Row) bool
 
 	selects  atomic.Int64
 	updates  atomic.Int64
@@ -325,15 +331,59 @@ func (d *DB) FenceSessions(ctx context.Context, ids []db.SessionID) error {
 func (d *DB) Update(ctx context.Context, r *schema.Row, mask uint64) error {
 	d.updates.Add(1)
 	defer d.write(r.Key)()
-	return d.run(ctx, &Stmt{Kind: Update, Key: r.Key, Gen: r.Gen, Ver: r.Ver}, func() bool { return d.applyLocked(r, mask) })
+	return d.updateRows(ctx, &Stmt{Kind: Update, Key: r.Key, Gen: r.Gen, Ver: r.Ver}, []db.Write{{Row: r, Mask: mask}})
 }
 
-// applyLocked executes UPDATE SET <columns in mask>, ver = r.Ver WHERE key = r.Key AND gen = r.Gen AND
-// ver < r.Ver. It never inserts.
-func (d *DB) applyLocked(r *schema.Row, mask uint64) bool {
+func (d *DB) UpdateBatch(ctx context.Context, ws []db.Write) error {
+	d.updates.Add(1)
+	keys := make([]schema.Key, len(ws))
+	for i, w := range ws {
+		keys[i] = w.Row.Key
+		defer d.write(w.Row.Key)()
+	}
+	if !slices.IsSorted(keys) {
+		d.mu.Lock()
+		d.violateLocked("batch not in key order (design.md 8.3): %q", keys)
+		d.mu.Unlock()
+	}
+	return d.updateRows(ctx, &Stmt{Kind: UpdateBatch, Keys: keys}, ws)
+}
+
+// updateRows sends st, which executes the writes ws in one transaction: if Reject matches a row one of them
+// would leave, none is written and the call returns ErrRejected.
+func (d *DB) updateRows(ctx context.Context, st *Stmt, ws []db.Write) error {
+	var rejected error // set by the exec; read only after run returns nil, when the exec has completed
+	err := d.run(ctx, st, func() bool {
+		var ns []*schema.Row
+		for _, w := range ws {
+			n := d.updatedLocked(w.Row, w.Mask)
+			if n == nil {
+				continue // 0 rows
+			}
+			if d.Reject != nil && d.Reject(n) {
+				rejected = fmt.Errorf("%w: key %q: check constraint", db.ErrRejected, n.Key)
+				return false
+			}
+			ns = append(ns, n)
+		}
+		for _, n := range ns {
+			d.checkRowLocked(n)
+			d.rows[n.Key] = n
+		}
+		return len(ns) > 0
+	})
+	if err != nil {
+		return err
+	}
+	return rejected
+}
+
+// updatedLocked returns the row that UPDATE SET <columns in mask>, ver = r.Ver WHERE key = r.Key AND
+// gen = r.Gen AND ver < r.Ver would leave, or nil if it matches no row. It never inserts.
+func (d *DB) updatedLocked(r *schema.Row, mask uint64) *schema.Row {
 	cur, ok := d.rows[r.Key]
 	if !ok || cur.Gen != r.Gen || cur.Ver >= r.Ver {
-		return false // 0 rows
+		return nil // 0 rows
 	}
 	if cur.Gen == r.Gen && r.Ver <= cur.Ver {
 		d.violateLocked("DbVerMonotonic: key %q gen %d: ver %d written over ver %d", r.Key, r.Gen, r.Ver, cur.Ver)
@@ -345,9 +395,7 @@ func (d *DB) applyLocked(r *schema.Row, mask uint64) bool {
 		}
 	}
 	n.Ver = r.Ver
-	d.checkRowLocked(n)
-	d.rows[r.Key] = n
-	return true
+	return n
 }
 
 func clone(r *schema.Row) *schema.Row {

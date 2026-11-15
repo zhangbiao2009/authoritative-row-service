@@ -370,3 +370,118 @@ func TestHookNilWithDoneCtx(t *testing.T) {
 		t.Fatalf("executed by the hook: err %v, row %+v; want nil and the write applied", err, d.Row("k"))
 	}
 }
+
+// batchRows puts three rows, a, b and c, at gen 1 ver 1, and returns writes of each at ver 2 with value v.
+func batchRows(d *DB, v int64) []db.Write {
+	var ws []db.Write
+	for _, k := range []schema.Key{"a", "b", "c"} {
+		d.Put(&schema.Row{Key: k, Gen: 1, Ver: 1, Vals: []any{int64(0)}})
+		ws = append(ws, db.Write{Row: &schema.Row{Key: k, Gen: 1, Ver: 2, Vals: []any{v}}, Mask: 1})
+	}
+	return ws
+}
+
+func TestUpdateBatchAppliesEach(t *testing.T) {
+	d := New()
+	ws := batchRows(d, 7)
+	ws[1].Row = &schema.Row{Key: "b", Gen: 1, Ver: 1, Vals: []any{int64(7)}} // stale: ver not above the DB's
+	if err := d.UpdateBatch(context.Background(), ws); err != nil {
+		t.Fatalf("UpdateBatch: %v", err)
+	}
+	for k, want := range map[schema.Key]int64{"a": 7, "b": 0, "c": 7} {
+		if got := d.Row(k).Vals[0]; got != want {
+			t.Fatalf("row %s: %v, want %d", k, got, want)
+		}
+	}
+	if n := d.Updates(); n != 1 {
+		t.Fatalf("Updates %d, want 1 (one call)", n)
+	}
+}
+
+func TestUpdateBatchRejectedWritesNothing(t *testing.T) {
+	d := New()
+	ws := batchRows(d, 7)
+	ws[1].Row.Vals[0] = int64(-1)
+	d.Reject = func(r *schema.Row) bool { return r.Vals[0] == int64(-1) }
+	err := d.UpdateBatch(context.Background(), ws)
+	if !errors.Is(err, db.ErrRejected) {
+		t.Fatalf("err %v, want ErrRejected", err)
+	}
+	for _, k := range []schema.Key{"a", "b", "c"} {
+		if r := d.Row(k); r.Ver != 1 {
+			t.Fatalf("row %s written by a rejected batch: %+v", k, r)
+		}
+	}
+}
+
+func TestUpdateRejected(t *testing.T) {
+	d := New()
+	d.Put(&schema.Row{Key: "k", Gen: 1, Ver: 1, Vals: []any{int64(0)}})
+	d.Reject = func(r *schema.Row) bool { return r.Vals[0] == int64(-1) }
+	err := d.Update(context.Background(), &schema.Row{Key: "k", Gen: 1, Ver: 2, Vals: []any{int64(-1)}}, 1)
+	if !errors.Is(err, db.ErrRejected) || d.Row("k").Ver != 1 {
+		t.Fatalf("err %v, row %+v; want ErrRejected and the row unchanged", err, d.Row("k"))
+	}
+}
+
+func TestUpdateBatchLateExecIsAtomic(t *testing.T) {
+	d := New()
+	ws := batchRows(d, 7)
+	var late func()
+	d.Hook = func(_ context.Context, st *Stmt) error {
+		if st.Kind != UpdateBatch || !reflect.DeepEqual(st.Keys, []schema.Key{"a", "b", "c"}) {
+			t.Errorf("statement %v keys %v, want UpdateBatch of a, b, c", st.Kind, st.Keys)
+		}
+		late = st.Exec
+		return Ambiguous(st, context.DeadlineExceeded)
+	}
+	if err := d.UpdateBatch(context.Background(), ws); !db.IsAmbiguous(err) {
+		t.Fatalf("err %v, want ambiguous", err)
+	}
+	for _, k := range []schema.Key{"a", "b", "c"} {
+		if d.Row(k).Ver != 1 {
+			t.Fatalf("row %s written before the exec", k)
+		}
+	}
+	late()
+	for _, k := range []schema.Key{"a", "b", "c"} {
+		if r := d.Row(k); r.Ver != 2 || r.Vals[0] != int64(7) {
+			t.Fatalf("row %s after the late exec: %+v", k, r)
+		}
+	}
+	if s := d.Stats(); s.Late != 1 {
+		t.Fatalf("Stats %+v, want Late 1", s)
+	}
+}
+
+func TestUpdateBatchOneWriterPerKey(t *testing.T) {
+	d := New()
+	ws := batchRows(d, 7)
+	entered, release := make(chan struct{}), make(chan struct{})
+	d.Hook = func(_ context.Context, st *Stmt) error {
+		if st.Kind == UpdateBatch {
+			entered <- struct{}{}
+			<-release
+		}
+		return nil
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() { d.UpdateBatch(context.Background(), ws) })
+	<-entered
+	d.Update(context.Background(), &schema.Row{Key: "b", Gen: 1, Ver: 3, Vals: []any{int64(9)}}, 1) // while the batch is in progress
+	close(release)
+	wg.Wait()
+	if d.Violation() == nil {
+		t.Fatal("a batch and an Update of one key in progress at once were not reported")
+	}
+}
+
+func TestUpdateBatchUnsorted(t *testing.T) {
+	d := New()
+	ws := batchRows(d, 7)
+	ws[0], ws[2] = ws[2], ws[0]
+	d.UpdateBatch(context.Background(), ws)
+	if err := d.Violation(); err == nil || !strings.Contains(err.Error(), "order") {
+		t.Fatalf("Violation %v, want one naming the key order (design.md 8.3)", err)
+	}
+}

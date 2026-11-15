@@ -58,6 +58,12 @@ func SessionOf(err error) SessionID {
 func NotExecuted(err error) bool { return errors.Is(err, ErrNotExecuted) }
 func IsCrossRow(err error) bool  { return errors.Is(err, ErrCrossRow) }
 
+// Write is one row of a batch: the columns of Row selected by Mask, written as Update writes them.
+type Write struct {
+	Row  *schema.Row
+	Mask uint64
+}
+
 // DB is one table's storage. Implementations: fakedb (tests) and PostgreSQL (M7).
 type DB interface {
 	// Select returns the row, or ErrNoRows. A read that executes late changes nothing, so it needs
@@ -69,6 +75,11 @@ type DB interface {
 	// Zero rows affected is not an error (7.6): an earlier write that timed out may have landed, or the row
 	// is gone. The values are absolute, never col = col + delta (I12).
 	Update(ctx context.Context, r *schema.Row, mask uint64) error
+
+	// UpdateBatch runs the Update of every write in one transaction (design.md 7.6, 8.3): all of them take
+	// effect or none. The writes are in ascending key order, one per key. ErrRejected or ErrCrossRow: one of
+	// them was rejected, and none was written. An ambiguous error: all of them, or none, may take effect.
+	UpdateBatch(ctx context.Context, ws []Write) error
 
 	// InsertDedup inserts r (r.Ver == 0) and its dedup record (table, r.Key, r.Gen) in one statement: both
 	// take effect or neither (I14; design.md 5.1, 8.3). It returns the stored row, with any defaults the DB
