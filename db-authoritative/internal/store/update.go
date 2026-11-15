@@ -64,8 +64,18 @@ func (s *Store) updateLocked(e *entry, ch Change) (*schema.Row, error) {
 		return got, nil
 	case errors.Is(err, db.ErrNoRows):
 		return nil, s.unexpectedLocked(e, err)
+	case db.IsAmbiguous(err):
+		now, ferr := s.fenceAndReadLocked(e, err)
+		if ferr != nil {
+			return nil, ferr
+		}
+		// TLA: B_3
+		if now != absent && now.Gen == old.Gen && now.Ver == old.Ver+1 {
+			return now, nil
+		}
+		return nil, fmt.Errorf("%w: update not applied after fence", db.ErrNotExecuted)
 	default:
-		return nil, err // ErrNotExecuted: nothing changed
+		return nil, err // ErrNotExecuted or ErrRejected: nothing changed
 	}
 }
 
