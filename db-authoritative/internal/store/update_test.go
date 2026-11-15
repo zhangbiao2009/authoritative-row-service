@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -18,18 +19,6 @@ import (
 
 func set(col int, v any) ColChange    { return ColChange{Col: col, Op: OpSet, Val: v} }
 func incr(col int, d int64) ColChange { return ColChange{Col: col, Op: OpIncr, Val: d} }
-
-// blockUpdates makes every fakedb.Update statement wait until the returned channel is closed.
-func blockUpdates(d *fakedb.DB) (release chan struct{}) {
-	release = make(chan struct{})
-	d.Hook = func(_ context.Context, st *fakedb.Stmt) error {
-		if st.Kind == fakedb.Update {
-			<-release
-		}
-		return nil
-	}
-	return release
-}
 
 func entryOf(s *Store, k schema.Key) *entry {
 	sh := s.shardFor(k)
@@ -244,7 +233,8 @@ func TestUpdateZeroRowsIsInternal(t *testing.T) {
 func TestUpdateClientGivesUp(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
-		release := blockUpdates(d)
+		release := make(chan struct{})
+		script(d, map[fakedb.Kind][]step{fakedb.Update: {blockOn(release)}})
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
@@ -265,11 +255,39 @@ func TestUpdateClientGivesUp(t *testing.T) {
 	})
 }
 
+// The caller reuses its []ColChange after ErrOutcomeUnknown: the update still in flight must write what was
+// sent, not what the caller wrote since.
+func TestUpdateDoesNotKeepCallerChange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		release := make(chan struct{})
+		script(d, map[fakedb.Kind][]step{fakedb.Select: {blockOn(release)}})
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1))
+		pk := d.Row(k).Vals[0]
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		cols := []ColChange{set(1, "b")}
+		if _, err := s.Update(ctx, k, Change{Cols: cols}); !errors.Is(err, ErrOutcomeUnknown) {
+			t.Fatalf("err = %v, want ErrOutcomeUnknown", err)
+		}
+		cols[0] = set(1, "other") // the caller reuses its slice
+		close(release)
+		s.inflight.Wait()
+		if r := d.Row(k); r.Vals[1] != "b" || r.Vals[0] != pk {
+			t.Fatalf("row = %+v, want column 1 \"b\" and the primary key %v", r, pk)
+		}
+		checkInvariants(t, s, d)
+	})
+}
+
 // A request that times out while queued for op did nothing (TLA: X_qtimeout).
 func TestUpdateTimesOutWhileQueued(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
-		release := blockUpdates(d)
+		release := make(chan struct{})
+		script(d, map[fakedb.Kind][]step{fakedb.Update: {blockOn(release)}})
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
@@ -296,7 +314,8 @@ func TestUpdateTimesOutWhileQueued(t *testing.T) {
 func TestGetDuringWriteSeesOldRow(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := fakedb.New()
-		release := blockUpdates(d)
+		release := make(chan struct{})
+		script(d, map[fakedb.Kind][]step{fakedb.Update: {blockOn(release)}})
 		s := newTestStore(t, d)
 		k := key(t, s, 1)
 		d.Put(testRow(k, 1))
@@ -370,4 +389,138 @@ func TestUpdateWithExpiredCtxSendsNothing(t *testing.T) {
 	if got := d.Row(k); !reflect.DeepEqual(got, before) {
 		t.Fatalf("row changed: %+v, want %+v", got, before)
 	}
+}
+
+// TLA: B_2 ambiguous, the statement executed (W_FenceThenApplied): OK with the DB's row.
+func TestUpdateAmbiguousApplied(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		rec := script(d, map[fakedb.Kind][]step{fakedb.Update: {lost}})
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1))
+		got, err := s.Update(context.Background(), k, Change{Cols: []ColChange{set(1, "b")}})
+		if err != nil || got.Ver != 4 || got.Vals[1] != "b" {
+			t.Fatalf("Update = %+v, %v; want ver 4, b", got, err)
+		}
+		rec.wantFences(t, 1, fakedb.Update)
+		checkInvariants(t, s, d)
+	})
+}
+
+// TLA: B_2 ambiguous, the fence dropped the statement (W_FenceThenNotApplied): not executed, and the kept
+// statement can never land (I5).
+func TestUpdateAmbiguousNotApplied(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		var late func()
+		rec := script(d, map[fakedb.Kind][]step{fakedb.Update: {amb(&late)}})
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1))
+		if _, err := s.Update(context.Background(), k, Change{Cols: []ColChange{set(1, "b")}}); !errors.Is(err, db.ErrNotExecuted) {
+			t.Fatalf("err = %v, want ErrNotExecuted", err)
+		}
+		rec.wantFences(t, 1, fakedb.Update)
+		if n := d.Pending(); n != 0 { // before late(): only the fence can clear it
+			t.Fatalf("Pending = %d, want 0", n)
+		}
+		late() // too late: the session is fenced
+		if r := d.Row(k); r.Ver != 3 || r.Vals[1] != "a" {
+			t.Fatalf("DB row %+v changed after the answer", r)
+		}
+		checkInvariants(t, s, d)
+	})
+}
+
+// The statement executes while the fence is being confirmed: the fence step runs the kept statement.
+func TestUpdateAmbiguousExecutesAtFence(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		var late func()
+		rec := script(d, map[fakedb.Kind][]step{
+			fakedb.Update: {amb(&late)},
+			fakedb.Fence:  {func(*fakedb.Stmt) error { late(); return nil }},
+		})
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1))
+		got, err := s.Update(context.Background(), k, Change{Cols: []ColChange{set(1, "b")}})
+		if err != nil || got.Ver != 4 || got.Vals[1] != "b" {
+			t.Fatalf("Update = %+v, %v; want ver 4, b", got, err)
+		}
+		rec.wantFences(t, 1, fakedb.Update)
+		checkInvariants(t, s, d)
+	})
+}
+
+// The fence is retried until confirmed; the statement lands between attempts, so op was rightly held.
+func TestUpdateFenceNotConfirmed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		var late func()
+		rec := script(d, map[fakedb.Kind][]step{
+			fakedb.Update: {amb(&late)},
+			fakedb.Fence: {
+				fail(errors.New("not confirmed")),
+				func(*fakedb.Stmt) error { late(); return fmt.Errorf("not confirmed again") },
+			},
+		})
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1))
+		got, err := s.Update(context.Background(), k, Change{Cols: []ColChange{set(1, "b")}})
+		if err != nil || got.Ver != 4 || got.Vals[1] != "b" {
+			t.Fatalf("Update = %+v, %v; want ver 4, b", got, err)
+		}
+		rec.wantFences(t, 3, fakedb.Update)
+		checkInvariants(t, s, d)
+	})
+}
+
+// The read after the fence is retried until it succeeds.
+func TestUpdateReadAfterFenceFails(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		var late func()
+		rec := script(d, map[fakedb.Kind][]step{
+			fakedb.Update: {amb(&late)},
+			fakedb.Select: {nil, fail(db.ErrNotExecuted), fail(db.ErrNotExecuted)},
+		})
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1))
+		if _, err := s.Update(context.Background(), k, Change{Cols: []ColChange{set(1, "b")}}); !errors.Is(err, db.ErrNotExecuted) {
+			t.Fatalf("err = %v, want ErrNotExecuted", err)
+		}
+		rec.wantFences(t, 1, fakedb.Update)
+		if n := d.Pending(); n != 0 { // the kept statement never runs: only the fence clears it
+			t.Fatalf("Pending = %d, want 0", n)
+		}
+		if n := rec.count(fakedb.Select); n != 4 { // the load, then three after the fence
+			t.Fatalf("Selects = %d, want 4", n)
+		}
+		checkInvariants(t, s, d)
+	})
+}
+
+func TestUpdateRejected(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d := fakedb.New()
+		rec := script(d, nil)
+		s := newTestStore(t, d)
+		k := key(t, s, 1)
+		d.Put(testRow(k, 1))
+		d.SetRejecting(k, true)
+		if _, err := s.Update(context.Background(), k, Change{Cols: []ColChange{set(1, "b")}}); !errors.Is(err, db.ErrRejected) {
+			t.Fatalf("err = %v, want ErrRejected", err)
+		}
+		if r := d.Row(k); r.Ver != 3 || r.Vals[1] != "a" {
+			t.Fatalf("DB row %+v changed", r)
+		}
+		if n := rec.count(fakedb.Fence); n != 0 {
+			t.Fatalf("%d fences, want none", n)
+		}
+		checkInvariants(t, s, d)
+	})
 }

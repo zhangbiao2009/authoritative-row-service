@@ -24,8 +24,9 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("not found")
-	ErrInvalid  = schema.ErrInvalid // the same value, so errors.Is works whichever package wrapped it
+	ErrNotFound      = errors.New("not found")
+	ErrAlreadyExists = errors.New("already exists")
+	ErrInvalid       = schema.ErrInvalid // the same value, so errors.Is works whichever package wrapped it
 
 	ErrOutcomeUnknown = errors.New("outcome unknown") // the caller's ctx expired before the outcome was settled
 	ErrInternal       = errors.New("internal")        // an invariant is broken
@@ -164,5 +165,36 @@ func runSync[T any](ctx context.Context, s *Store, e *entry, fn func(*entry) (T,
 	case <-ctx.Done(): // TLA: X_wait, the client giving up
 		var zero T
 		return zero, ErrOutcomeUnknown
+	}
+}
+
+// backoff waits before retry number attempt: 10 ms doubled per attempt, at most 1 s. M6 makes it return an
+// error once bgCtx is cancelled (shutdown). The inner min only keeps the shift from overflowing; the outer
+// min caps the wait.
+func (s *Store) backoff(attempt int) {
+	time.Sleep(min(10*time.Millisecond<<min(attempt, 7), time.Second))
+}
+
+// fenceAndReadLocked settles a statement whose outcome is ambiguous (design.md 7.3, without the owner
+// check: M6). Requires op (I5). It terminates the statement's session and confirms it is gone, then reads
+// the row and stores it in the snapshot, so that I4 holds again when op is released. Both steps are retried
+// until they succeed: until the fence is confirmed the statement may still execute, so op must not be
+// released. If the statement did not take effect, the row read equals the snapshot already held.
+func (s *Store) fenceAndReadLocked(e *entry, amb error) (*schema.Row, error) {
+	// TLA: B_2, the ambiguous branch (the connection fence)
+	for attempt := 0; s.db.FenceSession(s.bgCtx, db.SessionOf(amb)) != nil; attempt++ {
+		s.backoff(attempt)
+	}
+	// TLA: B_3 (the read). M6 adds the owner check after it.
+	for attempt := 0; ; attempt++ {
+		r, err := s.db.Select(s.bgCtx, e.id)
+		if errors.Is(err, db.ErrNoRows) {
+			r, err = absent, nil
+		}
+		if err == nil {
+			e.snap.Store(r)
+			return r, nil
+		}
+		s.backoff(attempt)
 	}
 }

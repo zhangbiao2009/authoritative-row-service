@@ -32,6 +32,9 @@ type Change struct {
 // exist or is not the life ch.Gen names; ErrInvalid if ch is malformed or an increment fails, in which
 // case nothing was sent.
 func (s *Store) Update(ctx context.Context, key schema.Key, ch Change) (*schema.Row, error) {
+	// The update may go on after the caller has its answer (ErrOutcomeUnknown), and the caller may then reuse
+	// its slice. The values themselves are immutable (I2).
+	ch.Cols = slices.Clone(ch.Cols)
 	if err := s.checkChange(ch); err != nil {
 		return nil, err
 	}
@@ -64,8 +67,22 @@ func (s *Store) updateLocked(e *entry, ch Change) (*schema.Row, error) {
 		return got, nil
 	case errors.Is(err, db.ErrNoRows):
 		return nil, s.unexpectedLocked(e, err)
+	case db.IsAmbiguous(err):
+		now, ferr := s.fenceAndReadLocked(e, err)
+		if ferr != nil {
+			return nil, ferr
+		}
+		// TLA: B_3. With op held the row is the loaded one, or the loaded one with this update applied (I5);
+		// anything else is a broken assumption, not an answer (7.3).
+		switch {
+		case now != absent && now.Gen == old.Gen && now.Ver == old.Ver+1:
+			return now, nil
+		case now != absent && now.Gen == old.Gen && now.Ver == old.Ver:
+			return nil, fmt.Errorf("%w: update not applied after fence", db.ErrNotExecuted)
+		}
+		return nil, s.unexpectedLocked(e, fmt.Errorf("after the fence: row %+v, loaded gen %d ver %d", now, old.Gen, old.Ver))
 	default:
-		return nil, err // ErrNotExecuted: nothing changed
+		return nil, err // ErrNotExecuted or ErrRejected: nothing changed
 	}
 }
 
