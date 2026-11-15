@@ -13,6 +13,7 @@ import (
 func (s *Store) Get(ctx context.Context, key schema.Key) (*schema.Row, error) {
 	for {
 		e := s.getOrCreate(key)
+		s.touch(e)
 		// TLA: G_read. Linearization point: the load of snap.
 		if r := e.snap.Load(); r != nil {
 			if r == absent {
@@ -34,6 +35,9 @@ func (s *Store) load(ctx context.Context, e *entry) error {
 	}
 	defer e.unlockOp()
 	// TLA: L_load
+	if e.dead {
+		return nil // removed while we queued: the caller looks the key up again
+	}
 	_, err := s.ensureLoadedLocked(ctx, e)
 	return err
 }

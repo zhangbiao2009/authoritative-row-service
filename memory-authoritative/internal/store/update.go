@@ -37,12 +37,16 @@ func (s *Store) Update(ctx context.Context, key schema.Key, ch Change) (*schema.
 	}
 	for {
 		e := s.getOrCreate(key)
+		s.touch(e)
 		// TLA: U_mu. The whole read-modify-write is inside mu, so concurrent updates of other columns, and
 		// concurrent increments, are not lost.
 		e.mu.Lock()
 		old := e.snap.Load()
-		if old == nil {
-			e.mu.Unlock() // mu is a leaf lock: release it before waiting for op (6.4)
+		if e.dead || old == nil {
+			// Being removed (7.7), or not loaded. mu is a leaf lock: release it before waiting for op (6.4).
+			// The remover holds op until the entry is out of the map, so load returns only then, and for a
+			// dead entry without reading; either way, look the key up again.
+			e.mu.Unlock()
 			if err := s.load(ctx, e); err != nil {
 				return nil, err
 			}

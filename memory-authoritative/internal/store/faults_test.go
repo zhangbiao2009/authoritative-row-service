@@ -31,11 +31,14 @@ type faults struct {
 	notExecutedAfterFence atomic.Int64 // the same, after one of its sessions was fenced
 	lateInsertOfDeleted   atomic.Int64 // a late INSERT arriving after its life was deleted
 	retryFindsOtherLife   atomic.Int64 // a GenClaimed lookup that found the gen claimed
+	evictions             atomic.Int64 // entries evicted (W_Evict), counted by watchEvictions
+	reloads               atomic.Int64 // a Select of a key after it was evicted (W_Reload)
 
 	mu        sync.Mutex
 	ambiguous map[stmtOf]bool         // answered "ambiguous" at least once
 	sessionOf map[db.SessionID]stmtOf // the sessions of those answers
 	fenced    map[stmtOf]bool         // one of those sessions was fenced
+	evicted   map[schema.Key]bool     // keys evicted at least once (watchEvictions)
 
 	flipping, flipped chan struct{}
 }
@@ -73,6 +76,7 @@ func startFaults(d *fakedb.DB, keys []schema.Key) *faults {
 	f := &faults{
 		d: d, keys: keys,
 		ambiguous: map[stmtOf]bool{}, sessionOf: map[db.SessionID]stmtOf{}, fenced: map[stmtOf]bool{},
+		evicted:  map[schema.Key]bool{},
 		flipping: make(chan struct{}), flipped: make(chan struct{}),
 	}
 	f.on.Store(true)
@@ -107,7 +111,36 @@ func (f *faults) stop() {
 	f.late.Wait()
 }
 
+// evictHard makes eviction interleave with everything, every 1ms: the idle sweep evicts every entry not
+// accessed during the current second, and capacity eviction keeps at most 2 entries (M5 plan, decision 7).
+func evictHard(c *Config) {
+	c.IdleTTL, c.NegativeIdleTTL, c.EvictInterval, c.MaxEntries = 0, 0, time.Millisecond, 2
+}
+
+// think waits 0-20ms of virtual time, so that many second boundaries pass during a run.
+func think() { time.Sleep(time.Duration(rand.IntN(20)) * time.Millisecond) }
+
+// watchEvictions counts s's evictions (W_Evict) in f through the "evict-dead" failpoint, and tells f which
+// keys were evicted, so that f counts their reloads. Call it before RunEvictor starts.
+func watchEvictions(s *Store, f *faults) {
+	s.failpoint = func(at string, e *entry) {
+		if at == "evict-dead" {
+			f.evictions.Add(1)
+			f.mu.Lock()
+			f.evicted[e.id] = true
+			f.mu.Unlock()
+		}
+	}
+}
+
 func (f *faults) hook(_ context.Context, st *fakedb.Stmt) error {
+	if st.Kind == fakedb.Select {
+		f.mu.Lock()
+		if f.evicted[st.Key] {
+			f.reloads.Add(1)
+		}
+		f.mu.Unlock()
+	}
 	if st.Kind == fakedb.GenClaimed {
 		if f.on.Load() && rand.IntN(100) < 5 {
 			return fail(db.ErrNotExecuted)(st)

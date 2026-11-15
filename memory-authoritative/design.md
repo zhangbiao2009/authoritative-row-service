@@ -587,14 +587,12 @@ func (s *Store) Update(ctx context.Context, id Key, ch Change) (*Row, error) {
 		e := s.getOrCreate(id)
 		s.touch(e)
 		e.mu.Lock()
-		if e.dead {
-			e.mu.Unlock()
-			runtime.Gosched() // eviction is removing it; wait a moment and look up the map again
-			continue
-		}
 		old := e.snap.Load()
-		if old == nil {
-			e.mu.Unlock() // release mu first, then take op (mu is a leaf lock)
+		if e.dead || old == nil {
+			// Eviction is removing it, or it is not loaded. Release mu first, then take op (mu is a leaf lock).
+			// The remover holds op until the entry is out of the map, so for a dead entry load returns only
+			// then, without reading; either way, look up the map again.
+			e.mu.Unlock()
 			if err := s.load(ctx, e); err != nil {
 				return nil, err
 			}
@@ -976,7 +974,7 @@ Eviction has two triggers:
 | Trigger | Condition | Approach |
 |---|---|---|
 | Idle sweep | `now - lastAccess > IdleTTL` (absent entries or entries that failed to load use `NegativeIdleTTL`) | Each shard is sample-checked once every `EvictInterval` |
-| Capacity eviction | `entryCount > MaxEntries` (high-water mark) | Sample, and evict the least recently accessed in the sample, until dropping to the low-water mark (e.g. 0.9 × MaxEntries) |
+| Capacity eviction | `entryCount > MaxEntries` (high-water mark) | Sample, and evict the least recently accessed quarter of each sample, until dropping to the low-water mark (e.g. 0.9 × MaxEntries) |
 
 **Why sampling, rather than a full scan or an LRU list:**
 
@@ -1049,7 +1047,7 @@ func (s *Store) tryEvict(sh *shard, e *entry, eligible func(*entry) bool) bool {
 }
 ```
 
-Capacity eviction (`capacityEvictShard`) follows the same flow: take K samples under RLock, release the lock, sort by `lastAccess` from oldest to newest, and call `tryEvict` on each (eligible simply returns true), until this shard has evicted its quota. If capacity is already exceeded and all entries in the sample are dirty and cannot be evicted, the flush is falling behind; at that point backpressure (11.1) is relied on to limit growth.
+Capacity eviction (`capacityEvictShard`) follows the same flow: take K samples under RLock, release the lock, sort by `lastAccess` from oldest to newest, and call `tryEvict` on the oldest quarter (eligible simply returns true); repeat until this shard has evicted its quota. Only a quarter: the quota is often far larger than a sample (just above `MaxEntries` with the defaults, 0.1 × 1,000,000 / 256 shards ≈ 391 per shard, against K = 64), and evicting whole samples would be random eviction. Taking the oldest quarter, no entry with 3K/4 or more newer entries in its shard is evicted. A sample smaller than K is the whole shard, and gives up its oldest. The rounds are not capped by `MaxSweepRounds`: each round but the last evicts at least one entry, so there are at most quota rounds. If capacity is already exceeded and the oldest entries in the sample are all dirty and cannot be evicted, the flush is falling behind; at that point backpressure (11.1) is relied on to limit growth.
 
 **The three rules of the dead protocol:**
 
@@ -1057,7 +1055,7 @@ Capacity eviction (`capacityEvictShard`) follows the same flow: take K samples u
 2. **Everyone who takes a lock**: after acquiring op or mu, checks dead first. If dead, release the lock and getOrCreate again.
 3. **Lock-free readers**: do not check dead. What they read is the latest value at the moment of removal; placing the linearization point at the removal moment keeps it linearizable.
 
-- In the few microseconds between releasing mu and deleting from the map, an Update may get the same dead e and spin a few times (mitigated by `Gosched`). This is the cost of keeping mu a leaf lock, and is acceptable.
+- In the few microseconds between releasing mu and deleting from the map, an Update may get the same dead e. It releases mu and waits for op, which the remover holds until the map has dropped e, and then looks the key up again: it blocks instead of spinning. This is the cost of keeping mu a leaf lock, and is acceptable.
 - `s.nowSec` is updated once per second by a background ticker. Idle TTL precision is at the second level, which is entirely sufficient.
 
 ### 7.8 Startup and graceful shutdown
@@ -1550,7 +1548,7 @@ The gaps "after releasing a lock and before acquiring it again" are where concur
 | Client attempt ambiguous -> its retry finds another life of the key | The first attempt had succeeded and that life was deleted since | Look the gen up in the dedup table before answering `ALREADY_EXISTS` (7.4) |
 | A new instance starts -> the old instance notices | The old instance keeps flushing, creating and deleting | Every write carries the owner epoch; the old instance's writes change nothing and it stops (I16, 7.8) |
 | Process crash -> new process loads data | The previous process's SQL has a late execution | At startup, terminate the previous process's sessions, and load only after confirming they have exited (I15, 7.8) |
-| tryEvict releases mu -> deletes from map | Update gets a dead e | Update checks dead, calls Gosched, then retries |
+| tryEvict releases mu -> deletes from map | Update gets a dead e | Update checks dead, waits for op (held by the remover until the removal), then retries |
 | DB DELETE executing (holding only op) | An update writes to memory | Step 2 clears dirty inside mu |
 | Client sends request -> receives response | Connection drops; the request may already have taken effect | create retries with the same gen; delete with gen retries; update and delete without gen are not retried automatically and return ambiguous (7.10) |
 
@@ -1612,7 +1610,7 @@ The whole service is deployed as a single instance, and the deployment process r
 | `IdleTTL` | How long a row must be idle before it is cleared from memory | TBD |
 | `NegativeIdleTTL` | Idle TTL for tombstones and negative-cache entries | Shorter than IdleTTL, e.g. 1-5 minutes |
 | `EvictInterval` | Interval between idle sampling runs | 1s |
-| `MaxSweepRounds` | Maximum consecutive rounds per sampling run | 16 |
+| `MaxSweepRounds` | Maximum consecutive rounds per idle sweep of a shard | 16 |
 | `MaxEntries` | Upper limit (high-water mark) on the number of entries per table, determined by the memory budget | TBD |
 | `MaxDirty` | Upper limit on dirty rows; beyond it, backpressure applies | TBD |
 | `MaxDirtyAge` | Upper limit on the age of the oldest dirty row; beyond it, every update returns `ErrBusy` (11.1). Bounds what a crash can lose while the DB cannot be written. 0 disables it | 30s |
@@ -2068,7 +2066,7 @@ Path 1 is also the only answer where no token can exist: a statement that anothe
 | Read path | copy-on-write, immutable snapshot plus atomic publication | Every update allocates memory, adding GC pressure | Reads are completely lock-free and scale linearly even on hot keys. If load testing shows allocation is the bottleneck (writes far outnumber reads, and rows are large), consider copy-on-read (RWMutex with in-place modification, copy on read) |
 | Lock splitting | op (spans IO) and mu (leaf lock) separated | One more lock | update never waits for IO |
 | Lookup approach | Release first, then validate (dead) | Requires the dead protocol | Keeps contention on hot keys from spreading to the whole shard; shard.mu stays a leaf lock |
-| Whether mu is a leaf lock | Yes (eviction releases mu before acquiring shard.mu) | During the few microseconds of eviction, Update may spin | The rule simplifies to "only op may nest" |
+| Whether mu is a leaf lock | Yes (eviction releases mu before acquiring shard.mu) | During the few microseconds of eviction, Update may wait for op | The rule simplifies to "only op may nest" |
 | Delete approach | Tombstone + deferred physical delete | Tombstones take memory and need TTL cleanup | Those already holding the pointer see it immediately; negative caching; the delete path is simple |
 | update arriving while delete is in progress | Allowed to succeed; discarded together after delete succeeds (confirmed) | Clients may find it surprising (update succeeded, then the data is deleted) | Linearizable; no extra state; update does not slow down. The other two options: return a retryable error (one more error to handle), or wait for delete to finish (update slows down) |
 | Serialization and gen/ver | Keep both | Two more columns and WHERE conditions | Serialization handles the normal case, gen/ver covers timeouts; a late write causes a permanent error and would violate a hard requirement |

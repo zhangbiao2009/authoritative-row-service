@@ -29,6 +29,7 @@ the model to match the code, without asking.
 | `"rej"` only means "rejected because of another row" | Rejection by the row's own data (CHECK, NOT NULL, length) is the `default` branch of the until-sure loops | Same parameters on every attempt, so the earlier attempt was rejected too (7.4) |
 | Not modeled: poison rows (7.9), backpressure (11.1), `lastLoadErr` cache, backoff, `nowSec`, `dirtySince`, metrics | Present | They only return errors earlier or change timing; none may change which branch a step takes |
 | Eviction may happen at any moment | TTL / capacity policy, sampling, `eligible` re-check | The model covers every timing; policy only narrows it |
+| `U_mu` on a dead entry goes straight back to `Goc` | `Update` on a dead entry goes through `load`: waits for `op`, sees `dead`, then looks the key up again (design.md 7.3, changed in M5) | The extra steps change no state: they only hold the `op` of an entry already removed from the map, which no one else can reach; the model already takes `Update` through `L_lock`/`L_load` on a dead entry whose `snap` is nil |
 | Superseded instance detects the new epoch: not a step | 0-row UPDATE/DELETE triggers an epoch check (7.6); periodic check (7.8) | The model checks the effect (`EpochOk`) of every statement; stopping is liveness, not safety |
 | SDK behaviour (`retry`, `unkGen`, `NotFinal`, `SdkAnswer`) is part of the client process | `client/` package (M8) | |
 | No TCP server, no protocol | `internal/server` (M8) | |
@@ -103,9 +104,9 @@ Each row is one atomic step of the model. In Go a step is a stretch of one funct
 | `G_read` | `Get` (7.2) | `e.snap.Load()`: linearization point; `nil` → `load`, then back to the top. No `dead` check (dead protocol rule 3) |
 | `L_lock` | `load` (7.2) | `e.lockOp(ctx)` |
 | `L_load` | `load` → `ensureLoadedLocked` (7.2) | `dead` check; re-check `snap`; `db.Select`; `snap.Store` under `mu`; `unlockOp` |
-| `U_mu` | `Update` (7.3) | the whole `mu` critical section: `dead` → `Gosched`, retry; `nil` → unlock `mu`, `load`; absent or gen mismatch → `ErrNotFound`; else build the new Row, `snap.Store` (linearization point), `markDirtyLocked`, set `queued` |
+| `U_mu` | `Update` (7.3) | the whole `mu` critical section: `dead` or `nil` → unlock `mu`, `load` (which, for a dead entry, waits for `op` and returns without reading), retry; absent or gen mismatch → `ErrNotFound`; else build the new Row, `snap.Store` (linearization point), `markDirtyLocked`, set `queued` |
 | `U_enq` | `Update` → `enqueue` (7.1) | after `mu.Unlock` |
-| `X_lock` | `Create` / `Delete` → `lockOpLive` (7.1), then `runSync` starts the goroutine (7.4) | until M5 (no `dead`): `getOrCreate` + `lockOp` |
+| `X_lock` | `Create` / `Delete` → `lockOpLive` (7.1), then `runSync` starts the goroutine (7.4) | |
 | `X_qtimeout` | `lockOpLive` returns `ctx.Err()` | timed out while queued for `op`: definitely not executed |
 | `X_wait` | `runSync`'s `select` | `done` → result; `ctx.Done()` → `ErrOutcomeUnknown`, the goroutine keeps running |
 | `FinishOp` | `runSync` goroutine | `e.unlockOp()` once `fn` has returned, then `done <- result`: `op` is free by the time the caller has its answer |
@@ -117,7 +118,7 @@ Each row is one atomic step of the model. In Go a step is a stretch of one funct
 | `F_scan` | `flushShard` loop over `batch` | `tryLockOp` (fails → `retry`); under `mu`: dead / nil / absent / clean → `queued = false`, `unlockOp`; else snapshot row + mask, `clearDirtyLocked`, `queued = false`, keep `op` |
 | `F_send` | `flushShard` | M2: `db.Update` per item, each right after its `F_scan`; `requeueAll(retry)` after the shard's items. From M6: `requeueAll(retry)`, then `db.UpdateBatch` |
 | `F_done` | `flushShard` after `UpdateBatch` | on error: merge the mask back, re-enqueue if not queued; `unlockOp` |
-| `V_evict` | `tryEvict` (7.7) | `tryLockOp`; under `mu`: `!dead && dirty == 0 && eligible` → `dead = true` |
+| `V_evict` | `tryEvict` (`evict.go`, 7.7), called by `idleSweepShard` / `capacityEvictShard` from `RunEvictor` | `tryLockOp`; under `mu`: `!dead && dirty == 0 && eligible` → `dead = true` |
 | `V_remove` | `tryEvict` | under `shard.mu`: delete from the map; `unlockOp` |
 | `DbExec`, `DbTimeout`, `DbDrop` | `fakedb` (and real PG) | execute; time out and maybe execute later; definitely not execute |
 | `EnvFlip` | test flips `fakedb`'s cross-row switch | |
@@ -133,7 +134,8 @@ Each row is one atomic step of the model. In Go a step is a stretch of one funct
 A gap is the space between two steps of one goroutine, where another goroutine can run (design.md section 10). Each
 gap below is a separate step boundary in the model. Failpoint hooks are nil in production. The gaps that sit at a DB
 call (delete-db-done, flush-snapshot, flush-late) are reached through `fakedb.Hook`: the hook of that statement runs the
-inserted operation, before or after calling `Exec`. The others need a hook in `store` (from M5).
+inserted operation, before or after calling `Exec`. The others are points of `Store.failpoint` (tests only, nil in
+production): `"evict-dead"` in `tryEvict` and `"evict-sample"` in `idleSweepShard`.
 
 | Gap | Between | What the failpoint test inserts | Exercises |
 |---|---|---|---|
@@ -243,7 +245,7 @@ count these events, and each stress test asserts the relevant counters are above
 | Witness | Counter |
 |---|---|
 | `W_Delete`, `W_Recreate` | deletes that succeeded; creates of a key after its delete |
-| `W_Evict`, `W_Reload` | evictions; loads of a key that was evicted |
+| `W_Evict`, `W_Reload` | evictions (`watchEvictions`, through `"evict-dead"`); Selects of a key that was evicted (`faults.reloads`) |
 | `W_LateStmt`, `W_EffectiveLateStmt` | statements executed after their caller stopped waiting; of those, ones that changed the DB |
 | `W_LateInsertOfDeletedGen`, `W_RetryOfDeletedGen`, `W_DedupClaimed` | INSERTs arriving for a deleted gen; `ErrGenClaimed` results |
 | `W_AmbThenNotExecuted`, `W_NotExecutedAfterFence` | "not executed" after an ambiguous attempt, before and after a fence |

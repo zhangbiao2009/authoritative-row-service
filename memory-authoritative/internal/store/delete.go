@@ -11,12 +11,12 @@ import (
 // is there; otherwise only that life, and ErrNotFound if the row has another gen. ErrOutcomeUnknown: ctx
 // expired first; the delete goes on and settles in the background.
 func (s *Store) Delete(ctx context.Context, key schema.Key, gen int64) error {
-	e := s.getOrCreate(key)
 	// TLA: X_lock. Waits for a flush write of this key in progress (I5).
-	if err := e.lockOp(ctx); err != nil {
+	e, err := s.lockOpLive(ctx, key)
+	if err != nil {
 		return err // TLA: X_qtimeout. Gave up while queued: definitely not executed
 	}
-	_, err := runSync(ctx, s, e, func() (struct{}, error) { return struct{}{}, s.deleteLocked(e, gen) })
+	_, err = runSync(ctx, s, e, func() (struct{}, error) { return struct{}{}, s.deleteLocked(e, gen) })
 	return err
 }
 
@@ -42,6 +42,7 @@ func (s *Store) deleteLocked(e *entry, gen int64) error {
 	e.snap.Store(absent) // linearization point
 	s.clearDirtyLocked(e)
 	e.mu.Unlock()
+	s.touch(e) // the tombstone's NegativeIdleTTL counts from the delete
 	return nil
 }
 
